@@ -43,6 +43,12 @@ runs/
 # 本地研报可能受版权或分发限制
 参考文件/
 
+# 外部逐日申万行业 CSV 原始目录（约 1.5 GB）
+参考文件/swind/
+*.7z
+*.zip
+*.rar
+
 *.tmp
 *.log
 Thumbs.db

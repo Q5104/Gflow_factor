@@ -26,6 +26,7 @@ from factor_gfn.barra import (
 from factor_gfn.evaluator import (
     DEFAULT_CONFIG,
     EvaluationConfig,
+    NeutralizationDiagnostics,
     evaluate_rank_ic,
     infer_long_direction,
     long_portfolio_series,
@@ -56,6 +57,8 @@ class RewardResult:
     ic_valid_periods: int
     long_ir_valid_periods: int
     industry_neutralized: bool
+    neutralization_skipped_dates: tuple[str, ...]
+    neutralization_skipped_rate: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +114,8 @@ def _invalid_result(
     ic_valid_periods: int = 0,
     long_ir_valid_periods: int = 0,
     industry_neutralized: bool,
+    neutralization_skipped_dates: tuple[str, ...] = (),
+    neutralization_skipped_rate: float = 0.0,
 ) -> RewardResult:
     correlations = (
         {name: float(penalty.correlations[name]) for name in STYLE_NAMES}
@@ -142,6 +147,8 @@ def _invalid_result(
         ic_valid_periods=ic_valid_periods,
         long_ir_valid_periods=long_ir_valid_periods,
         industry_neutralized=industry_neutralized,
+        neutralization_skipped_dates=neutralization_skipped_dates,
+        neutralization_skipped_rate=float(neutralization_skipped_rate),
     )
 
 
@@ -155,6 +162,8 @@ def combine_reward_components(
     long_direction: int | None = None,
     ic_valid_periods: int = 0,
     long_ir_valid_periods: int = 0,
+    neutralization_skipped_dates: tuple[str, ...] = (),
+    neutralization_skipped_rate: float = 0.0,
 ) -> RewardResult:
     """应用冻结公式并同时保留 raw reward 与 TB 正值 reward。"""
 
@@ -172,6 +181,8 @@ def combine_reward_components(
             ic_valid_periods=ic_valid_periods,
             long_ir_valid_periods=long_ir_valid_periods,
             industry_neutralized=neutralized,
+            neutralization_skipped_dates=neutralization_skipped_dates,
+            neutralization_skipped_rate=neutralization_skipped_rate,
         )
     if not np.isfinite(train_long_ir):
         return _invalid_result(
@@ -184,6 +195,8 @@ def combine_reward_components(
             ic_valid_periods=ic_valid_periods,
             long_ir_valid_periods=long_ir_valid_periods,
             industry_neutralized=neutralized,
+            neutralization_skipped_dates=neutralization_skipped_dates,
+            neutralization_skipped_rate=neutralization_skipped_rate,
         )
     if not np.isfinite(penalty.barra_ts_corr):
         return _invalid_result(
@@ -196,6 +209,8 @@ def combine_reward_components(
             ic_valid_periods=ic_valid_periods,
             long_ir_valid_periods=long_ir_valid_periods,
             industry_neutralized=neutralized,
+            neutralization_skipped_dates=neutralization_skipped_dates,
+            neutralization_skipped_rate=neutralization_skipped_rate,
         )
 
     clipped_ir = float(np.clip(train_long_ir, 0.0, config.long_ir_cap))
@@ -216,6 +231,8 @@ def combine_reward_components(
             ic_valid_periods=ic_valid_periods,
             long_ir_valid_periods=long_ir_valid_periods,
             industry_neutralized=neutralized,
+            neutralization_skipped_dates=neutralization_skipped_dates,
+            neutralization_skipped_rate=neutralization_skipped_rate,
         )
     reward = max(raw_reward, config.reward_floor)
     correlations = {name: float(penalty.correlations[name]) for name in STYLE_NAMES}
@@ -240,6 +257,8 @@ def combine_reward_components(
         ic_valid_periods=ic_valid_periods,
         long_ir_valid_periods=long_ir_valid_periods,
         industry_neutralized=neutralized,
+        neutralization_skipped_dates=neutralization_skipped_dates,
+        neutralization_skipped_rate=float(neutralization_skipped_rate),
     )
 
 
@@ -257,6 +276,8 @@ class RewardEvaluator:
         universe_mask: npt.ArrayLike | None = None,
         industry_labels: npt.ArrayLike | None = None,
         industry_fingerprint: str | None = None,
+        rebalance_indices: npt.ArrayLike | None = None,
+        evaluation_dates: npt.ArrayLike | None = None,
         cache: RewardCache | None = None,
     ) -> None:
         returns = np.asarray(forward_returns, dtype=np.float64)
@@ -272,8 +293,39 @@ class RewardEvaluator:
                 raise ValueError("启用候选因子行业中性化时必须提供 industry_labels")
             if not industry_fingerprint or not industry_fingerprint.strip():
                 raise ValueError("启用行业中性化时必须提供 industry_fingerprint")
+            if evaluation_dates is None:
+                raise ValueError("启用行业中性化时必须提供 evaluation_dates")
         if universe_mask is not None and np.asarray(universe_mask).shape != returns.shape:
             raise ValueError("universe_mask 必须与 forward_returns 同形")
+        fixed_indices: npt.NDArray[np.int64] | None = None
+        if rebalance_indices is not None:
+            raw_indices = np.asarray(rebalance_indices)
+            if raw_indices.ndim != 1 or not np.issubdtype(raw_indices.dtype, np.integer):
+                raise ValueError("rebalance_indices 必须是一维整数数组")
+            fixed_indices = raw_indices.astype(np.int64, copy=True)
+            if fixed_indices.size == 0:
+                raise ValueError("固定 rebalance_indices 不能为空")
+            if (fixed_indices < 0).any() or (fixed_indices >= returns.shape[0]).any():
+                raise IndexError("rebalance_indices 包含越界日期")
+            if np.unique(fixed_indices).size != fixed_indices.size:
+                raise ValueError("rebalance_indices 不能包含重复日期")
+            fixed_indices.setflags(write=False)
+
+        fixed_dates: npt.NDArray[np.datetime64] | None = None
+        if evaluation_dates is not None:
+            try:
+                fixed_dates = np.asarray(evaluation_dates, dtype="datetime64[D]").copy()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("evaluation_dates 必须能够转换为日期数组") from exc
+            if fixed_dates.ndim != 1 or fixed_dates.size != returns.shape[0]:
+                raise ValueError("evaluation_dates 必须是一维且与 forward_returns 日期轴等长")
+            if np.isnat(fixed_dates).any():
+                raise ValueError("evaluation_dates 不能包含 NaT")
+            if np.unique(fixed_dates).size != fixed_dates.size:
+                raise ValueError("evaluation_dates 不能包含重复日期")
+            if fixed_dates.size > 1 and not np.all(fixed_dates[:-1] < fixed_dates[1:]):
+                raise ValueError("evaluation_dates 必须严格升序")
+            fixed_dates.setflags(write=False)
 
         self.forward_returns = returns
         self.barra_long_short = dict(barra_long_short)
@@ -281,6 +333,8 @@ class RewardEvaluator:
         self.reward_config = reward_config
         self.universe_mask = universe_mask
         self.industry_labels = industry_labels
+        self.rebalance_indices = fixed_indices
+        self.evaluation_dates = fixed_dates
         self.cache = cache if cache is not None else RewardCache()
         manifest = {
             "schema": "factor_gfn.reward_context.v1",
@@ -289,9 +343,32 @@ class RewardEvaluator:
             "evaluation_config": asdict(evaluation_config),
             "reward_config": asdict(reward_config),
             "styles": list(STYLE_NAMES),
+            "rebalance_indices": (
+                fixed_indices.tolist() if fixed_indices is not None else None
+            ),
+            "evaluation_dates_sha256": (
+                hashlib.sha256(fixed_dates.astype("int64").tobytes()).hexdigest()
+                if fixed_dates is not None
+                else None
+            ),
         }
         payload = json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         self.context_fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _neutralization_summary(
+        self,
+        diagnostics: NeutralizationDiagnostics,
+        rebalance_indices: npt.NDArray[np.int64],
+    ) -> tuple[tuple[str, ...], float]:
+        if not self.reward_config.candidate_industry_neutralization:
+            return (), 0.0
+        if self.evaluation_dates is None:
+            raise RuntimeError("行业中性化诊断缺少 evaluation_dates")
+        active_rows = {int(index) for index in rebalance_indices}
+        skipped_rows = sorted(active_rows.intersection(diagnostics.skipped_rows))
+        skipped_dates = tuple(str(self.evaluation_dates[index]) for index in skipped_rows)
+        rate = len(skipped_rows) / len(active_rows) if active_rows else 0.0
+        return skipped_dates, float(rate)
 
     def evaluate(self, expression_hash: str, factor: npt.ArrayLike) -> RewardEvaluation:
         if not expression_hash:
@@ -305,6 +382,7 @@ class RewardEvaluator:
         if values.shape != self.forward_returns.shape:
             raise ValueError("factor 必须与 forward_returns 同形")
         neutralize = self.reward_config.candidate_industry_neutralization
+        diagnostics = NeutralizationDiagnostics()
         ic = evaluate_rank_ic(
             values,
             self.forward_returns,
@@ -312,9 +390,15 @@ class RewardEvaluator:
             industry_labels=self.industry_labels,
             universe_mask=self.universe_mask,
             neutralize_industry=neutralize,
+            rebalance_indices=self.rebalance_indices,
+            neutralization_diagnostics=diagnostics,
         )
         train_ic = ic.rebalance_summary.mean
         if not np.isfinite(train_ic) or train_ic == 0.0:
+            skipped_dates, skipped_rate = self._neutralization_summary(
+                diagnostics,
+                ic.rebalance_indices,
+            )
             penalty = BarraPenaltyResult(
                 barra_ts_corr=np.nan,
                 correlations={name: np.nan for name in STYLE_NAMES},
@@ -327,6 +411,8 @@ class RewardEvaluator:
                 penalty=penalty,
                 ic_valid_periods=ic.rebalance_summary.valid_periods,
                 industry_neutralized=neutralize,
+                neutralization_skipped_dates=skipped_dates,
+                neutralization_skipped_rate=skipped_rate,
             )
             self.cache.put(key, result)
             return RewardEvaluation(result=result, cache_hit=False)
@@ -341,6 +427,7 @@ class RewardEvaluator:
             industry_labels=self.industry_labels,
             universe_mask=self.universe_mask,
             neutralize_industry=neutralize,
+            neutralization_diagnostics=diagnostics,
         )
         long_summary = summarize_excess_returns(
             long_series.excess_return[ic.rebalance_indices],
@@ -354,11 +441,16 @@ class RewardEvaluator:
             industry_labels=self.industry_labels,
             universe_mask=self.universe_mask,
             neutralize_industry=neutralize,
+            neutralization_diagnostics=diagnostics,
         )
         penalty = calculate_barra_ts_corr(
             candidate_ls.long_short_return,
             self.barra_long_short,
             min_periods=self.reward_config.barra_min_common_periods,
+        )
+        skipped_dates, skipped_rate = self._neutralization_summary(
+            diagnostics,
+            ic.rebalance_indices,
         )
         result = combine_reward_components(
             expression_hash,
@@ -369,6 +461,8 @@ class RewardEvaluator:
             long_direction=direction,
             ic_valid_periods=ic.rebalance_summary.valid_periods,
             long_ir_valid_periods=long_summary.valid_periods,
+            neutralization_skipped_dates=skipped_dates,
+            neutralization_skipped_rate=skipped_rate,
         )
         self.cache.put(key, result)
         return RewardEvaluation(result=result, cache_hit=False)

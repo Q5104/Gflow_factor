@@ -139,6 +139,17 @@ class GFNTrainer:
         for method in ("evaluate", "fingerprint", "manifest"):
             if not callable(getattr(reward_provider, method, None)):
                 raise TypeError(f"reward_provider 缺少 {method}()")
+        provider_manifest = reward_provider.manifest()
+        if not isinstance(provider_manifest, dict):
+            raise TypeError("reward_provider.manifest() 必须返回 dict")
+        declared_reward_config = provider_manifest.get("reward_config")
+        if (
+            declared_reward_config is not None
+            and declared_reward_config != asdict(config.reward)
+        ):
+            raise ValueError(
+                "GFNConfig.reward 与 RewardProvider 声明的 reward_config 不一致"
+            )
         self.config = config
         self.reward_provider = reward_provider
         self.device = torch.device(device)

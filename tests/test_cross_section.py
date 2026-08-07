@@ -5,6 +5,7 @@ import numpy as np
 
 from factor_gfn.evaluator.cross_section import (
     IndustryNeutralizationWarning,
+    NeutralizationDiagnostics,
     clean_candidate_factor_cross_sections,
     clean_factor_cross_sections,
 )
@@ -45,6 +46,17 @@ class CrossSectionalCleaningTests(unittest.TestCase):
 
         self.assertTrue(np.isfinite(cleaned).all())
 
+    def test_integer_point_in_time_industries_use_negative_one_as_missing(self):
+        factor = np.array([[1.0, 3.0, 20.0], [2.0, 5.0, 30.0]])
+        industries = np.array(
+            [[801780, 801780, -1], [801780, 801150, 801150]],
+            dtype=np.int32,
+        )
+
+        cleaned = clean_candidate_factor_cross_sections(factor, industries)
+
+        self.assertTrue(np.isfinite(cleaned).all())
+
     def test_single_stock_industry_has_zero_residual(self):
         factor = np.array([[5.0, 1.0, 3.0]])
         industries = np.array(["单股票行业", "银行", "银行"], dtype=object)
@@ -56,15 +68,21 @@ class CrossSectionalCleaningTests(unittest.TestCase):
     def test_insufficient_industry_regression_warns_and_skips(self):
         factor = np.array([[1.0, 2.0]])
         industries = np.array(["银行", "计算机"], dtype=object)
+        diagnostics = NeutralizationDiagnostics()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            cleaned = clean_candidate_factor_cross_sections(factor, industries)
+            cleaned = clean_candidate_factor_cross_sections(
+                factor,
+                industries,
+                diagnostics=diagnostics,
+            )
 
         expected = clean_factor_cross_sections(factor)
         np.testing.assert_allclose(cleaned, expected)
         self.assertTrue(
             any(item.category is IndustryNeutralizationWarning for item in caught)
         )
+        self.assertEqual(diagnostics.skipped_rows, {0})
 
 
 if __name__ == "__main__":

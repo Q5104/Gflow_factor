@@ -110,6 +110,8 @@ def build_barra_long_short_returns(
     forward_returns: npt.ArrayLike,
     rebalance_indices: npt.ArrayLike,
     config: BarraConfig = DEFAULT_BARRA_CONFIG,
+    *,
+    universe_mask: npt.ArrayLike | None = None,
 ) -> dict[str, LongShortSeries]:
     """Return five separate style long-short series; never combine styles."""
     return {
@@ -118,6 +120,7 @@ def build_barra_long_short_returns(
             forward_returns,
             rebalance_indices,
             config,
+            universe_mask=universe_mask,
         )
         for name in STYLE_NAMES
     }

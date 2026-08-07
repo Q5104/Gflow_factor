@@ -45,6 +45,26 @@ class ForwardReturnTests(unittest.TestCase):
 
 
 class RankICTests(unittest.TestCase):
+    def test_explicit_rebalance_indices_are_not_shifted_by_factor_warmup(self):
+        stock_count = 30
+        factor = np.tile(np.linspace(-1.0, 1.0, stock_count), (12, 1))
+        returns = factor.copy()
+        factor[:4] = np.nan
+        fixed = np.array([1, 6, 11], dtype=np.int64)
+
+        result = evaluate_rank_ic(
+            factor,
+            returns,
+            EvaluationConfig(min_cross_section_count=10),
+            neutralize_industry=False,
+            rebalance_indices=fixed,
+        )
+
+        np.testing.assert_array_equal(result.rebalance_indices, fixed)
+        self.assertTrue(np.isnan(result.rebalance_values[0]))
+        self.assertAlmostEqual(result.rebalance_values[1], 1.0)
+        self.assertAlmostEqual(result.rebalance_values[2], 1.0)
+
     def setUp(self):
         self.config = EvaluationConfig(min_cross_section_count=3)
 

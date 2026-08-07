@@ -6,13 +6,11 @@ Notebook 或旧命令在本轮下载结束前失效；新代码应直接从包�
 
 from factor_gfn.data.downloader import (
     DEFAULT_START_DATE,
-    INDUSTRY_SW_PATH,
     LISTING_DATES_PATH,
     MARKET_DATA_PATH,
     RAW_CLOSE_PATH,
     STOCK_SHARES_PATH,
     download_adjusted_market,
-    download_industry_sw,
     download_raw_close,
     download_stock_shares,
     download_stock_list,
@@ -21,14 +19,12 @@ from factor_gfn.data.downloader import (
 
 __all__ = [
     "DEFAULT_START_DATE",
-    "INDUSTRY_SW_PATH",
     "LISTING_DATES_PATH",
     "MARKET_DATA_PATH",
     "RAW_CLOSE_PATH",
     "STOCK_SHARES_PATH",
     "download_stock_list",
     "download_adjusted_market",
-    "download_industry_sw",
     "download_raw_close",
     "download_stock_shares",
     "print_download_summary",

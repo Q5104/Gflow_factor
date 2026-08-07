@@ -3,7 +3,7 @@
 > 状态：初版、持续更新  
 > 建立日期：2026-08-04  
 > 最近同步：2026-08-07  
-> 当前阶段：阶段 4 合成训练闭环已完成，准备接入真实 Reward 与正式训练  
+> 当前阶段：阶段 1–4 工程验收已完成，准备进入阶段 5 因子筛选与回测验证
 > 重要说明：本文用于记录开发路线、已确认决策、待确认问题和验收标准，不是不可修改的冻结规格。
 
 ## 1. 项目目标
@@ -56,9 +56,9 @@
 - 五个手工 Barra 风格因子及独立多空收益：`factor_gfn/barra/`；
 - Transformer 前向策略、轨迹、Reward、TB Loss、Trainer 与检查点：`factor_gfn/gfn/`；
 - 手工下载、处理及阶段 2–4 验证入口：`notebooks/`；
-- 合成单元与集成测试：`tests/`，当前完整测试为 164 项；
+- 单元与集成测试：`tests/`，当前完整测试为 178 项；
 - 原始数据、断点和处理结果分别位于 `data/raw/`、`data/download_parts/`、`data/processed/`，均不进入 Git；
-- Git 仓库已初始化，但项目文件尚未建立首个基线提交。
+- Git 仓库已初始化并已建立项目基线提交；后续修改仍需分阶段审查后提交。
 
 ### 3.2 当前数据层状态
 
@@ -67,23 +67,23 @@
 - 获取股票主表；
 - 下载 `adjust_type=2` 后复权日频行情；
 - 下载 `adjust_type=0` 不复权收盘价；
-- 下载历史股本和当前申万一、二级行业分类；
+- 下载历史股本；
 - 断点续传、分片合并和轻量 QA。
 
-`factor_gfn/data/preprocess.py` 已实现后复权 VWAP、六特征清洗、有效值 mask、股票池 mask、索引与元数据输出。股票主表、两套行情、历史股本及处理结果已经完成下载或验证；申万行业下载仍可能受接口限流影响，未完整前不得声称已完成正式行业中性化数据准备。
+`factor_gfn/data/preprocess.py` 已实现后复权 VWAP、六特征清洗、有效值 mask、股票池 mask、索引与元数据输出。股票主表、两套行情、历史股本及处理结果已经完成下载或验证。申万行业不再依赖受限流影响的 adata 静态接口，改用 `参考文件/swind/` 的逐交易日一、二、三级 CSV；`factor_gfn/data/industry.py` 负责严格校验、流式合并和行情键对齐，全量转换由用户通过 `prepare_industry_data.ipynb` 手动启动。
 
 ### 3.3 当前阶段实现状态
 
 - 阶段 1：核心清洗、VWAP、矩阵化及验证已经完成；
 - 阶段 2：52 个算子、142 个 Token、规范化部分 AST、多路径 DAG、父状态枚举和表达式转换已经完成；
 - 阶段 3：全部 52 个数值算子、解释器、候选截面清洗、行业中性化、5 日指标及 Barra 风格计算已经完成；
-- 阶段 4：路径条件化 Transformer、可微采样、Reward 合同、固定均匀 `P_B`、TB Loss、可学习 `logZ`、Trainer、检查点及合成训练闭环已经完成；
-- 当前尚未完成：行业数据完整接入后的真实 Reward 验证、正式训练、候选因子持久化归档及阶段 5 筛选回测。
+- 阶段 4：路径条件化 Transformer、可微采样、Reward 合同、固定均匀 `P_B`、TB Loss、可学习 `logZ`、Trainer、检查点、合成训练闭环、真实数据上下文、真实 Reward 预检及五步最小真实训练已经完成；
+- 点时行业长表已完成全量构建与 QA，并已通过阶段三行业中性化实跑验证；阶段 1–4 的工程验收已完成，下一步进入阶段 5。五步最小实验只证明真实训练链路与确定性续跑可用，不等同于研报规模的正式训练。
 
 ### 3.4 当前执行边界
 
 - 根目录 `data_loader.py` 继续作为兼容入口，正式实现以 `factor_gfn/data/downloader.py` 为准；
-- 行业数据未完整时允许运行纯文法、解释器合成测试和阶段 4 合成训练，不允许完成正式行业中性化 Reward 训练；
+- `industry_sw_daily.parquet` 已生成并通过 QA；正式 Reward 必须启用点时申万一级行业中性化，不再允许静默降级；
 - 长时间下载、真实数据预处理和正式训练由用户手动启动；
 - 不删除未完成的行业断点，不重写原始 Parquet，不将数据、研报、检查点或本地运行结果提交 Git；
 - 真实训练前必须再次核对数据指纹、行业覆盖、Reward 配置、训练/验证日期和运行元数据。
@@ -98,7 +98,8 @@
 | `data/raw/market_data.parquet` | `k_type=1`, `adjust_type=2` | `trade_date`, `stock_code`, `open`, `high`, `low`, `close`, `volume`, `amount` |
 | `data/raw/raw_close.parquet` | `k_type=1`, `adjust_type=0` | `trade_date`, `stock_code`, `close` |
 | `data/raw/stock_shares_history.parquet` | `get_stock_shares(is_history=True)`，下载后生成 | `stock_code`, `change_date`, `total_shares`, `limit_shares`, `list_a_shares`, `change_reason` |
-| `data/raw/industry_sw.parquet` | `get_industry_sw()` 当前申万行业分类，下载后生成 | `stock_code`, `sw_code`, `industry_name`, `industry_type`, `source` |
+| `参考文件/swind/swind_YYYYMMDD.csv` | 外部逐交易日申万一、二、三级行业源数据，不进入 Git | `TradingDay`, `StockCode`, `StockName`, `SWCode1/SWName1`, `SWCode2/SWName2`, `SWCode3/SWName3` |
+| `data/processed/industry_sw_daily.parquet` | 以 `daily_clean.parquet` 行情键左连接生成的点时行业长表 | `trade_date`, `stock_code`, `stock_name`, `sw_code_1/sw_name_1`, `sw_code_2/sw_name_2`, `sw_code_3/sw_name_3` |
 
 ### 4.2 已确认 VWAP 口径
 
@@ -208,7 +209,7 @@ reward = abs(train_ic)
 在每个 5 日调仓评价期：
 
 - 候选因子只在当期 `universe_mask=True` 且因子有限的截面内，依次执行 1%/99% 缩尾、申万一级行业哑变量 OLS 回归取残差、`ddof=0` z-score；
-- 候选因子的行业分类使用 `stock.info.get_industry_sw()` 返回的 `industry_name`。每个调仓日基于当前有效股票池实际出现的行业构造哑变量，第一版 OLS 含截距，并通过稳定最小二乘求解；
+- 候选因子的行业分类使用 `industry_sw_daily.parquet` 当日 `sw_code_1`。每个调仓日基于当前有效股票池实际出现的申万一级代码构造哑变量，第一版 OLS 含截距，并通过稳定最小二乘求解；`sw_name_1` 仅用于展示和 QA；
 - 候选股票缺失行业信息时不参与行业回归，其缩尾后但未经残差替换的因子值保留并进入同一截面的后续 z-score。这里的“保留原始值”特指保留缩尾后的值，不回退到缩尾前数值；
 - 若某行业只有一只有效股票，保留该行业哑变量，该股票在可识别的行业回归中允许得到 0 残差；若截面有效股票数少于行业数加 1，则整个截面跳过行业中性化、直接 z-score，并为该日期记录一次可汇总警告；
 - 每个 Barra 风格暴露仍只执行 1%/99% 缩尾与 `ddof=0` z-score，禁止进行行业中性化或市值中性化；NaN 保持 NaN，常数截面清洗后记为 NaN；
@@ -225,7 +226,7 @@ barra_ts_corr = max_k abs(candidate_corr_k)
 
 绝对值使该惩罚对候选因子和 Barra 因子的正负方向不敏感。第一版最低共同有效调仓期数固定为 60，约对应 300 个交易日或 14 个月；该设置用于提高相关性估计稳定性及跨市场状态覆盖概率，但不保证样本必然包含完整牛熊周期。任一候选因子与所有 Barra 序列均不足 60 个共同有效调仓期时，`barra_ts_corr=NaN`；硬性条件 `barra_ts_corr < 0.7` 对 NaN 返回不通过。分位数边界并列值沿用稳定股票代码顺序处理。
 
-行业数据接入前必须用实际接口结果核对 `get_industry_sw()` 是否提供历史生效日期。如果接口只返回当前申万一级行业归属，第一版只能将其作为静态行业代理，并在实验元数据和报告中明确记录该限制，不能声称完成了严格的历史点时行业中性化。
+点时行业源数据按交易日提供历史分类。使用时以候选因子日期 `t` 的同日 `sw_code_1` 作为行业标签，并继续在实验元数据中记录源文件范围和数据指纹。源文件中出现的上市前回填、退市股票和行情体系外代码不直接进入面板；最终长表必须以 `daily_clean.parquet` 的 `(trade_date, stock_code)` 为左表对齐，避免行业源数据扩张股票池或制造上市前样本。
 
 #### 5.3.3 Barra 数据需求与当前缺口
 
@@ -316,7 +317,7 @@ forward_return_5d[t] = open[t+6] / open[t+1] - 1
 - 后复权行情与不复权收盘价的键覆盖差异已统计；
 - 下载程序已经停止，最终文件不再被写入。
 
-当前状态（2026-08-07）：股票主表、后复权行情、不复权收盘价和历史股本已完成；申万行业属于候选因子行业中性化的补充输入，仍可能因接口限流而不完整，其断点必须保留。
+当前状态（2026-08-07）：股票主表、后复权行情、不复权收盘价和历史股本已完成。原 adata 行业接口已退出并移除；正式行业输入改为 `参考文件/swind/` 点时 CSV，已经独立完成全量转换、QA 和阶段三中性化接入验证。
 
 ### 阶段 1：数据清洗、VWAP 与矩阵化
 
@@ -467,7 +468,7 @@ TB 轨迹必须同时记录 `log P_F(slot)`、`log P_F(token|slot)`、后继状�
 - Reward 结果必须保留 `barra_correlations` 字典中的五个带符号 Pearson 相关系数；`barra_ts_corr` 仅作为 `max_k abs(corr_k)` 聚合惩罚值。同时记录绝对相关性最大的风格名称及其带符号相关系数，供后续分析暴露方向。
 - `reward_floor=1e-8` 是可配置的 TB 数值稳定下界，只对指标均有效但原始 reward 过小的样本生效；原始 reward、稳定化 reward、`log_reward` 和是否触发 floor 必须分别记录。任何 IC、Long IR 或 Barra 相关性无效的候选均保持无效，禁止用 floor 伪装成有效低奖励样本。
 - Reward 缓存第一版采用有容量上限的进程内 LRU，以“数据上下文指纹 + Reward/Evaluation 配置 + 表达式结构哈希”隔离结果。候选行业中性化开关及行业数据指纹必须进入上下文；不得在开启和暂时跳过行业中性化的运行间共享缓存。
-- 行业数据尚未完整下载期间，阶段四联调允许通过显式配置 `candidate_industry_neutralization=False` 暂时跳过候选行业中性化，并在每个 Reward 结果中记录该状态；阶段三默认口径仍是启用行业中性化，正式训练切换为启用时必须同时提供行业标签与行业数据指纹。
+- 点时行业长表尚未生成或未通过 QA 时，阶段四联调允许通过显式配置 `candidate_industry_neutralization=False` 暂时跳过候选行业中性化，并在每个 Reward 结果中记录该状态；阶段三默认口径仍是启用行业中性化，正式训练切换为启用时必须同时提供当日一级行业标签与行业数据指纹。
 - 研报图表中的 batch 内相关性与 Barra 风格相关性是两个独立诊断：前者后续按固定间隔统计候选因子两两相关性的 `mean(abs(corr))` 与 `median(abs(corr))`，只用于模式坍塌分析，不进入第一版 reward。
 - TB 目标严格定义为 `mean((logZ + sum_log_pf - log_reward - sum_log_pb)^2)`；`logZ` 是全局单一可学习标量，第一版初始化为 `0.0`（即 `Z=1`），研报未披露该初始化值。
 - TB 的 Delta 使用 `float64` 累加以提高极小 Reward 和长轨迹的数值稳定性，梯度仍回传至原 dtype 的 Transformer 与 `logZ`。Loss 不加入轨迹长度归一化、Delta 截断、Reward 重加权、流守恒项或其他正则。
@@ -571,6 +572,50 @@ Trainer 最多采样 `10*batch_size` 个候选以补满有效 batch，未补满�
 
 手动验收入口为 `notebooks/validate_stage4_synthetic_training.ipynb`，不读取真实数据，输出只写入 `tmp/synthetic_runs/`。
 
+#### 6.4.7 第七步：真实 Reward 接入与最小实验
+
+目标：在不改变已冻结 Reward 公式、行业中性化和 Barra 惩罚口径的前提下，将真实日频数据接入现有 `RewardProvider → TB Loss → Trainer` 合同；先建立可复核的性能基线，再决定是否优化或扩大训练。
+
+实现状态（2026-08-07）：四部分均已完成工程验收。`factor_gfn/gfn/real_data.py` 以只读 mmap 组装训练上下文并排除验证期，建立统一五日调仓日历、五条 Barra LS、数据指纹和 QA 清单。真实训练期为 2010-01-04 至 2018-12-28；全局调仓日为 2011-01-18 至 2018-12-17，共 386 期，五条 Barra LS 均有 386 个有效期。训练股票池内共有 4,318,753 个有效股票—日期样本，申万一级缺失为 0；稠密矩阵中的 `-1` 主要对应尚未上市或不在当日股票池的占位格。上下文不暴露 2019 年后的特征行，末端不完整未来收益标签也不进入调仓日历。`factor_gfn/gfn/real_reward.py` 已实现解释器接入、强制行业中性化、全局日历 Reward、解释前 LRU、完整诊断记录和 Provider 指纹；通用阶段三指标保留未显式传入日历时的原分析行为。真实 Reward 人工表达式预检已得到多个有效候选，并确认五条 Barra LS 可参与相关性计算、缓存命中和标签边界合同。CPU 五步最小真实训练完成 5 次参数更新，无跳过更新、非法动作或 NaN/Inf Loss；第 4 步检查点完整恢复后，第 5 步候选序列、统计、模型、`logZ`、优化器及随机状态与连续运行逐项一致。当前完整测试为 178 项。
+
+**第一部分：真实 Reward 数据上下文**
+
+- 以只读 mmap 加载六特征张量、`universe_mask`、日期、股票和五个 Barra 暴露矩阵；加载与行情键完全一致的申万一级点时行业矩阵。
+- 未来五日收益继续采用 `open[t+6] / open[t+1] - 1`。训练集固定为 2010-01-01 至 2018-12-31；任何退出日在 2018-12-31 之后的标签不得进入训练 Reward，2019-2020 验证集保持隔离。
+- 在统一训练评价日历上分别构造 Market Beta、Size、Momentum、Volatility、Liquidity 五条 Long-Short 收益序列，不合成 Barra 因子。
+- 数据上下文指纹至少覆盖日期、股票、预处理元数据、行业元数据、Barra 元数据、评价配置和 Reward 配置；检查点不得跨不同上下文恢复。
+- 验收包括所有矩阵轴严格一致、行业缺失值为 `-1`、五条 Barra LS 非全 NaN/非常数、有效期充足、评价日期不越过训练边界，以及每条序列的有效期数、均值、波动和累计收益摘要。
+
+**第二部分：`RealRewardProvider`**
+
+- 新增真实 Provider，将 `Expression → FactorInterpreter → 原始因子矩阵 → RewardEvaluator → RewardAssignment` 接入 Trainer；正式模式强制 `candidate_industry_neutralization=True`。
+- `RewardEvaluator` 必须显式接收第一部分生成的全局 `rebalance_indices`，RankIC、Long IR、候选 LS 与五条 Barra LS 全部使用同一日历；禁止再次调用“按候选首次有效日”生成日历的旧分支。通用阶段三接口仍可保留未传入固定日历时的原行为，以维持分析兼容性。
+- Reward 严格保持 `abs(train_ic) × (1 + 0.3 × clip(train_long_ir, 0, 2)) × (1 - 0.2 × clip(barra_ts_corr, 0, 1))`；`barra_ts_corr=max_k abs(corr_k)`，最低共同有效期为 60。
+- 保存五个带符号 Barra 相关系数、最大暴露风格、共同有效期数、IC/Long IR 有效期数、原始/稳定化/log Reward 和行业中性化状态；每个候选还必须持久化固定调仓日历上去重后的 `neutralization_skipped_dates` 及其占调仓期数的 `neutralization_skipped_rate`，包括最终无效的候选。
+- 在解释表达式前按“数据上下文指纹 + 表达式结构哈希”检查 Provider 级有界缓存，避免重复表达式再次执行整张因子矩阵；不缓存完整因子矩阵。
+- Provider 记录每次真正执行的表达式公式、结构哈希、节点数、深度、因子有限覆盖率、解释器耗时、指标耗时、有效性、拒绝原因及完整 Reward 拆解；缓存命中另行计数，不伪装成一次新的因子计算。最小真实训练 Notebook 将完整候选清单持久化为 `evaluations.jsonl`。
+- Provider 指纹必须包含真实数据上下文指纹、评价配置、Reward 配置、固定日历摘要、行业中性化状态和缓存合同；相同结构表达式只在同一 Provider 上下文中共享结果。
+- 指标无效的候选返回明确拒绝原因且不得用 Reward floor 兜底；解释器、形状或数据合同错误必须立即抛出，不得伪装为普通无效候选。
+
+**第三部分：真实 Reward 预检与性能基线**
+
+- 先评价少量人工表达式，不进行参数更新；至少覆盖叶子、时序、二元组合和截面算子。
+- 记录因子计算与 Reward 计算耗时、峰值内存、有效覆盖率、RankIC、Long IR、五个带符号 Barra 相关、最终 Reward、拒绝原因和缓存命中。
+- 只有确认行业中性化实际运行、五条 Barra LS 可参与相关性、标签无越界且时间/内存可接受后，才进入训练。
+- 若该基线已经形成瓶颈，先根据实测定位解释器、滚动算子、截面回归或组合评价的占比，再决定是否引入 Numba、额外 MemMap、并行或分层缓存，不预先优化。
+
+**第四部分：最小真实训练实验**
+
+- 第一轮仅采用工程试验配置：`max_depth=5`、`max_nodes=12`、`d_model=64`、4 heads、2 layers、feedforward 128、dropout 0、batch size 2、最多 5 步、`temperature=1.0`、随机采样、Transformer 学习率 `1e-4`、logZ 学习率 `1e-3`、补采倍数 10、seed 42、CPU。它们不代表研报超参数或正式训练配置。
+- 监控 Loss、Reward、logZ、梯度范数、有效 batch、拒绝率、跳过更新、结构唯一率、轨迹长度、联合策略熵和非法动作率。
+- 保存整个实验期间所有被评价表达式的公式、结构哈希、有效性、Reward 拆解和 Barra 暴露方向，不只保留最后一个 batch；结果、运行元数据和检查点写入已忽略的 `runs/real_minimal/<run_id>/`。
+- 验收要求至少完成 3 次真实参数更新，Transformer 与 logZ 均有限变化，非法动作率为 0，Loss 无 NaN/Inf，且检查点可以继续运行一步。
+- 若拒绝率持续超过 80%，先分析无效原因；不得自动降低 60 期门槛、关闭行业中性化或直接扩大正式训练规模。
+
+**已确认：全局统一调仓日历**
+
+所有候选与五个 Barra 风格共用一组训练调仓日期：在训练区间内寻找五个 Barra 风格均达到最小截面样本数且未来收益标签完整的首个日期，从该日期起每 5 个交易日评价，并截断在最后一个全局可评价日以内。候选表达式在自身尚未形成有效值的调仓日保留 NaN，相关性及指标只使用共同有效期。不得再根据各候选首次有效日平移其调仓相位，也不得为每个候选动态重建另一套 Barra 日历。
+
 ### 阶段 5：因子筛选与回测验证
 
 目标：从搜索结果中得到稳定、低相关的 Alpha 池。
@@ -638,6 +683,8 @@ factor_gfn/
 │   ├── trajectory.py
 │   ├── policy_sampler.py
 │   ├── reward.py
+│   ├── real_data.py
+│   ├── real_reward.py
 │   ├── loss.py
 │   ├── trainer.py
 │   └── checkpoint.py
@@ -688,7 +735,7 @@ factor_gfn/
 ### GFlowNet
 
 - 正式训练的 Transformer 规模、batch size、学习率、训练步数和硬件预算；
-- 真实 Reward 初期的无效轨迹比例、有效 batch 补采上限及是否需要调整；
+- 正式规模训练中的无效轨迹比例、有效 batch 补采上限及是否需要调整；
 - 训练期间候选表达式持久化归档、验证检查点选择和训练后补采规模；
 - 数值指纹、退化因子和高度相关因子的阶段 5 去重与筛选细节。
 
@@ -736,7 +783,7 @@ factor_gfn/
 - 候选因子市值中性化暂缓，待阶段五回测评估市值暴露后决定；当前由 reward 中的 Barra Size 惩罚把关。
 - 第一版 Barra 集合继续仅保留 Market Beta、Size、Momentum、Volatility、Liquidity；Value、Earnings Yield、Growth、Leverage、Profitability、Dividend Yield 全部暂缓，仅在附录记录参考公式和数据源。
 - Barra 参数调整为：Beta 252 日且 `min_periods=120`；Volatility 252 日且 `min_periods=120`；Liquidity 默认 60 日平均换手率；Size 固定 `log(流通市值)`；Momentum 保持 252/21。
-- 新增 `get_industry_sw(stock_code=code)` 可续传下载：原始文件保留申万一级、二级及来源字段，每只股票至少具有一条有效申万一级记录才记为下载成功；断点位于 `data/download_parts/industry_sw/`。
+- 早期曾接入 `get_industry_sw(stock_code=code)` 静态行业下载；该方案因限流且无法提供历史点时行业，已于 2026-08-07 被逐日 `swind` 数据替代，相关下载器、断点和静态加载器均已删除。
 - 阶段三候选评价接口将行业标签设为必需输入，并实现“1%/99% 缩尾 → 申万一级行业 OLS 残差化 → `ddof=0` z-score”；支持静态 `(stock,)` 和未来点时 `(date, stock)` 行业标签。Barra 清洗入口保持不变。
 - 移除 `ts_corr`、`ts_cov` 的交换律标记：二者虽数值对称，但不纳入交换去重，以保持与 `ts_beta`、`ts_orth` 的方向性一致；交换规范化仅用于 `add`、`mul`、`max2`、`min2`，动作空间内容与指纹不变。
 - 废止前序固定槽位生成状态机，改用带显式 Hole 的规范化部分有序 AST DAG；前序和后序仅保留为完整表达式序列化格式。
@@ -758,6 +805,16 @@ factor_gfn/
 - 同步项目状态：阶段 1–3 已完成，阶段 4 六个子步骤及合成训练闭环已完成，当前转入真实 Reward 接入与正式训练准备。
 - 明确行业数据未完整时只允许跳过行业中性化进行合成或显式降级联调，不得据此完成正式训练结论。
 - 更新实际代码结构、当前执行边界和待确认问题；原始数据、断点、处理结果、研报及模型检查点继续排除在 Git 之外。
+- 申万行业正式来源由 adata 当前静态接口替换为 `参考文件/swind/` 逐交易日点时 CSV；源数据覆盖 2008-12-01 至 2026-08-06，并同时保留申万一、二、三级代码和名称。
+- 新增长表合同 `factor_gfn.industry_sw_daily.v1`：股票及三级行业代码去除市场后缀但保持六位字符串，以 `daily_clean.parquet` 行情键左连接，输出键必须与行情长表完全一致；候选因子行业中性化使用当日 `sw_code_1`。
+- 新增严格源数据检查、DuckDB 流式原子构建、输出覆盖 QA、`int32` 点时面板加载及 `prepare_industry_data.ipynb`；`-1` 表示行业缺失，旧 adata 静态加载器及下载入口已删除。
+- 完成点时行业全量构建：输出 13,070,721 行、4,027 个交易日、5,424 只股票，与 `daily_clean.parquet` 双向键差异均为 0；三级行业缺失率均为 0.1923%，重复键及同日代码—名称冲突均为 0。
+- 一级行业 `int32` 点时矩阵已实际接入阶段三候选因子中性化并产生有限结果。由此删除旧 adata 行业下载器、静态加载器、旧 13,954 字节 Parquet 和 51 个未完成分片；4,296 个源 CSV 同盘迁移至 `参考文件/swind/`，不进入 Git。
+- 完成真实 Reward 人工表达式预检与性能基线；确认存在多个有效 Reward 候选、五条 Barra LS 均可计算相关性、Provider 缓存命中且训练标签不越过训练边界。小样本截面跳过行业回归的警告属于可追踪的数据完整度诊断，不改变 60 期门槛或行业中性化总口径。
+- 完成 CPU 五步最小真实训练：5 步均发生有效参数更新，拒绝率最高为 1/3，非法动作率为 0，无跳过更新及 NaN/Inf Loss；Transformer 与 `logZ` 均发生有限变化。
+- 完成确定性续跑验收：第 4 步检查点的模型、`logZ`、优化器、步数和 Python/NumPy/PyTorch 随机状态完整恢复，恢复后的第 5 步与连续五步运行逐项一致。
+- 为每个候选 Reward 增加 `neutralization_skipped_dates` 与 `neutralization_skipped_rate` 持久化诊断，并修复实验 manifest 的自包含文件清单。上述两项是在五步实验后发现的非阻塞产物完整性修复；历史 run 保留原样，新运行使用修复后的合同。
+- 完成阶段 1–4 收口检查：旧 adata 静态行业下载代码、旧行业 Parquet 与断点均已移除，原始数据、处理产物、运行目录和检查点继续由 `.gitignore` 隔离；项目转入阶段 5 前置状态。
 
 ## 附录A：暂缓的 Barra 风格因子参考实现
 

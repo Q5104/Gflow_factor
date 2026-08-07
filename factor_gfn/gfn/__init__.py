@@ -22,6 +22,14 @@ from .reward import (
     RewardResult,
     combine_reward_components,
 )
+from .real_data import (
+    REAL_REWARD_CONTEXT_SCHEMA,
+    RealRewardDataConfig,
+    RealRewardDataContext,
+    RealRewardDataPaths,
+    build_global_rebalance_indices,
+    build_real_reward_data_context,
+)
 from .state_adapter import (
     HOLE_TOKEN_ID,
     MODEL_TOKEN_COUNT,
@@ -44,6 +52,12 @@ from .trainer import (
     SyntheticRewardProvider,
     TRAINER_SCHEMA,
     seed_everything,
+)
+from .real_reward import (
+    DEFAULT_REAL_REWARD_CONFIG,
+    REAL_REWARD_PROVIDER_SCHEMA,
+    RealRewardEvaluationRecord,
+    RealRewardProvider,
 )
 from .checkpoint import CHECKPOINT_SCHEMA, load_checkpoint, save_checkpoint, write_run_metadata
 
@@ -70,6 +84,14 @@ __all__ = [
     "RewardResult",
     "RewardAssignment",
     "RewardProvider",
+    "REAL_REWARD_CONTEXT_SCHEMA",
+    "RealRewardDataConfig",
+    "RealRewardDataContext",
+    "RealRewardDataPaths",
+    "DEFAULT_REAL_REWARD_CONFIG",
+    "REAL_REWARD_PROVIDER_SCHEMA",
+    "RealRewardEvaluationRecord",
+    "RealRewardProvider",
     "SamplingConfig",
     "STATE_ADAPTER_SCHEMA",
     "StateAdapter",
@@ -92,6 +114,8 @@ __all__ = [
     "write_run_metadata",
     "seed_everything",
     "combine_reward_components",
+    "build_global_rebalance_indices",
+    "build_real_reward_data_context",
     "state_hash",
     "state_adapter_manifest",
 ]

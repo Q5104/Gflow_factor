@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from tempfile import TemporaryDirectory
-import unittest
-from unittest import mock
 
 import pandas as pd
 
@@ -19,18 +16,6 @@ def _share_response(code: str) -> pd.DataFrame:
             "limit_shares": [400_000, 300_000],
             "list_a_shares": [600_000, 900_000],
             "change_reason": ["首次记录", "股份变动"],
-        }
-    )
-
-
-def _industry_response(code: str) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "stock_code": [code, code],
-            "sw_code": ["710000", "710400"],
-            "industry_name": ["计算机", "软件开发"],
-            "industry_type": ["申万一级", "申万二级"],
-            "source": ["百度股市通", "百度股市通"],
         }
     )
 
@@ -116,109 +101,3 @@ def test_stock_shares_download_resumes_from_successful_parts(
     assert second["stock_count"] == 2
     assert second["missing_codes"] == []
     assert calls == []
-
-
-def test_prepare_industry_response_requires_level1_and_keeps_two_levels() -> None:
-    result = downloader._prepare_industry_sw_response(
-        _industry_response("300033"),
-        "300033",
-    )
-
-    assert result.columns.tolist() == downloader.INDUSTRY_SW_COLUMNS
-    assert result["stock_code"].tolist() == ["300033", "300033"]
-    assert set(result["industry_type"]) == {"申万一级", "申万二级"}
-
-    only_level2 = _industry_response("300033").iloc[[1]]
-    try:
-        downloader._prepare_industry_sw_response(only_level2, "300033")
-    except ValueError as exc:
-        assert "申万一级" in str(exc)
-    else:
-        raise AssertionError("缺少申万一级时应拒绝该股票响应")
-
-
-def test_industry_download_resumes_from_successful_parts(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    raw_dir = tmp_path / "raw"
-    parts_dir = tmp_path / "download_parts"
-    output_path = raw_dir / "industry_sw.parquet"
-    stocks = pd.DataFrame({"stock_code": ["000001", "300033"]})
-    calls: list[str] = []
-
-    monkeypatch.setattr(downloader, "DOWNLOAD_PARTS_DIR", parts_dir)
-    monkeypatch.setattr(downloader, "INDUSTRY_SW_PATH", output_path)
-    monkeypatch.setattr(
-        downloader,
-        "download_stock_list",
-        lambda force_update=False: stocks.copy(),
-    )
-
-    def fake_get_industry_sw(stock_code: str) -> pd.DataFrame:
-        calls.append(stock_code)
-        return _industry_response(stock_code)
-
-    monkeypatch.setattr(
-        downloader.adata.stock.info,
-        "get_industry_sw",
-        fake_get_industry_sw,
-    )
-
-    first = downloader.download_industry_sw(force_update=False)
-    assert first["stock_count"] == 2
-    assert first["missing_codes"] == []
-    assert calls == ["000001", "300033"]
-    assert list((parts_dir / "industry_sw").glob("part_*.parquet"))
-
-    calls.clear()
-    second = downloader.download_industry_sw(force_update=False)
-    assert second["stock_count"] == 2
-    assert second["missing_codes"] == []
-    assert calls == []
-
-
-class IndustryDownloaderUnittest(unittest.TestCase):
-    def test_only_level2_is_not_treated_as_completed(self) -> None:
-        with TemporaryDirectory() as temporary:
-            path = Path(temporary) / "industry.parquet"
-            _industry_response("300033").iloc[[1]].to_parquet(path, index=False)
-            self.assertEqual(downloader._industry_level1_codes(path), set())
-
-    def test_industry_download_checkpoint_resume(self) -> None:
-        with TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            parts_dir = root / "download_parts"
-            output_path = root / "raw" / "industry_sw.parquet"
-            stocks = pd.DataFrame({"stock_code": ["000001", "300033"]})
-            calls: list[str] = []
-
-            def fake_get_industry_sw(stock_code: str) -> pd.DataFrame:
-                calls.append(stock_code)
-                return _industry_response(stock_code)
-
-            with (
-                mock.patch.object(downloader, "DOWNLOAD_PARTS_DIR", parts_dir),
-                mock.patch.object(downloader, "INDUSTRY_SW_PATH", output_path),
-                mock.patch.object(
-                    downloader,
-                    "download_stock_list",
-                    side_effect=lambda force_update=False: stocks.copy(),
-                ),
-                mock.patch.object(
-                    downloader.adata.stock.info,
-                    "get_industry_sw",
-                    side_effect=fake_get_industry_sw,
-                    create=True,
-                ),
-            ):
-                first = downloader.download_industry_sw(force_update=False)
-                self.assertEqual(first["stock_count"], 2)
-                self.assertEqual(first["missing_codes"], [])
-                self.assertEqual(calls, ["000001", "300033"])
-
-                calls.clear()
-                second = downloader.download_industry_sw(force_update=False)
-                self.assertEqual(second["stock_count"], 2)
-                self.assertEqual(second["missing_codes"], [])
-                self.assertEqual(calls, [])

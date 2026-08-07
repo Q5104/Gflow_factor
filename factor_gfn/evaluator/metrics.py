@@ -19,6 +19,7 @@ from scipy.stats import rankdata
 from .cross_section import (
     DEFAULT_CLEANING_CONFIG,
     CrossSectionalCleaningConfig,
+    NeutralizationDiagnostics,
     clean_candidate_factor_cross_sections,
     clean_factor_cross_sections,
 )
@@ -155,6 +156,7 @@ def _clean_candidate(
     row_indices: npt.ArrayLike | None,
     cleaning_config: CrossSectionalCleaningConfig,
     neutralize_industry: bool,
+    neutralization_diagnostics: NeutralizationDiagnostics | None = None,
 ) -> FloatMatrix:
     """选择显式的候选因子清洗口径，禁止静默跳过行业中性化。"""
 
@@ -167,6 +169,7 @@ def _clean_candidate(
             universe_mask,
             row_indices=row_indices,
             config=cleaning_config,
+            diagnostics=neutralization_diagnostics,
         )
     return clean_factor_cross_sections(
         factor,
@@ -231,19 +234,33 @@ def rank_ic_series(
     universe_mask: npt.ArrayLike | None = None,
     cleaning_config: CrossSectionalCleaningConfig = DEFAULT_CLEANING_CONFIG,
     neutralize_industry: bool = True,
+    row_indices: npt.ArrayLike | None = None,
+    neutralization_diagnostics: NeutralizationDiagnostics | None = None,
 ) -> CrossSectionalSeries:
     """计算清洗后候选因子的逐日截面 Spearman RankIC。"""
 
     if min_count < 2:
         raise ValueError("min_count 至少为 2")
     raw_factor = _matrix(factor, "factor")
+    if row_indices is None:
+        rows = np.arange(raw_factor.shape[0], dtype=np.int64)
+    else:
+        raw_rows = np.asarray(row_indices)
+        if raw_rows.ndim != 1 or not np.issubdtype(raw_rows.dtype, np.integer):
+            raise ValueError("row_indices 必须是一维整数数组")
+        rows = raw_rows.astype(np.int64, copy=False)
+        if rows.size and ((rows < 0).any() or (rows >= raw_factor.shape[0]).any()):
+            raise IndexError("row_indices 包含越界日期")
+        if np.unique(rows).size != rows.size:
+            raise ValueError("row_indices 不能包含重复日期")
     factor_matrix = _clean_candidate(
         raw_factor,
         industry_labels,
         universe_mask,
-        None,
+        rows,
         cleaning_config,
         neutralize_industry,
+        neutralization_diagnostics,
     )
     return_matrix = _matrix(forward_returns, "forward_returns")
     _same_shape(factor_matrix, return_matrix)
@@ -256,7 +273,7 @@ def rank_ic_series(
         if universe_mask is None
         else np.asarray(universe_mask, dtype=bool)
     )
-    for date_index in range(date_count):
+    for date_index in rows:
         raw_valid = (
             universe[date_index]
             & np.isfinite(raw_factor[date_index])
@@ -333,8 +350,23 @@ def evaluate_rank_ic(
     universe_mask: npt.ArrayLike | None = None,
     cleaning_config: CrossSectionalCleaningConfig = DEFAULT_CLEANING_CONFIG,
     neutralize_industry: bool = True,
+    rebalance_indices: npt.ArrayLike | None = None,
+    neutralization_diagnostics: NeutralizationDiagnostics | None = None,
 ) -> ICEvaluation:
     """同时返回分析用逐日 IC 与 reward 默认使用的5日非重叠 IC。"""
+
+    fixed_indices: npt.NDArray[np.int64] | None = None
+    if rebalance_indices is not None:
+        raw_indices = np.asarray(rebalance_indices)
+        if raw_indices.ndim != 1 or not np.issubdtype(raw_indices.dtype, np.integer):
+            raise ValueError("rebalance_indices 必须是一维整数数组")
+        fixed_indices = raw_indices.astype(np.int64, copy=False)
+        if fixed_indices.size and (
+            (fixed_indices < 0).any() or (fixed_indices >= np.asarray(factor).shape[0]).any()
+        ):
+            raise IndexError("rebalance_indices 包含越界日期")
+        if np.unique(fixed_indices).size != fixed_indices.size:
+            raise ValueError("rebalance_indices 不能包含重复日期")
 
     daily = rank_ic_series(
         factor,
@@ -344,8 +376,14 @@ def evaluate_rank_ic(
         universe_mask=universe_mask,
         cleaning_config=cleaning_config,
         neutralize_industry=neutralize_industry,
+        row_indices=fixed_indices,
+        neutralization_diagnostics=neutralization_diagnostics,
     )
-    indices = select_rebalance_indices(daily.sample_count, config)
+    indices = (
+        select_rebalance_indices(daily.sample_count, config)
+        if fixed_indices is None
+        else fixed_indices.copy()
+    )
     rebalance_values = daily.values[indices].copy()
     return ICEvaluation(
         daily=daily,
@@ -376,6 +414,7 @@ def long_portfolio_series(
     universe_mask: npt.ArrayLike | None = None,
     cleaning_config: CrossSectionalCleaningConfig = DEFAULT_CLEANING_CONFIG,
     neutralize_industry: bool = True,
+    neutralization_diagnostics: NeutralizationDiagnostics | None = None,
 ) -> LongPortfolioSeries:
     """构造前10%等权多头、有效股票池等权基准及两者超额序列。"""
 
@@ -399,6 +438,7 @@ def long_portfolio_series(
         indices,
         cleaning_config,
         neutralize_industry,
+        neutralization_diagnostics,
     )
 
     date_count = factor_matrix.shape[0]
@@ -449,6 +489,7 @@ def long_short_portfolio_series(
     universe_mask: npt.ArrayLike | None = None,
     cleaning_config: CrossSectionalCleaningConfig = DEFAULT_CLEANING_CONFIG,
     neutralize_industry: bool = True,
+    neutralization_diagnostics: NeutralizationDiagnostics | None = None,
 ) -> LongShortPortfolioSeries:
     """构造候选因子原始方向的 Top 10% 减 Bottom 10% 收益序列。"""
 
@@ -470,6 +511,7 @@ def long_short_portfolio_series(
         indices,
         cleaning_config,
         neutralize_industry,
+        neutralization_diagnostics,
     )
 
     date_count = raw_factor.shape[0]

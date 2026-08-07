@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import warnings
 
 import numpy as np
@@ -33,6 +33,16 @@ DEFAULT_CLEANING_CONFIG = CrossSectionalCleaningConfig()
 
 class IndustryNeutralizationWarning(UserWarning):
     """A date skipped industry neutralization and continued to z-score."""
+
+
+@dataclass(slots=True)
+class NeutralizationDiagnostics:
+    """Collect unique matrix rows where requested industry neutralization skipped."""
+
+    skipped_rows: set[int] = field(default_factory=set)
+
+    def record_skip(self, row_index: int) -> None:
+        self.skipped_rows.add(int(row_index))
 
 
 def _validate_inputs(
@@ -88,8 +98,8 @@ def _zscore(
 def _industry_matrix(
     industry_labels: npt.ArrayLike,
     shape: tuple[int, int],
-) -> npt.NDArray[np.object_]:
-    labels = np.asarray(industry_labels, dtype=object)
+) -> npt.NDArray:
+    labels = np.asarray(industry_labels)
     if labels.ndim == 1:
         if labels.shape[0] != shape[1]:
             raise ValueError("一维 industry_labels 长度必须等于股票数")
@@ -102,6 +112,13 @@ def _industry_matrix(
 def _valid_industry_label(value: object) -> str | None:
     if value is None:
         return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        if not np.isfinite(numeric) or numeric < 0:
+            return None
     try:
         if bool(value != value):
             return None
@@ -144,6 +161,7 @@ def clean_candidate_factor_cross_sections(
     *,
     row_indices: npt.ArrayLike | None = None,
     config: CrossSectionalCleaningConfig = DEFAULT_CLEANING_CONFIG,
+    diagnostics: NeutralizationDiagnostics | None = None,
 ) -> npt.NDArray[np.float64]:
     """Winsorize, industry-neutralize, then z-score candidate factors.
 
@@ -178,6 +196,8 @@ def clean_candidate_factor_cross_sections(
             categories = np.unique(labels)
             known_count = int(known.sum())
             if known_count < len(categories) + 1:
+                if diagnostics is not None:
+                    diagnostics.record_skip(int(date_index))
                 warnings.warn(
                     f"日期索引 {date_index} 的行业回归样本数 {known_count} 少于"
                     f"行业数+1 ({len(categories) + 1})，已跳过行业中性化",
@@ -199,6 +219,8 @@ def clean_candidate_factor_cross_sections(
                     residuals[np.abs(residuals) <= config.epsilon] = 0.0
                     adjusted[known] = residuals
                 except np.linalg.LinAlgError:
+                    if diagnostics is not None:
+                        diagnostics.record_skip(int(date_index))
                     warnings.warn(
                         f"日期索引 {date_index} 的行业 OLS 求解失败，已跳过行业中性化",
                         IndustryNeutralizationWarning,
@@ -215,6 +237,7 @@ __all__ = [
     "DEFAULT_CLEANING_CONFIG",
     "CrossSectionalCleaningConfig",
     "IndustryNeutralizationWarning",
+    "NeutralizationDiagnostics",
     "clean_candidate_factor_cross_sections",
     "clean_factor_cross_sections",
 ]

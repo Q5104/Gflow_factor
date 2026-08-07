@@ -22,7 +22,6 @@ LISTING_DATES_PATH = RAW_DATA_DIR / "adata_listing_dates.parquet"
 MARKET_DATA_PATH = RAW_DATA_DIR / "market_data.parquet"
 RAW_CLOSE_PATH = RAW_DATA_DIR / "raw_close.parquet"
 STOCK_SHARES_PATH = RAW_DATA_DIR / "stock_shares_history.parquet"
-INDUSTRY_SW_PATH = RAW_DATA_DIR / "industry_sw.parquet"
 
 DEFAULT_START_DATE = "2010-01-01"
 PART_SIZE = 50
@@ -48,13 +47,6 @@ STOCK_SHARES_COLUMNS = [
     "limit_shares",
     "list_a_shares",
     "change_reason",
-]
-INDUSTRY_SW_COLUMNS = [
-    "stock_code",
-    "sw_code",
-    "industry_name",
-    "industry_type",
-    "source",
 ]
 
 
@@ -174,22 +166,6 @@ def _codes_in_parquet(path: Path) -> set[str]:
     return codes
 
 
-def _industry_level1_codes(path: Path) -> set[str]:
-    parquet = pq.ParquetFile(path)
-    codes: set[str] = set()
-    for row_group in range(parquet.num_row_groups):
-        frame = parquet.read_row_group(
-            row_group,
-            columns=["stock_code", "industry_type"],
-        ).to_pandas()
-        level1 = frame.loc[
-            frame["industry_type"].astype("string").str.strip().eq("申万一级"),
-            "stock_code",
-        ]
-        codes.update(_normalize_stock_code(pd.Series(level1)).dropna().astype(str))
-    return codes
-
-
 def _prepare_market_response(
     response: pd.DataFrame,
     stock_code: str,
@@ -291,51 +267,6 @@ def _prepare_stock_shares_response(
     normalized = result.sort_values("change_date").reset_index(drop=True)
     normalized.attrs["dropped_invalid_rows"] = invalid_count
     return normalized
-
-
-def _prepare_industry_sw_response(
-    response: pd.DataFrame,
-    stock_code: str,
-) -> pd.DataFrame:
-    """Normalize one stock's current Shenwan level-1/level-2 classifications."""
-    required_source = {"sw_code", "industry_name", "industry_type"}
-    missing = required_source.difference(response.columns)
-    if missing:
-        raise ValueError(f"申万行业接口缺少字段：{sorted(missing)}")
-
-    result = response.loc[:, sorted(required_source)].copy()
-    result["source"] = response["source"] if "source" in response.columns else pd.NA
-    result.insert(0, "stock_code", str(stock_code).zfill(6))
-    for column in ("sw_code", "industry_name", "industry_type", "source"):
-        result[column] = result[column].astype("string").str.strip()
-
-    valid_types = {"申万一级", "申万二级"}
-    valid = (
-        result["sw_code"].notna()
-        & result["sw_code"].ne("")
-        & result["industry_name"].notna()
-        & result["industry_name"].ne("")
-        & result["industry_type"].isin(valid_types)
-    )
-    result = result.loc[valid, INDUSTRY_SW_COLUMNS].copy()
-    if result.empty or not result["industry_type"].eq("申万一级").any():
-        raise ValueError("接口没有有效的申万一级行业记录")
-
-    duplicate_types = result["industry_type"].duplicated(keep=False)
-    if duplicate_types.any():
-        conflicts = (
-            result.loc[duplicate_types]
-            .groupby("industry_type", dropna=False)[["sw_code", "industry_name"]]
-            .nunique(dropna=False)
-            .gt(1)
-            .any(axis=1)
-        )
-        if conflicts.any():
-            examples = conflicts.index[conflicts].astype(str).tolist()
-            raise ValueError(f"同一股票同一行业层级存在冲突：{examples}")
-        result = result.drop_duplicates("industry_type", keep="last")
-
-    return result.sort_values("industry_type").reset_index(drop=True)
 
 
 def _save_part(dataset_name: str, frames: list[pd.DataFrame], number: int) -> Path:
@@ -655,108 +586,6 @@ def download_stock_shares(force_update: bool = False) -> dict:
     }
 
 
-def download_industry_sw(force_update: bool = False) -> dict:
-    """Download current Shenwan level-1/level-2 industries with checkpoints.
-
-    Each successful stock must contain a valid ``申万一级`` record. Successful
-    responses are checkpointed under ``data/download_parts/industry_sw``;
-    rerunning with ``force_update=False`` retries only missing stocks.
-    """
-    dataset_name = "industry_sw"
-    stocks = download_stock_list(force_update=False)
-    codes = stocks["stock_code"].astype(str).tolist()
-    parts_directory = _part_directory(dataset_name)
-
-    if force_update:
-        shutil.rmtree(parts_directory, ignore_errors=True)
-        INDUSTRY_SW_PATH.unlink(missing_ok=True)
-
-    files = _part_files(dataset_name)
-    completed: set[str] = set()
-    if INDUSTRY_SW_PATH.exists():
-        completed.update(_industry_level1_codes(INDUSTRY_SW_PATH))
-    for path in files:
-        completed.update(_industry_level1_codes(path))
-
-    pending = [code for code in codes if code not in completed]
-    print(
-        f"{dataset_name}：股票池 {len(codes):,} 只，已完成 {len(completed):,} 只，"
-        f"待下载 {len(pending):,} 只。"
-    )
-
-    frames: list[pd.DataFrame] = []
-    failures: list[tuple[str, str]] = []
-    next_part = _next_part_number(files)
-    consecutive_failures = 0
-
-    for code in tqdm(pending, desc="下载申万行业"):
-        try:
-            response = _retry_call(
-                lambda code=code: adata.stock.info.get_industry_sw(
-                    stock_code=code,
-                ),
-                f"{code} 申万行业",
-            )
-            prepared = _prepare_industry_sw_response(response, code)
-            frames.append(prepared)
-            completed.add(code)
-            consecutive_failures = 0
-        except Exception as exc:
-            failures.append((code, str(exc)))
-            consecutive_failures += 1
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                print(
-                    f"连续失败 {MAX_CONSECUTIVE_FAILURES} 只，已停止本轮。"
-                    "稍后重新运行同一单元即可续传。"
-                )
-                break
-
-        if len(frames) >= PART_SIZE:
-            _save_part(dataset_name, frames, next_part)
-            next_part += 1
-            frames.clear()
-
-    if frames:
-        _save_part(dataset_name, frames, next_part)
-        frames.clear()
-
-    sources = ([INDUSTRY_SW_PATH] if INDUSTRY_SW_PATH.exists() else []) + _part_files(
-        dataset_name
-    )
-    if sources:
-        _consolidate_parts(
-            sources,
-            INDUSTRY_SW_PATH,
-            INDUSTRY_SW_COLUMNS,
-            key_columns=("stock_code", "industry_type"),
-        )
-
-    final_codes = (
-        _industry_level1_codes(INDUSTRY_SW_PATH)
-        if INDUSTRY_SW_PATH.exists()
-        else set()
-    )
-    missing_codes = [code for code in codes if code not in final_codes]
-    if INDUSTRY_SW_PATH.exists():
-        print(f"已保存：{INDUSTRY_SW_PATH}")
-    else:
-        print("本轮没有可用于生成最终申万行业文件的有效分段。")
-    print(
-        f"最终覆盖 {len(final_codes):,}/{len(codes):,} 只；"
-        f"仍缺失 {len(missing_codes):,} 只。"
-    )
-    if failures:
-        print("本轮失败示例：", failures[:20])
-    if missing_codes:
-        print("待重试代码示例：", missing_codes[:30])
-    return {
-        "path": INDUSTRY_SW_PATH,
-        "stock_count": len(final_codes),
-        "missing_codes": missing_codes,
-        "failures": failures,
-    }
-
-
 def _summarize_parquet(path: Path, required_columns: list[str]) -> dict:
     if not path.exists():
         return {"path": str(path), "exists": False}
@@ -849,59 +678,12 @@ def _summarize_stock_shares(path: Path) -> dict:
         connection.close()
 
 
-def _summarize_industry_sw(path: Path) -> dict:
-    if not path.exists():
-        return {"path": str(path), "exists": False}
-
-    null_terms = ", ".join(
-        f'sum(CASE WHEN "{column}" IS NULL THEN 1 ELSE 0 END) AS "{column}"'
-        for column in INDUSTRY_SW_COLUMNS
-    )
-    connection = duckdb.connect()
-    try:
-        base = connection.execute(
-            f"""
-            SELECT count(*) AS rows,
-                   count(DISTINCT stock_code) AS stocks,
-                   count(DISTINCT stock_code) FILTER (
-                       WHERE industry_type = '申万一级'
-                   ) AS level1_stocks,
-                   count(DISTINCT stock_code) FILTER (
-                       WHERE industry_type = '申万二级'
-                   ) AS level2_stocks,
-                   count(*) - count(DISTINCT (stock_code, industry_type))
-                       AS duplicates,
-                   count(DISTINCT industry_name) FILTER (
-                       WHERE industry_type = '申万一级'
-                   ) AS level1_industries
-            FROM read_parquet('{_sql_path(path)}')
-            """
-        ).fetchone()
-        null_values = connection.execute(
-            f"SELECT {null_terms} FROM read_parquet('{_sql_path(path)}')"
-        ).fetchone()
-        return {
-            "path": str(path),
-            "exists": True,
-            "rows": int(base[0]),
-            "stocks": int(base[1]),
-            "level1_stocks": int(base[2]),
-            "level2_stocks": int(base[3]),
-            "duplicates": int(base[4]),
-            "level1_industries": int(base[5]),
-            "nulls": dict(zip(INDUSTRY_SW_COLUMNS, map(int, null_values))),
-        }
-    finally:
-        connection.close()
-
-
 def print_download_summary() -> dict:
-    """Print lightweight QA summaries for all raw download outputs."""
+    """Print QA for the required adata raw outputs."""
     summary = {
         "market_data": _summarize_parquet(MARKET_DATA_PATH, MARKET_COLUMNS),
         "raw_close": _summarize_parquet(RAW_CLOSE_PATH, RAW_CLOSE_COLUMNS),
         "stock_shares_history": _summarize_stock_shares(STOCK_SHARES_PATH),
-        "industry_sw": _summarize_industry_sw(INDUSTRY_SW_PATH),
     }
     for name, values in summary.items():
         print(f"\n[{name}]")
@@ -917,11 +699,9 @@ __all__ = [
     "MARKET_DATA_PATH",
     "RAW_CLOSE_PATH",
     "STOCK_SHARES_PATH",
-    "INDUSTRY_SW_PATH",
     "download_stock_list",
     "download_adjusted_market",
     "download_raw_close",
     "download_stock_shares",
-    "download_industry_sw",
     "print_download_summary",
 ]

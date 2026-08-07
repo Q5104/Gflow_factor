@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 import numpy as np
 
@@ -110,6 +111,8 @@ class RewardEvaluatorTests(unittest.TestCase):
         self.assertTrue(second.cache_hit)
         self.assertTrue(first.result.valid)
         self.assertFalse(first.result.industry_neutralized)
+        self.assertEqual(first.result.neutralization_skipped_dates, ())
+        self.assertEqual(first.result.neutralization_skipped_rate, 0.0)
         self.assertEqual(set(first.result.barra_correlations), set(STYLE_NAMES))
         self.assertEqual(first.result, second.result)
 
@@ -123,6 +126,67 @@ class RewardEvaluatorTests(unittest.TestCase):
                 data_fingerprint="data-v1",
                 reward_config=RewardConfig(candidate_industry_neutralization=True),
             )
+
+        with self.assertRaisesRegex(ValueError, "evaluation_dates"):
+            RewardEvaluator(
+                values,
+                references,
+                data_fingerprint="data-v1",
+                industry_labels=np.zeros(values.shape, dtype=np.int32),
+                industry_fingerprint="industry-v1",
+                reward_config=RewardConfig(candidate_industry_neutralization=True),
+            )
+
+    def test_neutralization_skips_are_deduplicated_and_persisted(self):
+        date_count, stock_count = 6, 4
+        factor = np.tile(np.arange(stock_count, dtype=np.float64), (date_count, 1))
+        returns = factor * np.arange(1.0, date_count + 1.0)[:, None]
+        reference_values = np.arange(date_count, dtype=np.float64)
+        references = {name: _series(reference_values) for name in STYLE_NAMES}
+        dates = np.arange(
+            np.datetime64("2010-01-01"),
+            np.datetime64("2010-01-07"),
+            dtype="datetime64[D]",
+        )
+        rebalance = np.array([0, 2, 4, 5], dtype=np.int64)
+        evaluator = RewardEvaluator(
+            returns,
+            references,
+            data_fingerprint="synthetic-industry-v1",
+            evaluation_config=EvaluationConfig(
+                rebalance_interval=1,
+                min_cross_section_count=2,
+                long_quantile=0.25,
+            ),
+            reward_config=RewardConfig(
+                barra_min_common_periods=2,
+                candidate_industry_neutralization=True,
+            ),
+            industry_labels=np.arange(stock_count),
+            industry_fingerprint="industry-v1",
+            rebalance_indices=rebalance,
+            evaluation_dates=dates,
+        )
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            first = evaluator.evaluate("factor-industry", factor)
+            second = evaluator.evaluate("factor-industry", factor)
+            invalid = evaluator.evaluate("constant-industry", np.ones_like(factor))
+
+        self.assertEqual(
+            first.result.neutralization_skipped_dates,
+            ("2010-01-01", "2010-01-03", "2010-01-05", "2010-01-06"),
+        )
+        self.assertEqual(first.result.neutralization_skipped_rate, 1.0)
+        self.assertEqual(first.result, second.result)
+        self.assertTrue(second.cache_hit)
+        self.assertFalse(invalid.result.valid)
+        self.assertEqual(
+            invalid.result.neutralization_skipped_dates,
+            first.result.neutralization_skipped_dates,
+        )
+        self.assertEqual(invalid.result.neutralization_skipped_rate, 1.0)
 
 
 if __name__ == "__main__":

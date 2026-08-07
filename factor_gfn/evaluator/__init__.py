@@ -46,6 +46,7 @@ __all__ = [
     "CrossSectionalSeries",
     "CrossSectionalCleaningConfig",
     "IndustryNeutralizationWarning",
+    "NeutralizationDiagnostics",
     "EvaluationConfig",
     "FEATURE_NAMES",
     "FEATURE_TO_INDEX",
@@ -80,6 +81,7 @@ from .cross_section import (
     DEFAULT_CLEANING_CONFIG,
     CrossSectionalCleaningConfig,
     IndustryNeutralizationWarning,
+    NeutralizationDiagnostics,
     clean_candidate_factor_cross_sections,
     clean_factor_cross_sections,
 )
