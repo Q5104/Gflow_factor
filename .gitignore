@@ -1,0 +1,49 @@
+.venv/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE、本地环境和密钥文件
+.vscode/
+.idea/
+.env
+.env.*
+!.env.example
+
+# 下载数据和断点文件不进入 Git
+data/raw/
+data/download_parts/
+
+# 处理结果格式尚未冻结，只保留目录占位
+data/processed/*
+!data/processed/.gitkeep
+
+# 防止数据产物误放到其他目录后进入 Git
+*.parquet
+*.npy
+*.npz
+*.memmap
+
+# 临时输出不进入 Git
+tmp/*
+!tmp/.gitkeep
+
+# 模型、检查点和实验运行目录不进入 Git
+checkpoints/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# 本地研报可能受版权或分发限制
+参考文件/
+
+*.tmp
+*.log
+Thumbs.db
+.DS_Store
