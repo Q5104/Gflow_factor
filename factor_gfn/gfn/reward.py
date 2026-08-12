@@ -25,13 +25,22 @@ from factor_gfn.barra import (
 )
 from factor_gfn.evaluator import (
     DEFAULT_CONFIG,
+    EncodedIndustryPanel,
     EvaluationConfig,
     NeutralizationDiagnostics,
+    cleaned_portfolio_returns_from_cleaned,
+    clean_candidate_factor_cross_sections,
+    clean_factor_cross_sections,
+    encode_industry_panel,
     evaluate_rank_ic,
     infer_long_direction,
     long_portfolio_series,
+    long_portfolio_series_from_cleaned,
     long_short_portfolio_series,
+    long_short_portfolio_series_from_cleaned,
+    rank_ic_values_from_cleaned,
     summarize_excess_returns,
+    summarize_ic,
 )
 
 from .config import RewardConfig
@@ -59,6 +68,7 @@ class RewardResult:
     industry_neutralized: bool
     neutralization_skipped_dates: tuple[str, ...]
     neutralization_skipped_rate: float
+    neutralization_skipped_details: tuple[dict[str, int | str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +126,7 @@ def _invalid_result(
     industry_neutralized: bool,
     neutralization_skipped_dates: tuple[str, ...] = (),
     neutralization_skipped_rate: float = 0.0,
+    neutralization_skipped_details: tuple[dict[str, int | str], ...] = (),
 ) -> RewardResult:
     correlations = (
         {name: float(penalty.correlations[name]) for name in STYLE_NAMES}
@@ -149,6 +160,7 @@ def _invalid_result(
         industry_neutralized=industry_neutralized,
         neutralization_skipped_dates=neutralization_skipped_dates,
         neutralization_skipped_rate=float(neutralization_skipped_rate),
+        neutralization_skipped_details=deepcopy(neutralization_skipped_details),
     )
 
 
@@ -164,6 +176,7 @@ def combine_reward_components(
     long_ir_valid_periods: int = 0,
     neutralization_skipped_dates: tuple[str, ...] = (),
     neutralization_skipped_rate: float = 0.0,
+    neutralization_skipped_details: tuple[dict[str, int | str], ...] = (),
 ) -> RewardResult:
     """应用冻结公式并同时保留 raw reward 与 TB 正值 reward。"""
 
@@ -183,6 +196,7 @@ def combine_reward_components(
             industry_neutralized=neutralized,
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
+            neutralization_skipped_details=neutralization_skipped_details,
         )
     if not np.isfinite(train_long_ir):
         return _invalid_result(
@@ -197,6 +211,7 @@ def combine_reward_components(
             industry_neutralized=neutralized,
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
+            neutralization_skipped_details=neutralization_skipped_details,
         )
     if not np.isfinite(penalty.barra_ts_corr):
         return _invalid_result(
@@ -211,6 +226,7 @@ def combine_reward_components(
             industry_neutralized=neutralized,
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
+            neutralization_skipped_details=neutralization_skipped_details,
         )
 
     clipped_ir = float(np.clip(train_long_ir, 0.0, config.long_ir_cap))
@@ -233,6 +249,7 @@ def combine_reward_components(
             industry_neutralized=neutralized,
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
+            neutralization_skipped_details=neutralization_skipped_details,
         )
     reward = max(raw_reward, config.reward_floor)
     correlations = {name: float(penalty.correlations[name]) for name in STYLE_NAMES}
@@ -259,6 +276,7 @@ def combine_reward_components(
         industry_neutralized=neutralized,
         neutralization_skipped_dates=neutralization_skipped_dates,
         neutralization_skipped_rate=float(neutralization_skipped_rate),
+        neutralization_skipped_details=deepcopy(neutralization_skipped_details),
     )
 
 
@@ -336,8 +354,47 @@ class RewardEvaluator:
         self.rebalance_indices = fixed_indices
         self.evaluation_dates = fixed_dates
         self.cache = cache if cache is not None else RewardCache()
+        self._compact_forward_returns: npt.NDArray[np.float64] | None = None
+        self._compact_universe_mask: npt.NDArray[np.bool_] | None = None
+        self._compact_industry_labels: npt.NDArray | None = None
+        self._compact_encoded_industries: EncodedIndustryPanel | None = None
+        self._compact_barra_long_short: dict[str, LongShortSeries] | None = None
+        if fixed_indices is not None:
+            self._compact_forward_returns = returns[fixed_indices]
+            self._compact_universe_mask = (
+                None
+                if universe_mask is None
+                else np.asarray(universe_mask, dtype=bool)[fixed_indices]
+            )
+            if industry_labels is not None:
+                labels = np.asarray(industry_labels)
+                if labels.ndim == 1 and labels.shape[0] == returns.shape[1]:
+                    self._compact_industry_labels = labels
+                elif labels.shape == returns.shape:
+                    self._compact_industry_labels = labels[fixed_indices]
+                else:
+                    raise ValueError(
+                        "industry_labels 必须是一维股票标签或与 forward_returns 同形"
+                    )
+                self._compact_encoded_industries = encode_industry_panel(
+                    self._compact_industry_labels,
+                    self._compact_forward_returns.shape,
+                )
+            compact_references: dict[str, LongShortSeries] = {}
+            for name in STYLE_NAMES:
+                series = barra_long_short[name]
+                if np.asarray(series.long_short_return).shape != (returns.shape[0],):
+                    raise ValueError(f"{name} Barra 收益序列必须与日期轴等长")
+                compact_references[name] = LongShortSeries(
+                    long_return=np.asarray(series.long_return)[fixed_indices],
+                    short_return=np.asarray(series.short_return)[fixed_indices],
+                    long_short_return=np.asarray(series.long_short_return)[fixed_indices],
+                    universe_count=np.asarray(series.universe_count)[fixed_indices],
+                    leg_count=np.asarray(series.leg_count)[fixed_indices],
+                )
+            self._compact_barra_long_short = compact_references
         manifest = {
-            "schema": "factor_gfn.reward_context.v1",
+            "schema": "factor_gfn.reward_context.v3",
             "data_fingerprint": data_fingerprint,
             "industry_fingerprint": industry_fingerprint,
             "evaluation_config": asdict(evaluation_config),
@@ -351,6 +408,27 @@ class RewardEvaluator:
                 if fixed_dates is not None
                 else None
             ),
+            "industry_neutralization_policy": {
+                "schema": "factor_gfn.strict_industry_neutralization.v1",
+                "failed_date_action": "exclude_entire_candidate_cross_section",
+                "unknown_industry_stock_action": "exclude_stock",
+                "calendar_action": "keep_global_phase_without_backfill",
+            },
+            "reward_panel": {
+                "mode": (
+                    "fixed_rebalance_compact"
+                    if fixed_indices is not None
+                    else "dynamic_full_axis"
+                ),
+                "row_count": (
+                    int(fixed_indices.size)
+                    if fixed_indices is not None
+                    else int(returns.shape[0])
+                ),
+                "candidate_cleaning_calls_per_evaluation": (
+                    1 if fixed_indices is not None else 3
+                ),
+            },
         }
         payload = json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         self.context_fingerprint = hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -359,16 +437,150 @@ class RewardEvaluator:
         self,
         diagnostics: NeutralizationDiagnostics,
         rebalance_indices: npt.NDArray[np.int64],
-    ) -> tuple[tuple[str, ...], float]:
+        *,
+        compact_rows: bool = False,
+    ) -> tuple[
+        tuple[str, ...],
+        float,
+        tuple[dict[str, int | str], ...],
+    ]:
         if not self.reward_config.candidate_industry_neutralization:
-            return (), 0.0
+            return (), 0.0, ()
         if self.evaluation_dates is None:
             raise RuntimeError("行业中性化诊断缺少 evaluation_dates")
-        active_rows = {int(index) for index in rebalance_indices}
-        skipped_rows = sorted(active_rows.intersection(diagnostics.skipped_rows))
-        skipped_dates = tuple(str(self.evaluation_dates[index]) for index in skipped_rows)
-        rate = len(skipped_rows) / len(active_rows) if active_rows else 0.0
-        return skipped_dates, float(rate)
+        if compact_rows:
+            local_rows = sorted(
+                set(range(rebalance_indices.size)).intersection(diagnostics.skipped_rows)
+            )
+            row_pairs = [
+                (local_index, int(rebalance_indices[local_index]))
+                for local_index in local_rows
+            ]
+        else:
+            active_rows = {int(index) for index in rebalance_indices}
+            row_pairs = [
+                (index, index)
+                for index in sorted(active_rows.intersection(diagnostics.skipped_rows))
+            ]
+        skipped_dates = tuple(
+            str(self.evaluation_dates[original_index])
+            for _, original_index in row_pairs
+        )
+        rate = len(row_pairs) / len(rebalance_indices) if len(rebalance_indices) else 0.0
+        details = tuple(
+            {
+                "date": str(self.evaluation_dates[original_index]),
+                "row_index": int(original_index),
+                "factor_valid_count": int(
+                    diagnostics.skipped_details[local_index].factor_valid_count
+                ),
+                "known_industry_count": int(
+                    diagnostics.skipped_details[local_index].known_industry_count
+                ),
+                "industry_count": int(
+                    diagnostics.skipped_details[local_index].industry_count
+                ),
+                "required_regression_count": int(
+                    diagnostics.skipped_details[local_index].required_regression_count
+                ),
+                "reason": diagnostics.skipped_details[local_index].reason,
+            }
+            for local_index, original_index in row_pairs
+        )
+        return skipped_dates, float(rate), details
+
+    def _evaluate_fixed_panel(
+        self,
+        expression_hash: str,
+        values: npt.NDArray[np.float64],
+    ) -> RewardResult:
+        """在冻结调仓截面上清洗一次，并复用同一矩阵计算全部 Reward 分量。"""
+
+        if self.rebalance_indices is None or self._compact_forward_returns is None:
+            raise RuntimeError("固定调仓面板尚未初始化")
+        compact_values = values[self.rebalance_indices]
+        neutralize = self.reward_config.candidate_industry_neutralization
+        diagnostics = NeutralizationDiagnostics()
+        if neutralize:
+            if self._compact_industry_labels is None:
+                raise RuntimeError("固定调仓面板缺少行业标签")
+            cleaned = clean_candidate_factor_cross_sections(
+                compact_values,
+                self._compact_industry_labels,
+                self._compact_universe_mask,
+                diagnostics=diagnostics,
+                encoded_industries=self._compact_encoded_industries,
+            )
+        else:
+            cleaned = clean_factor_cross_sections(
+                compact_values,
+                self._compact_universe_mask,
+            )
+
+        ic_values = rank_ic_values_from_cleaned(
+            cleaned,
+            self._compact_forward_returns,
+            self.evaluation_config.min_cross_section_count,
+        )
+        ic_summary = summarize_ic(
+            ic_values,
+            ddof=self.evaluation_config.performance_ddof,
+        )
+        train_ic = ic_summary.mean
+        skipped_dates, skipped_rate, skipped_details = self._neutralization_summary(
+            diagnostics,
+            self.rebalance_indices,
+            compact_rows=True,
+        )
+        if not np.isfinite(train_ic) or train_ic == 0.0:
+            penalty = BarraPenaltyResult(
+                barra_ts_corr=np.nan,
+                correlations={name: np.nan for name in STYLE_NAMES},
+                valid_periods={name: 0 for name in STYLE_NAMES},
+            )
+            return _invalid_result(
+                expression_hash,
+                "train_ic 为零或非有限值，无法确定多头方向",
+                train_ic=train_ic,
+                penalty=penalty,
+                ic_valid_periods=ic_summary.valid_periods,
+                industry_neutralized=neutralize,
+                neutralization_skipped_dates=skipped_dates,
+                neutralization_skipped_rate=skipped_rate,
+                neutralization_skipped_details=skipped_details,
+            )
+
+        direction = infer_long_direction(train_ic)
+        long_excess, candidate_long_short = cleaned_portfolio_returns_from_cleaned(
+            cleaned,
+            self._compact_forward_returns,
+            direction,
+            self.evaluation_config,
+        )
+        long_summary = summarize_excess_returns(
+            long_excess,
+            self.evaluation_config,
+        )
+        if self._compact_barra_long_short is None:
+            raise RuntimeError("固定调仓面板缺少 Barra 参考序列")
+        penalty = calculate_barra_ts_corr(
+            candidate_long_short,
+            self._compact_barra_long_short,
+            min_periods=self.reward_config.barra_min_common_periods,
+        )
+        return combine_reward_components(
+            expression_hash,
+            train_ic,
+            long_summary.annualized_ir,
+            penalty,
+            self.reward_config,
+            long_direction=direction,
+            ic_valid_periods=ic_summary.valid_periods,
+            long_ir_valid_periods=long_summary.valid_periods,
+            neutralization_skipped_dates=skipped_dates,
+            neutralization_skipped_rate=skipped_rate,
+            neutralization_skipped_details=skipped_details,
+        )
 
     def evaluate(self, expression_hash: str, factor: npt.ArrayLike) -> RewardEvaluation:
         if not expression_hash:
@@ -381,6 +593,11 @@ class RewardEvaluator:
         values = np.asarray(factor, dtype=np.float64)
         if values.shape != self.forward_returns.shape:
             raise ValueError("factor 必须与 forward_returns 同形")
+        if self.rebalance_indices is not None:
+            result = self._evaluate_fixed_panel(expression_hash, values)
+            self.cache.put(key, result)
+            return RewardEvaluation(result=result, cache_hit=False)
+
         neutralize = self.reward_config.candidate_industry_neutralization
         diagnostics = NeutralizationDiagnostics()
         ic = evaluate_rank_ic(
@@ -395,7 +612,7 @@ class RewardEvaluator:
         )
         train_ic = ic.rebalance_summary.mean
         if not np.isfinite(train_ic) or train_ic == 0.0:
-            skipped_dates, skipped_rate = self._neutralization_summary(
+            skipped_dates, skipped_rate, skipped_details = self._neutralization_summary(
                 diagnostics,
                 ic.rebalance_indices,
             )
@@ -413,6 +630,7 @@ class RewardEvaluator:
                 industry_neutralized=neutralize,
                 neutralization_skipped_dates=skipped_dates,
                 neutralization_skipped_rate=skipped_rate,
+                neutralization_skipped_details=skipped_details,
             )
             self.cache.put(key, result)
             return RewardEvaluation(result=result, cache_hit=False)
@@ -448,7 +666,7 @@ class RewardEvaluator:
             self.barra_long_short,
             min_periods=self.reward_config.barra_min_common_periods,
         )
-        skipped_dates, skipped_rate = self._neutralization_summary(
+        skipped_dates, skipped_rate, skipped_details = self._neutralization_summary(
             diagnostics,
             ic.rebalance_indices,
         )
@@ -463,6 +681,7 @@ class RewardEvaluator:
             long_ir_valid_periods=long_summary.valid_periods,
             neutralization_skipped_dates=skipped_dates,
             neutralization_skipped_rate=skipped_rate,
+            neutralization_skipped_details=skipped_details,
         )
         self.cache.put(key, result)
         return RewardEvaluation(result=result, cache_hit=False)

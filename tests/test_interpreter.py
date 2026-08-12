@@ -51,6 +51,41 @@ class InterpreterInputContractTests(unittest.TestCase):
         result[0, 0] = -999.0
         np.testing.assert_array_equal(data, original)
 
+    def test_read_only_float64_tensor_is_borrowed_but_leaf_result_is_independent(self):
+        data = _sample_tensor(days=4, stocks=3)
+        data.setflags(write=False)
+        interpreter = FactorInterpreter(data)
+
+        self.assertTrue(interpreter.borrows_input_data)
+        self.assertTrue(np.shares_memory(interpreter._data, data))
+        result = interpreter.evaluate(
+            Expression.from_prefix((get_action_id("close"),))
+        )
+        self.assertFalse(np.shares_memory(result, data))
+        self.assertTrue(result.flags.writeable)
+
+    def test_writable_or_infinite_input_is_copied_and_normalized(self):
+        writable = _sample_tensor(days=4, stocks=3)
+        interpreter = FactorInterpreter(writable)
+        expected = writable[:, 3, :].copy()
+        writable[:, 3, :] = -999.0
+
+        self.assertFalse(interpreter.borrows_input_data)
+        np.testing.assert_allclose(
+            interpreter.evaluate(Expression.from_prefix((get_action_id("close"),))),
+            expected,
+        )
+
+        with_infinity = _sample_tensor(days=4, stocks=3)
+        with_infinity[0, 3, 0] = np.inf
+        with_infinity.setflags(write=False)
+        sanitized = FactorInterpreter(with_infinity)
+        self.assertFalse(sanitized.borrows_input_data)
+        result = sanitized.evaluate(
+            Expression.from_prefix((get_action_id("close"),))
+        )
+        self.assertTrue(np.isnan(result[0, 0]))
+
 
 class InterpreterEvaluationTests(unittest.TestCase):
     def test_manual_add_close_and_mean_volume_formula(self):
@@ -108,6 +143,90 @@ class InterpreterEvaluationTests(unittest.TestCase):
 
         FactorInterpreter(data).evaluate(expression)
         np.testing.assert_equal(data, original)
+
+
+class InterpreterSubexpressionCacheTests(unittest.TestCase):
+    @staticmethod
+    def _expression(root: str, child: str, leaf: str) -> Expression:
+        return Expression.from_prefix(
+            (
+                get_action_id(root),
+                get_action_id(child, 5),
+                get_action_id("close"),
+                get_action_id(leaf),
+            )
+        )
+
+    def test_shared_non_leaf_subexpression_is_reused_without_numeric_change(self):
+        data = _sample_tensor(days=30, stocks=4)
+        matrix_bytes = data.shape[0] * data.shape[2] * 8
+        cached = FactorInterpreter(
+            data,
+            subexpression_cache_max_bytes=2 * matrix_bytes,
+        )
+        first = self._expression("add", "ts_mean", "high")
+        second = self._expression("sub", "ts_mean", "low")
+
+        first_result = cached.evaluate(first)
+        after_first = cached.subexpression_cache_info()
+        second_result = cached.evaluate(second)
+        after_second = cached.subexpression_cache_info()
+
+        np.testing.assert_allclose(
+            first_result,
+            FactorInterpreter(data).evaluate(first),
+            equal_nan=True,
+        )
+        np.testing.assert_allclose(
+            second_result,
+            FactorInterpreter(data).evaluate(second),
+            equal_nan=True,
+        )
+        self.assertEqual(after_first["entries"], 1)
+        self.assertEqual(after_first["misses"], 1)
+        self.assertEqual(after_second["hits"], 1)
+        self.assertTrue(second_result.flags.writeable)
+
+    def test_byte_cap_enforces_lru_eviction(self):
+        data = _sample_tensor(days=30, stocks=4)
+        matrix_bytes = data.shape[0] * data.shape[2] * 8
+        interpreter = FactorInterpreter(
+            data,
+            subexpression_cache_max_bytes=matrix_bytes,
+        )
+
+        interpreter.evaluate(self._expression("add", "ts_mean", "high"))
+        interpreter.evaluate(self._expression("add", "ts_std", "high"))
+        before_revisit = interpreter.subexpression_cache_info()
+        interpreter.evaluate(self._expression("sub", "ts_mean", "low"))
+        after_revisit = interpreter.subexpression_cache_info()
+
+        self.assertEqual(before_revisit["entries"], 1)
+        self.assertLessEqual(before_revisit["current_bytes"], matrix_bytes)
+        self.assertEqual(before_revisit["evictions"], 1)
+        self.assertEqual(after_revisit["hits"], 0)
+        self.assertEqual(after_revisit["misses"], 3)
+        self.assertEqual(after_revisit["evictions"], 2)
+
+    def test_oversized_subexpression_is_not_cached_and_invalid_limit_is_rejected(self):
+        data = _sample_tensor(days=30, stocks=4)
+        interpreter = FactorInterpreter(
+            data,
+            subexpression_cache_max_bytes=data.shape[0] * data.shape[2] * 8 - 1,
+        )
+        expression = self._expression("add", "ts_mean", "high")
+
+        interpreter.evaluate(expression)
+        interpreter.evaluate(expression)
+        info = interpreter.subexpression_cache_info()
+
+        self.assertEqual(info["entries"], 0)
+        self.assertEqual(info["current_bytes"], 0)
+        self.assertEqual(info["misses"], 2)
+        with self.assertRaisesRegex(ValueError, "非负整数"):
+            FactorInterpreter(data, subexpression_cache_max_bytes=-1)
+        with self.assertRaisesRegex(ValueError, "非负整数"):
+            FactorInterpreter(data, subexpression_cache_max_bytes=True)
 
 
 class InterpreterCoverageTests(unittest.TestCase):

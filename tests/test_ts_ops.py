@@ -4,6 +4,11 @@ import numpy as np
 import pandas as pd
 
 from factor_gfn.evaluator import ops_impl as ops
+from factor_gfn.evaluator.numba_kernels import (
+    ema_kernel,
+    rolling_window_kernel,
+    warm_numba_kernels,
+)
 from factor_gfn.grammar import WINDOWS
 from factor_gfn.grammar.operators import TS_BINARY_OPERATORS, TS_UNARY_OPERATORS
 
@@ -150,6 +155,174 @@ class TimeSeriesPandasReferenceTests(unittest.TestCase):
             )
         self.assert_frame_close(ops.ts_cov(self.x, self.y, 5), expected_cov)
         self.assert_frame_close(ops.ts_corr(self.x, self.y, 5), expected_corr)
+
+    def test_cumulative_kernels_match_window_reference_with_missing_values(self):
+        rng = np.random.default_rng(20260810)
+        left = rng.normal(size=(45, 7))
+        right = 0.4 * left + rng.normal(size=left.shape)
+        left[[3, 17, 31], [1, 4, 6]] = np.nan
+        right[[8, 17, 29], [2, 4, 0]] = np.nan
+
+        for window in WINDOWS:
+            weights = np.arange(1, window + 1, dtype=np.float64)
+            weights /= weights.sum()
+            unary_cases = {
+                "ts_mean": lambda sample: np.mean(sample, axis=0),
+                "ts_std": lambda sample: np.std(sample, axis=0, ddof=0),
+                "ts_sum": lambda sample: np.sum(sample, axis=0),
+                "ts_wma": lambda sample: weights @ sample,
+                "ts_slope": lambda sample: ops._time_regression(sample)[1],
+                "ts_residual": lambda sample: sample[-1]
+                - (
+                    ops._time_regression(sample)[0]
+                    + ops._time_regression(sample)[1] * (sample.shape[0] - 1)
+                ),
+                "ts_zscore": lambda sample: np.divide(
+                    sample[-1] - np.mean(sample, axis=0),
+                    np.std(sample, axis=0, ddof=0),
+                    out=np.full(sample.shape[1], np.nan),
+                    where=np.std(sample, axis=0, ddof=0) > ops.EPSILON,
+                ),
+            }
+            for name, transform in unary_cases.items():
+                with self.subTest(operator=name, window=window):
+                    expected = ops._rolling_unary(left, window, transform)
+                    actual = ops.TS_OPERATOR_FUNCTIONS[name](left, window)
+                    np.testing.assert_allclose(
+                        actual,
+                        expected,
+                        rtol=1e-10,
+                        atol=1e-10,
+                        equal_nan=True,
+                    )
+
+            binary_cases = {
+                "ts_cov": lambda x, y: np.mean(
+                    (x - np.mean(x, axis=0)) * (y - np.mean(y, axis=0)),
+                    axis=0,
+                ),
+                "ts_corr": lambda x, y: np.divide(
+                    np.mean(
+                        (x - np.mean(x, axis=0)) * (y - np.mean(y, axis=0)),
+                        axis=0,
+                    ),
+                    np.std(x, axis=0, ddof=0) * np.std(y, axis=0, ddof=0),
+                    out=np.full(x.shape[1], np.nan),
+                    where=(np.std(x, axis=0, ddof=0) > ops.EPSILON)
+                    & (np.std(y, axis=0, ddof=0) > ops.EPSILON),
+                ),
+                "ts_beta": lambda x, y: ops._cross_regression(x, y)[1],
+                "ts_orth": lambda x, y: x[-1]
+                - ops._cross_regression(x, y)[0]
+                - ops._cross_regression(x, y)[1] * y[-1],
+            }
+            for name, transform in binary_cases.items():
+                with self.subTest(operator=name, window=window):
+                    expected = ops._rolling_binary(left, right, window, transform)
+                    actual = ops.TS_OPERATOR_FUNCTIONS[name](left, right, window)
+                    np.testing.assert_allclose(
+                        actual,
+                        expected,
+                        rtol=1e-10,
+                        atol=1e-10,
+                        equal_nan=True,
+                    )
+
+    def test_centered_moments_remain_stable_for_large_levels(self):
+        time = np.arange(40, dtype=np.float64)[:, None]
+        stock = np.arange(4, dtype=np.float64)[None, :]
+        left = 1.0e12 + time * (0.5 + stock * 0.1) + np.sin(time / 3.0)
+        right = -2.0e11 + time * (0.2 + stock * 0.05) + np.cos(time / 5.0)
+
+        expected_std = ops._rolling_unary(
+            left,
+            20,
+            lambda sample: np.std(sample, axis=0, ddof=0),
+        )
+        expected_cov = ops._rolling_binary(
+            left,
+            right,
+            20,
+            lambda x, y: np.mean(
+                (x - np.mean(x, axis=0)) * (y - np.mean(y, axis=0)),
+                axis=0,
+            ),
+        )
+        np.testing.assert_allclose(
+            ops.ts_std(left, 20), expected_std, rtol=1e-5, atol=1e-5, equal_nan=True
+        )
+        np.testing.assert_allclose(
+            ops.ts_cov(left, right, 20),
+            expected_cov,
+            rtol=1e-4,
+            atol=1e-4,
+            equal_nan=True,
+        )
+
+    def test_numba_loop_kernels_match_numpy_reference_for_all_windows(self):
+        rng = np.random.default_rng(20260811)
+        values = rng.normal(size=(75, 9))
+        values[10:13, 2] = np.nan
+        values[31, 5] = np.nan
+        values[40:45, 7] = 3.0
+
+        warm_numba_kernels()
+        self.assertTrue(rolling_window_kernel.signatures)
+        self.assertTrue(ema_kernel.signatures)
+
+        def rank_reference(sample):
+            output = np.empty(sample.shape[1], dtype=np.float64)
+            for stock_index in range(sample.shape[1]):
+                ranks = ops._average_zero_based_rank(sample[:, stock_index])
+                output[stock_index] = (ranks[-1] + 0.5) / sample.shape[0]
+            return output
+
+        for window in WINDOWS:
+            numpy_cases = {
+                "ts_max": lambda sample: np.max(sample, axis=0),
+                "ts_min": lambda sample: np.min(sample, axis=0),
+                "ts_rank": rank_reference,
+                "ts_argmax": lambda sample: sample.shape[0]
+                - 1
+                - np.argmax(sample[::-1] == np.max(sample, axis=0), axis=0),
+                "ts_argmin": lambda sample: sample.shape[0]
+                - 1
+                - np.argmax(sample[::-1] == np.min(sample, axis=0), axis=0),
+                "ts_position": lambda sample: (
+                    sample[-1] - np.min(sample, axis=0)
+                )
+                / (np.max(sample, axis=0) - np.min(sample, axis=0) + ops.EPSILON),
+                "ts_range": lambda sample: np.max(sample, axis=0)
+                - np.min(sample, axis=0),
+            }
+            for name, transform in numpy_cases.items():
+                with self.subTest(operator=name, window=window):
+                    expected = ops._rolling_unary(values, window, transform)
+                    actual = ops.TS_OPERATOR_FUNCTIONS[name](values, window)
+                    np.testing.assert_allclose(actual, expected, equal_nan=True)
+
+            expected_ema = np.full_like(values, np.nan)
+            alpha = 2.0 / (window + 1.0)
+            for stock_index in range(values.shape[1]):
+                ema = np.nan
+                consecutive_valid = 0
+                for date_index in range(values.shape[0]):
+                    value = values[date_index, stock_index]
+                    if not np.isfinite(value):
+                        ema = np.nan
+                        consecutive_valid = 0
+                        continue
+                    ema = value if consecutive_valid == 0 else (
+                        alpha * value + (1.0 - alpha) * ema
+                    )
+                    consecutive_valid += 1
+                    if consecutive_valid >= window:
+                        expected_ema[date_index, stock_index] = ema
+            np.testing.assert_allclose(
+                ops.ts_ema(values, window),
+                expected_ema,
+                equal_nan=True,
+            )
 
 
 class TimeSeriesBoundaryTests(unittest.TestCase):

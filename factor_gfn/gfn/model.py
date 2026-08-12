@@ -10,14 +10,32 @@ from torch import Tensor, nn
 from factor_gfn.grammar import (
     CATEGORY_TO_INDEX,
     OPERATOR_TO_INDEX,
+    OperatorCategory,
     SearchSpaceConfig,
     TOTAL_ACTIONS,
+    WINDOWS,
     WINDOW_TO_INDEX,
+    get_action,
     get_token_indices,
 )
 
 from .config import ModelConfig
 from .state_adapter import MODEL_TOKEN_COUNT, ROLE_COUNT, StateBatch
+
+
+TOKEN_GROUP_NAMES = ("leaf", "unary", "binary")
+TOKEN_GROUP_COUNT = len(TOKEN_GROUP_NAMES)
+GRAMMAR_CATEGORY_NAMES = (
+    "feature",
+    "unary",
+    "ts_unary",
+    "binary",
+    "ts_binary",
+    "cross_sectional",
+)
+GRAMMAR_CATEGORY_COUNT = len(GRAMMAR_CATEGORY_NAMES)
+WINDOW_NAMES = tuple(str(window) for window in WINDOWS)
+WINDOW_COUNT = len(WINDOW_NAMES)
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +46,16 @@ class PolicyOutput:
     token_log_probs: Tensor
     slot_mask: Tensor
     legal_token_mask: Tensor
+    group_logits: Tensor | None = None
+    group_log_probs: Tensor | None = None
+    legal_group_mask: Tensor | None = None
+    grammar_category_log_probs: Tensor | None = None
+    legal_grammar_category_mask: Tensor | None = None
+    operator_log_probs: Tensor | None = None
+    legal_operator_mask: Tensor | None = None
+    operator_category_lookup: Tensor | None = None
+    window_log_probs: Tensor | None = None
+    legal_window_mask: Tensor | None = None
 
 
 def _masked_log_softmax(logits: Tensor, mask: Tensor, dim: int) -> Tensor:
@@ -106,10 +134,284 @@ class ForwardPolicyNetwork(nn.Module):
             nn.LayerNorm(d_model),
         )
         self.slot_head = nn.Linear(d_model, 1)
-        self.token_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Linear(d_model, TOTAL_ACTIONS),
+        if model_config.token_policy_mode == "grammar_hierarchical":
+            self.token_head: nn.Sequential | None = None
+        else:
+            self.token_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Linear(d_model, TOTAL_ACTIONS),
+            )
+        token_groups = [get_action(token_id).arity for token_id in range(TOTAL_ACTIONS)]
+        token_categories = [
+            CATEGORY_TO_INDEX[get_action(token_id).category]
+            for token_id in range(TOTAL_ACTIONS)
+        ]
+        token_operators = [
+            OPERATOR_TO_INDEX[get_action(token_id).name]
+            for token_id in range(TOTAL_ACTIONS)
+        ]
+        token_windows = [
+            (WINDOWS.index(get_action(token_id).window) if get_action(token_id).window else -1)
+            for token_id in range(TOTAL_ACTIONS)
+        ]
+        self.register_buffer(
+            "token_group_lookup",
+            torch.tensor(token_groups, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_category_lookup",
+            torch.tensor(token_categories, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_operator_lookup",
+            torch.tensor(token_operators, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "action_window_lookup",
+            torch.tensor(token_windows, dtype=torch.long),
+            persistent=False,
+        )
+        category_groups = [
+            0 if category is OperatorCategory.LEAF else (
+                2 if category in (OperatorCategory.BINARY, OperatorCategory.TS_BINARY) else 1
+            )
+            for category in OperatorCategory
+        ]
+        operator_categories = [0] * len(OPERATOR_TO_INDEX)
+        operator_requires_window = [False] * len(OPERATOR_TO_INDEX)
+        for action in (get_action(token_id) for token_id in range(TOTAL_ACTIONS)):
+            operator_categories[OPERATOR_TO_INDEX[action.name]] = CATEGORY_TO_INDEX[action.category]
+            operator_requires_window[OPERATOR_TO_INDEX[action.name]] = bool(action.window)
+        self.register_buffer(
+            "category_group_lookup",
+            torch.tensor(category_groups, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "operator_category_lookup",
+            torch.tensor(operator_categories, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "operator_requires_window",
+            torch.tensor(operator_requires_window, dtype=torch.bool),
+            persistent=False,
+        )
+        if model_config.token_policy_mode in ("arity_hierarchical", "grammar_hierarchical"):
+            self.group_head: nn.Linear | None = nn.Linear(d_model, TOKEN_GROUP_COUNT)
+            nn.init.zeros_(self.group_head.weight)
+            nn.init.zeros_(self.group_head.bias)
+        else:
+            self.group_head = None
+        if model_config.token_policy_mode == "grammar_hierarchical":
+            self.grammar_category_head: nn.Linear | None = nn.Linear(
+                d_model, GRAMMAR_CATEGORY_COUNT
+            )
+            self.operator_head: nn.Linear | None = nn.Linear(
+                d_model, len(OPERATOR_TO_INDEX)
+            )
+            self.window_head: nn.Linear | None = nn.Linear(
+                d_model, len(OPERATOR_TO_INDEX) * WINDOW_COUNT
+            )
+            for head in (
+                self.grammar_category_head,
+                self.operator_head,
+                self.window_head,
+            ):
+                nn.init.zeros_(head.weight)
+                nn.init.zeros_(head.bias)
+        else:
+            self.grammar_category_head = None
+            self.operator_head = None
+            self.window_head = None
+
+    def _hierarchical_token_distribution(
+        self,
+        token_logits: Tensor,
+        legal_token_mask: Tensor,
+        slot_mask: Tensor,
+        slot_hidden: Tensor,
+        temperature: float,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        if self.group_head is None:
+            raise RuntimeError("分组 Token 策略缺少 group_head")
+        group_logits = self.group_head(slot_hidden) / temperature
+        group_membership = torch.nn.functional.one_hot(
+            self.token_group_lookup,
+            num_classes=TOKEN_GROUP_COUNT,
+        ).to(dtype=torch.bool)
+        legal_by_group = legal_token_mask.unsqueeze(-1) & group_membership
+        legal_group_mask = legal_by_group.any(dim=2)
+
+        safe_group_mask = legal_group_mask.clone()
+        padding_slots = ~slot_mask
+        safe_group_mask[..., 0] |= padding_slots
+        group_log_probs = _masked_log_softmax(group_logits, safe_group_mask, dim=2)
+        group_log_probs = group_log_probs.masked_fill(
+            padding_slots.unsqueeze(-1), -torch.inf
+        )
+
+        within_group_log_probs = torch.full_like(token_logits, -torch.inf)
+        for group_id in range(TOKEN_GROUP_COUNT):
+            group_token_mask = legal_by_group[..., group_id].clone()
+            missing_group = ~group_token_mask.any(dim=2)
+            sentinel_token = int(
+                torch.nonzero(
+                    self.token_group_lookup == group_id,
+                    as_tuple=False,
+                )[0, 0]
+            )
+            group_token_mask[..., sentinel_token] |= missing_group
+            group_distribution = _masked_log_softmax(
+                token_logits,
+                group_token_mask,
+                dim=2,
+            )
+            actual_members = legal_by_group[..., group_id]
+            within_group_log_probs = torch.where(
+                actual_members,
+                group_distribution,
+                within_group_log_probs,
+            )
+
+        token_group_log_probs = group_log_probs.gather(
+            2,
+            self.token_group_lookup.view(1, 1, -1).expand_as(token_logits),
+        )
+        token_log_probs = token_group_log_probs + within_group_log_probs
+        token_log_probs = token_log_probs.masked_fill(
+            ~legal_token_mask | padding_slots.unsqueeze(-1),
+            -torch.inf,
+        )
+        return group_logits, group_log_probs, legal_group_mask, token_log_probs
+
+    def _grammar_hierarchical_token_distribution(
+        self,
+        legal_token_mask: Tensor,
+        slot_mask: Tensor,
+        slot_hidden: Tensor,
+        temperature: float,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        if any(
+            head is None
+            for head in (
+                self.group_head,
+                self.grammar_category_head,
+                self.operator_head,
+                self.window_head,
+            )
+        ):
+            raise RuntimeError("完整文法分层策略缺少概率头")
+        padding_slots = ~slot_mask
+
+        action_categories = torch.nn.functional.one_hot(
+            self.action_category_lookup, num_classes=GRAMMAR_CATEGORY_COUNT
+        ).to(dtype=torch.bool)
+        action_operators = torch.nn.functional.one_hot(
+            self.action_operator_lookup, num_classes=len(OPERATOR_TO_INDEX)
+        ).to(dtype=torch.bool)
+        legal_by_category = legal_token_mask.unsqueeze(-1) & action_categories
+        legal_category_mask = legal_by_category.any(dim=2)
+        legal_by_operator = legal_token_mask.unsqueeze(-1) & action_operators
+        legal_operator_mask = legal_by_operator.any(dim=2)
+
+        group_logits = self.group_head(slot_hidden) / temperature
+        legal_group_mask = (
+            legal_category_mask.unsqueeze(-1)
+            & torch.nn.functional.one_hot(
+                self.category_group_lookup, num_classes=TOKEN_GROUP_COUNT
+            ).to(dtype=torch.bool)
+        ).any(dim=2)
+        safe_group_mask = legal_group_mask.clone()
+        safe_group_mask[..., 0] |= padding_slots
+        group_log_probs = _masked_log_softmax(group_logits, safe_group_mask, dim=2)
+        group_log_probs = group_log_probs.masked_fill(padding_slots.unsqueeze(-1), -torch.inf)
+
+        category_logits = self.grammar_category_head(slot_hidden) / temperature
+        category_conditional = torch.full_like(category_logits, -torch.inf)
+        for group_id in range(TOKEN_GROUP_COUNT):
+            mask = legal_category_mask & (self.category_group_lookup == group_id)
+            missing = ~mask.any(dim=2)
+            sentinel = int(torch.nonzero(self.category_group_lookup == group_id)[0, 0])
+            safe = mask.clone()
+            safe[..., sentinel] |= missing
+            distribution = _masked_log_softmax(category_logits, safe, dim=2)
+            category_conditional = torch.where(mask, distribution, category_conditional)
+        category_group_logs = group_log_probs.gather(
+            2, self.category_group_lookup.view(1, 1, -1).expand_as(category_logits)
+        )
+        category_joint_log_probs = category_group_logs + category_conditional
+        category_joint_log_probs = category_joint_log_probs.masked_fill(
+            ~legal_category_mask | padding_slots.unsqueeze(-1), -torch.inf
+        )
+
+        operator_logits = self.operator_head(slot_hidden) / temperature
+        operator_log_probs = torch.full_like(operator_logits, -torch.inf)
+        for category_id in range(GRAMMAR_CATEGORY_COUNT):
+            mask = legal_operator_mask & (self.operator_category_lookup == category_id)
+            missing = ~mask.any(dim=2)
+            sentinel = int(torch.nonzero(self.operator_category_lookup == category_id)[0, 0])
+            safe = mask.clone()
+            safe[..., sentinel] |= missing
+            distribution = _masked_log_softmax(operator_logits, safe, dim=2)
+            operator_log_probs = torch.where(mask, distribution, operator_log_probs)
+        operator_log_probs = operator_log_probs.masked_fill(
+            ~legal_operator_mask | padding_slots.unsqueeze(-1), -torch.inf
+        )
+
+        window_logits = self.window_head(slot_hidden).view(
+            *slot_hidden.shape[:2], len(OPERATOR_TO_INDEX), WINDOW_COUNT
+        ) / temperature
+        # 当前固定文法中，同一个时序 Operator 的五个窗口具有相同结构合法性；
+        # 用 Operator 合法掩码一次性展开，避免每次 forward 发起 142 次 GPU 小操作。
+        legal_window_mask = (
+            legal_operator_mask.unsqueeze(-1)
+            & self.operator_requires_window.view(1, 1, -1, 1)
+        ).expand(-1, -1, -1, WINDOW_COUNT)
+        safe_window_mask = legal_window_mask.clone()
+        missing_windows = ~safe_window_mask.any(dim=3)
+        safe_window_mask[..., 0] |= missing_windows
+        window_log_probs = _masked_log_softmax(window_logits, safe_window_mask, dim=3)
+        window_log_probs = window_log_probs.masked_fill(~legal_window_mask, -torch.inf)
+
+        category_for_action = category_joint_log_probs.gather(
+            2, self.action_category_lookup.view(1, 1, -1).expand_as(legal_token_mask)
+        )
+        operator_for_action = operator_log_probs.gather(
+            2, self.action_operator_lookup.view(1, 1, -1).expand_as(legal_token_mask)
+        )
+        window_indices = self.action_window_lookup.clamp_min(0)
+        operator_indices = self.action_operator_lookup
+        window_for_action = window_log_probs[
+            ...,
+            operator_indices,
+            window_indices,
+        ]
+        has_window = self.action_window_lookup >= 0
+        window_for_action = torch.where(
+            has_window.view(1, 1, -1),
+            window_for_action,
+            torch.zeros_like(window_for_action),
+        )
+        token_log_probs = category_for_action + operator_for_action + window_for_action
+        token_log_probs = token_log_probs.masked_fill(
+            ~legal_token_mask | padding_slots.unsqueeze(-1), -torch.inf
+        )
+        return (
+            group_logits,
+            group_log_probs,
+            legal_group_mask,
+            category_joint_log_probs,
+            legal_category_mask,
+            operator_log_probs,
+            legal_operator_mask,
+            window_log_probs,
+            legal_window_mask,
+            token_log_probs,
         )
 
     def _token_embeddings(self, token_ids: Tensor) -> Tensor:
@@ -200,7 +502,11 @@ class ForwardPolicyNetwork(nn.Module):
         )
 
         slot_logits = self.slot_head(slot_hidden).squeeze(-1) / temperature
-        token_logits = self.token_head(slot_hidden) / temperature
+        token_logits = (
+            slot_hidden.new_zeros((*slot_hidden.shape[:2], TOTAL_ACTIONS))
+            if self.token_head is None
+            else self.token_head(slot_hidden) / temperature
+        )
         slot_log_probs = _masked_log_softmax(slot_logits, batch.slot_mask, dim=1)
 
         # Padding 槽位没有合法 Token。先为其放置一个仅用于数值计算的哨兵动作，
@@ -208,8 +514,61 @@ class ForwardPolicyNetwork(nn.Module):
         safe_token_mask = batch.legal_token_mask.clone()
         padding_slots = ~batch.slot_mask
         safe_token_mask[..., 0] |= padding_slots
-        token_log_probs = _masked_log_softmax(token_logits, safe_token_mask, dim=2)
-        token_log_probs = token_log_probs.masked_fill(padding_slots.unsqueeze(-1), -torch.inf)
+        if self.model_config.token_policy_mode == "grammar_hierarchical":
+            (
+                group_logits,
+                group_log_probs,
+                legal_group_mask,
+                grammar_category_log_probs,
+                legal_grammar_category_mask,
+                operator_log_probs,
+                legal_operator_mask,
+                window_log_probs,
+                legal_window_mask,
+                token_log_probs,
+            ) = self._grammar_hierarchical_token_distribution(
+                batch.legal_token_mask,
+                batch.slot_mask,
+                slot_hidden,
+                temperature,
+            )
+            # grammar_hierarchical 没有冗余的142维独立输出头；以联合 log
+            # 概率作为可审计的最终动作 logits，避免每次 forward 做无效矩阵乘法。
+            token_logits = token_log_probs
+        elif self.model_config.token_policy_mode == "arity_hierarchical":
+            (
+                group_logits,
+                group_log_probs,
+                legal_group_mask,
+                token_log_probs,
+            ) = self._hierarchical_token_distribution(
+                token_logits,
+                batch.legal_token_mask,
+                batch.slot_mask,
+                slot_hidden,
+                temperature,
+            )
+        else:
+            token_log_probs = _masked_log_softmax(token_logits, safe_token_mask, dim=2)
+            token_log_probs = token_log_probs.masked_fill(
+                padding_slots.unsqueeze(-1), -torch.inf
+            )
+            group_logits = None
+            group_log_probs = None
+            legal_group_mask = None
+            grammar_category_log_probs = None
+            legal_grammar_category_mask = None
+            operator_log_probs = None
+            legal_operator_mask = None
+            window_log_probs = None
+            legal_window_mask = None
+        if self.model_config.token_policy_mode == "arity_hierarchical":
+            grammar_category_log_probs = None
+            legal_grammar_category_mask = None
+            operator_log_probs = None
+            legal_operator_mask = None
+            window_log_probs = None
+            legal_window_mask = None
         masked_slot_logits = slot_logits.masked_fill(~batch.slot_mask, -torch.inf)
         masked_token_logits = token_logits.masked_fill(~batch.legal_token_mask, -torch.inf)
 
@@ -220,7 +579,33 @@ class ForwardPolicyNetwork(nn.Module):
             token_log_probs=token_log_probs,
             slot_mask=batch.slot_mask,
             legal_token_mask=batch.legal_token_mask,
+            group_logits=(
+                group_logits.masked_fill(~legal_group_mask, -torch.inf)
+                if group_logits is not None and legal_group_mask is not None
+                else None
+            ),
+            group_log_probs=group_log_probs,
+            legal_group_mask=legal_group_mask,
+            grammar_category_log_probs=grammar_category_log_probs,
+            legal_grammar_category_mask=legal_grammar_category_mask,
+            operator_log_probs=operator_log_probs,
+            legal_operator_mask=legal_operator_mask,
+            operator_category_lookup=(
+                self.operator_category_lookup
+                if operator_log_probs is not None else None
+            ),
+            window_log_probs=window_log_probs,
+            legal_window_mask=legal_window_mask,
         )
 
 
-__all__ = ["ForwardPolicyNetwork", "PolicyOutput"]
+__all__ = [
+    "ForwardPolicyNetwork",
+    "PolicyOutput",
+    "TOKEN_GROUP_COUNT",
+    "TOKEN_GROUP_NAMES",
+    "GRAMMAR_CATEGORY_COUNT",
+    "GRAMMAR_CATEGORY_NAMES",
+    "WINDOW_COUNT",
+    "WINDOW_NAMES",
+]

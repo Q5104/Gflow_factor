@@ -7,11 +7,14 @@ from scipy.stats import spearmanr
 from factor_gfn.evaluator import (
     EvaluationConfig,
     build_forward_returns,
+    cleaned_portfolio_returns_from_cleaned,
     evaluate_rank_ic,
     excess_return_correlation,
     factor_cross_sectional_correlation,
     infer_long_direction,
     long_portfolio_series,
+    long_portfolio_series_from_cleaned,
+    long_short_portfolio_series_from_cleaned,
     rank_ic_series,
     select_rebalance_indices,
     summarize_correlation,
@@ -227,6 +230,47 @@ class LongPortfolioTests(unittest.TestCase):
             result.annualized_ir,
             0.02 / expected_std * np.sqrt(252.0 / 5.0),
         )
+
+    def test_combined_cleaned_portfolios_match_separate_stable_sorts(self):
+        rng = np.random.default_rng(20260811)
+        factor = np.round(rng.normal(size=(9, 40)), 1)
+        returns = rng.normal(0.0, 0.02, size=factor.shape)
+        factor[2, ::6] = np.nan
+        returns[4, ::7] = np.nan
+        config = EvaluationConfig(min_cross_section_count=10, long_quantile=0.2)
+
+        for direction in (-1, 1):
+            combined_long, combined_ls = cleaned_portfolio_returns_from_cleaned(
+                factor,
+                returns,
+                direction,
+                config,
+            )
+            separate_long = long_portfolio_series_from_cleaned(
+                factor,
+                returns,
+                direction,
+                config,
+            )
+            separate_ls = long_short_portfolio_series_from_cleaned(
+                factor,
+                returns,
+                config,
+            )
+            np.testing.assert_allclose(
+                combined_long,
+                separate_long.excess_return,
+                equal_nan=True,
+                rtol=1e-13,
+                atol=1e-13,
+            )
+            np.testing.assert_allclose(
+                combined_ls,
+                separate_ls.long_short_return,
+                equal_nan=True,
+                rtol=1e-13,
+                atol=1e-13,
+            )
 
 
 class CorrelationTests(unittest.TestCase):

@@ -1,10 +1,20 @@
 import unittest
 import warnings
+from unittest.mock import patch
 
 import numpy as np
 
 from factor_gfn.barra import BarraPenaltyResult, LongShortSeries, STYLE_NAMES
-from factor_gfn.evaluator import EvaluationConfig
+from factor_gfn.evaluator import (
+    EvaluationConfig,
+    evaluate_rank_ic,
+    infer_long_direction,
+    long_portfolio_series,
+    long_short_portfolio_series,
+    summarize_excess_returns,
+)
+from factor_gfn.barra import calculate_barra_ts_corr
+from factor_gfn.evaluator.cross_section import clean_candidate_factor_cross_sections
 from factor_gfn.gfn import (
     RewardConfig,
     RewardEvaluator,
@@ -82,6 +92,105 @@ class RewardFormulaTests(unittest.TestCase):
 
 
 class RewardEvaluatorTests(unittest.TestCase):
+    def test_fixed_calendar_cleans_only_compact_rows_once_and_matches_reference(self):
+        rng = np.random.default_rng(20260810)
+        date_count, stock_count = 10, 30
+        factor = rng.normal(size=(date_count, stock_count))
+        groups = np.repeat(np.arange(3), 10)
+        factor += groups[None, :] * 0.25
+        returns = 0.02 * factor + rng.normal(0.0, 0.01, factor.shape)
+        industries = np.broadcast_to(groups, factor.shape).copy()
+        universe = np.ones(factor.shape, dtype=bool)
+        rebalance = np.array([1, 4, 7, 9], dtype=np.int64)
+        dates = np.arange(
+            np.datetime64("2010-01-01"),
+            np.datetime64("2010-01-11"),
+            dtype="datetime64[D]",
+        )
+        references = {
+            name: _series(rng.normal(0.0, 0.02, date_count)) for name in STYLE_NAMES
+        }
+        config = EvaluationConfig(
+            rebalance_interval=1,
+            min_cross_section_count=10,
+            long_quantile=0.10,
+        )
+        reward_config = RewardConfig(
+            barra_min_common_periods=2,
+            candidate_industry_neutralization=True,
+        )
+        evaluator = RewardEvaluator(
+            returns,
+            references,
+            data_fingerprint="compact-panel-v1",
+            evaluation_config=config,
+            reward_config=reward_config,
+            universe_mask=universe,
+            industry_labels=industries,
+            industry_fingerprint="industry-v1",
+            rebalance_indices=rebalance,
+            evaluation_dates=dates,
+        )
+
+        with patch(
+            "factor_gfn.gfn.reward.clean_candidate_factor_cross_sections",
+            wraps=clean_candidate_factor_cross_sections,
+        ) as cleaner:
+            optimized = evaluator.evaluate("compact-factor", factor).result
+
+        self.assertEqual(cleaner.call_count, 1)
+        self.assertEqual(cleaner.call_args.args[0].shape, (rebalance.size, stock_count))
+
+        legacy_ic = evaluate_rank_ic(
+            factor,
+            returns,
+            config,
+            industry_labels=industries,
+            universe_mask=universe,
+            neutralize_industry=True,
+            rebalance_indices=rebalance,
+        )
+        direction = infer_long_direction(legacy_ic.rebalance_summary.mean)
+        legacy_long = long_portfolio_series(
+            factor,
+            returns,
+            rebalance,
+            direction,
+            config,
+            industry_labels=industries,
+            universe_mask=universe,
+            neutralize_industry=True,
+        )
+        legacy_long_summary = summarize_excess_returns(
+            legacy_long.excess_return[rebalance],
+            config,
+        )
+        legacy_ls = long_short_portfolio_series(
+            factor,
+            returns,
+            rebalance,
+            config,
+            industry_labels=industries,
+            universe_mask=universe,
+            neutralize_industry=True,
+        )
+        legacy_penalty = calculate_barra_ts_corr(
+            legacy_ls.long_short_return,
+            references,
+            min_periods=2,
+        )
+
+        self.assertAlmostEqual(optimized.train_ic, legacy_ic.rebalance_summary.mean)
+        self.assertAlmostEqual(optimized.train_long_ir, legacy_long_summary.annualized_ir)
+        self.assertAlmostEqual(optimized.barra_ts_corr, legacy_penalty.barra_ts_corr)
+        self.assertEqual(optimized.ic_valid_periods, legacy_ic.rebalance_summary.valid_periods)
+        self.assertEqual(optimized.long_ir_valid_periods, legacy_long_summary.valid_periods)
+        for name in STYLE_NAMES:
+            self.assertAlmostEqual(
+                optimized.barra_correlations[name],
+                legacy_penalty.correlations[name],
+            )
+
     def test_explicit_no_industry_mode_runs_and_cache_hits(self):
         rng = np.random.default_rng(2026)
         date_count, stock_count = 24, 30
@@ -113,6 +222,7 @@ class RewardEvaluatorTests(unittest.TestCase):
         self.assertFalse(first.result.industry_neutralized)
         self.assertEqual(first.result.neutralization_skipped_dates, ())
         self.assertEqual(first.result.neutralization_skipped_rate, 0.0)
+        self.assertEqual(first.result.neutralization_skipped_details, ())
         self.assertEqual(set(first.result.barra_correlations), set(STYLE_NAMES))
         self.assertEqual(first.result, second.result)
 
@@ -179,6 +289,20 @@ class RewardEvaluatorTests(unittest.TestCase):
             ("2010-01-01", "2010-01-03", "2010-01-05", "2010-01-06"),
         )
         self.assertEqual(first.result.neutralization_skipped_rate, 1.0)
+        self.assertEqual(
+            tuple(item["row_index"] for item in first.result.neutralization_skipped_details),
+            (0, 2, 4, 5),
+        )
+        first_detail = first.result.neutralization_skipped_details[0]
+        self.assertEqual(first_detail["date"], "2010-01-01")
+        self.assertEqual(first_detail["factor_valid_count"], 4)
+        self.assertEqual(first_detail["known_industry_count"], 4)
+        self.assertEqual(first_detail["industry_count"], 4)
+        self.assertEqual(first_detail["required_regression_count"], 5)
+        self.assertEqual(
+            first_detail["reason"],
+            "insufficient_industry_regression_samples",
+        )
         self.assertEqual(first.result, second.result)
         self.assertTrue(second.cache_hit)
         self.assertFalse(invalid.result.valid)
@@ -187,6 +311,10 @@ class RewardEvaluatorTests(unittest.TestCase):
             first.result.neutralization_skipped_dates,
         )
         self.assertEqual(invalid.result.neutralization_skipped_rate, 1.0)
+        self.assertEqual(
+            invalid.result.neutralization_skipped_details,
+            first.result.neutralization_skipped_details,
+        )
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import unittest
+import warnings
 
 import numpy as np
 
@@ -91,7 +92,12 @@ def _context() -> RealRewardDataContext:
 
 
 class RealRewardProviderTests(unittest.TestCase):
-    def _provider(self, *, cache_max_entries: int = 8) -> RealRewardProvider:
+    def _provider(
+        self,
+        *,
+        cache_max_entries: int = 8,
+        subexpression_cache_max_bytes: int = 512 * 1024**2,
+    ) -> RealRewardProvider:
         return RealRewardProvider(
             _context(),
             RewardConfig(
@@ -99,6 +105,7 @@ class RealRewardProviderTests(unittest.TestCase):
                 candidate_industry_neutralization=True,
             ),
             cache_max_entries=cache_max_entries,
+            subexpression_cache_max_bytes=subexpression_cache_max_bytes,
         )
 
     def test_valid_expression_returns_full_decomposition(self) -> None:
@@ -114,10 +121,87 @@ class RealRewardProviderTests(unittest.TestCase):
         self.assertTrue(result["industry_neutralized"])
         self.assertEqual(result["neutralization_skipped_dates"], ())
         self.assertEqual(result["neutralization_skipped_rate"], 0.0)
+        self.assertEqual(result["neutralization_skipped_details"], ())
         self.assertEqual(set(result["barra_correlations"]), set(STYLE_NAMES))
         self.assertEqual(result["ic_valid_periods"], 13)
         self.assertEqual(provider.interpreter_evaluation_count, 1)
         self.assertEqual(len(provider.evaluation_records), 1)
+        policy = provider.manifest()["industry_neutralization"]
+        self.assertEqual(
+            policy["policy_schema"],
+            "factor_gfn.strict_industry_neutralization.v1",
+        )
+        self.assertEqual(
+            policy["failed_date_action"],
+            "exclude_entire_candidate_cross_section",
+        )
+        self.assertEqual(policy["unknown_industry_stock_action"], "exclude_stock")
+        self.assertIn("reason", policy["audit_fields"])
+        reward_panel = provider.manifest()["reward_panel"]
+        self.assertEqual(reward_panel["mode"], "fixed_rebalance_compact")
+        self.assertEqual(reward_panel["history_rows_interpreted"], 80)
+        self.assertEqual(reward_panel["evaluation_rows"], 13)
+        self.assertEqual(reward_panel["candidate_cleaning_calls_per_evaluation"], 1)
+        interpreter = provider.manifest()["interpreter"]
+        self.assertEqual(
+            interpreter["numeric_kernel_schema"],
+            "factor_gfn.numba_cpu_loops.v2",
+        )
+        self.assertEqual(
+            interpreter["numba_kernel_schema"],
+            "factor_gfn.numba_cpu_loops.v2",
+        )
+        self.assertTrue(interpreter["numba_pre_warmed"])
+        self.assertEqual(interpreter["input_storage_mode"], "owned_normalized_copy")
+        self.assertTrue(interpreter["leaf_views_are_read_only"])
+        self.assertTrue(interpreter["returned_factor_is_independent"])
+        subexpression = provider.manifest()["cache"]["subexpression"]
+        self.assertEqual(
+            subexpression["schema"],
+            "factor_gfn.subexpression_lru.v1",
+        )
+        self.assertEqual(subexpression["max_bytes"], 512 * 1024**2)
+        self.assertTrue(subexpression["enabled"])
+        self.assertEqual(subexpression["eviction"], "lru")
+        self.assertFalse(subexpression["leaf_cached"])
+        self.assertFalse(subexpression["root_cached"])
+        self.assertFalse(subexpression["checkpointed"])
+
+    def test_shared_subexpression_cache_is_audited_per_candidate(self) -> None:
+        provider = self._provider()
+        shared = get_action_id("ts_mean", 5)
+        first = Expression.from_prefix(
+            (
+                get_action_id("add"),
+                shared,
+                get_action_id("close"),
+                get_action_id("high"),
+            )
+        )
+        second = Expression.from_prefix(
+            (
+                get_action_id("sub"),
+                shared,
+                get_action_id("close"),
+                get_action_id("low"),
+            )
+        )
+
+        first_assignment = provider.evaluate(first)
+        second_assignment = provider.evaluate(second)
+
+        self.assertEqual(first_assignment.metadata["subexpression_cache_hits"], 0)
+        self.assertEqual(first_assignment.metadata["subexpression_cache_misses"], 1)
+        self.assertEqual(second_assignment.metadata["subexpression_cache_hits"], 1)
+        self.assertEqual(second_assignment.metadata["subexpression_cache_misses"], 0)
+        self.assertGreater(
+            second_assignment.metadata["subexpression_cache_current_bytes"],
+            0,
+        )
+        self.assertEqual(
+            provider.cache_info()["subexpression"]["hits"],
+            1,
+        )
 
     def test_provider_cache_prevents_second_interpreter_call(self) -> None:
         provider = self._provider()
@@ -133,6 +217,43 @@ class RealRewardProviderTests(unittest.TestCase):
         self.assertEqual(provider.cache_hit_count, 1)
         self.assertEqual(provider.interpreter_evaluation_count, 1)
         self.assertEqual(len(provider.evaluation_records), 1)
+
+    def test_failed_dates_persist_complete_neutralization_audit(self) -> None:
+        context = _context()
+        stock_count = context.industry_labels.shape[1]
+        context.industry_labels[:] = np.arange(stock_count, dtype=np.int32)
+        provider = RealRewardProvider(
+            context,
+            RewardConfig(
+                barra_min_common_periods=5,
+                candidate_industry_neutralization=True,
+            ),
+        )
+        expression = Expression.from_prefix([get_action_id("close")])
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            assignment = provider.evaluate(expression)
+
+        result = assignment.metadata["reward_result"]
+        self.assertFalse(assignment.valid)
+        self.assertEqual(
+            len(result["neutralization_skipped_details"]),
+            context.rebalance_indices.size,
+        )
+        detail = result["neutralization_skipped_details"][0]
+        self.assertEqual(
+            detail["date"],
+            str(context.evaluation_dates[context.rebalance_indices[0]]),
+        )
+        self.assertEqual(detail["factor_valid_count"], stock_count)
+        self.assertEqual(detail["known_industry_count"], stock_count)
+        self.assertEqual(detail["industry_count"], stock_count)
+        self.assertEqual(detail["required_regression_count"], stock_count + 1)
+        self.assertEqual(
+            detail["reason"],
+            "insufficient_industry_regression_samples",
+        )
 
     def test_divergent_lru_orders_do_not_break_evaluation(self) -> None:
         provider = self._provider(cache_max_entries=2)

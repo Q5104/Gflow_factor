@@ -143,6 +143,85 @@ class PolicySamplerTests(unittest.TestCase):
             [(step.selected_slot_path, step.selected_token_id) for step in second.steps],
         )
 
+    def test_batched_grammar_diagnostics_preserve_sampling_and_metrics(self):
+        search_space = SearchSpaceConfig(max_depth=3, max_nodes=5)
+        adapter = StateAdapter(search_space)
+        model = ForwardPolicyNetwork(
+            ModelConfig(
+                d_model=32,
+                num_heads=4,
+                num_layers=1,
+                dim_feedforward=64,
+                dropout=0.0,
+                token_policy_mode="grammar_hierarchical",
+            ),
+            search_space,
+        )
+        torch.manual_seed(412)
+        per_action = sample_trajectories(model, adapter, num_trajectories=6)
+        torch.manual_seed(412)
+        batched = sample_trajectories(
+            model,
+            adapter,
+            num_trajectories=6,
+            batched_policy_diagnostics=True,
+        )
+        self.assertEqual(
+            [trajectory.terminal_expression.to_prefix() for trajectory in per_action],
+            [trajectory.terminal_expression.to_prefix() for trajectory in batched],
+        )
+        scalar_fields = (
+            "policy_entropy",
+            "normalized_policy_entropy",
+            "group_entropy",
+            "normalized_group_entropy",
+            "grammar_category_entropy",
+            "normalized_grammar_category_entropy",
+            "operator_entropy",
+            "normalized_operator_entropy",
+            "window_entropy",
+            "normalized_window_entropy",
+        )
+        vector_fields = (
+            "group_probabilities",
+            "grammar_category_probabilities",
+            "window_probabilities",
+        )
+        for expected, actual in zip(per_action, batched, strict=True):
+            self.assertEqual(len(expected.steps), len(actual.steps))
+            for expected_step, actual_step in zip(
+                expected.steps, actual.steps, strict=True
+            ):
+                self.assertEqual(
+                    expected_step.selected_token_id, actual_step.selected_token_id
+                )
+                self.assertEqual(
+                    expected_step.selected_slot_path,
+                    actual_step.selected_slot_path,
+                )
+                for field in scalar_fields:
+                    expected_value = getattr(expected_step, field)
+                    actual_value = getattr(actual_step, field)
+                    if expected_value is None:
+                        self.assertIsNone(actual_value)
+                    else:
+                        self.assertAlmostEqual(
+                            float(expected_value), float(actual_value), places=5
+                        )
+                for field in vector_fields:
+                    expected_values = getattr(expected_step, field)
+                    actual_values = getattr(actual_step, field)
+                    if expected_values is None:
+                        self.assertIsNone(actual_values)
+                    else:
+                        self.assertEqual(len(expected_values), len(actual_values))
+                        for expected_value, actual_value in zip(
+                            expected_values, actual_values, strict=True
+                        ):
+                            self.assertAlmostEqual(
+                                float(expected_value), float(actual_value), places=6
+                            )
+
     def test_model_mode_is_restored_when_sampling_raises(self):
         _, adapter, model = self.small_components()
         model.train()

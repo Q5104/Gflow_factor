@@ -32,17 +32,87 @@ DEFAULT_CLEANING_CONFIG = CrossSectionalCleaningConfig()
 
 
 class IndustryNeutralizationWarning(UserWarning):
-    """A date skipped industry neutralization and continued to z-score."""
+    """A candidate date was excluded because industry neutralization failed."""
+
+
+@dataclass(frozen=True, slots=True)
+class NeutralizationSkipDetail:
+    """Auditable reason and sample counts for one excluded matrix row."""
+
+    row_index: int
+    factor_valid_count: int
+    known_industry_count: int
+    industry_count: int
+    required_regression_count: int
+    reason: str
 
 
 @dataclass(slots=True)
 class NeutralizationDiagnostics:
-    """Collect unique matrix rows where requested industry neutralization skipped."""
+    """Collect unique matrix rows where requested neutralization failed closed."""
 
-    skipped_rows: set[int] = field(default_factory=set)
+    skipped_details: dict[int, NeutralizationSkipDetail] = field(default_factory=dict)
 
-    def record_skip(self, row_index: int) -> None:
-        self.skipped_rows.add(int(row_index))
+    @property
+    def skipped_rows(self) -> set[int]:
+        return set(self.skipped_details)
+
+    def record_skip(
+        self,
+        row_index: int,
+        *,
+        factor_valid_count: int,
+        known_industry_count: int,
+        industry_count: int,
+        reason: str,
+    ) -> None:
+        detail = NeutralizationSkipDetail(
+            row_index=int(row_index),
+            factor_valid_count=int(factor_valid_count),
+            known_industry_count=int(known_industry_count),
+            industry_count=int(industry_count),
+            required_regression_count=int(industry_count) + 1,
+            reason=str(reason),
+        )
+        existing = self.skipped_details.get(detail.row_index)
+        if existing is not None and existing != detail:
+            raise RuntimeError(
+                f"日期索引 {detail.row_index} 出现不一致的行业中性化失败诊断"
+            )
+        self.skipped_details[detail.row_index] = detail
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedIndustryPanel:
+    """Point-in-time industry labels encoded once for repeated candidates."""
+
+    codes: npt.NDArray[np.int32]
+
+
+def encode_industry_panel(
+    industry_labels: npt.ArrayLike,
+    shape: tuple[int, int],
+) -> EncodedIndustryPanel:
+    """Normalize labels once; ``-1`` denotes an unknown point-in-time label."""
+
+    labels = _industry_matrix(industry_labels, shape)
+    codes = np.full(shape, -1, dtype=np.int32)
+    for date_index in range(shape[0]):
+        normalized = [_valid_industry_label(value) for value in labels[date_index]]
+        known_positions = np.fromiter(
+            (index for index, label in enumerate(normalized) if label is not None),
+            dtype=np.int64,
+        )
+        if known_positions.size == 0:
+            continue
+        known_labels = np.asarray(
+            [normalized[index] for index in known_positions],
+            dtype=object,
+        )
+        _, inverse = np.unique(known_labels, return_inverse=True)
+        codes[date_index, known_positions] = inverse.astype(np.int32, copy=False)
+    codes.setflags(write=False)
+    return EncodedIndustryPanel(codes=codes)
 
 
 def _validate_inputs(
@@ -130,6 +200,27 @@ def _valid_industry_label(value: object) -> str | None:
     return text
 
 
+def _industry_group_residuals(
+    values: npt.NDArray[np.float64],
+    codes: npt.NDArray[np.int32],
+    epsilon: float,
+) -> npt.NDArray[np.float64]:
+    """Project onto industry groups without constructing a dense OLS design.
+
+    An intercept plus a full set of industry dummies fits each observation to
+    its industry mean.  Computing that projection directly preserves the
+    neutralization definition while removing one rank-deficient ``lstsq`` per
+    candidate and date.
+    """
+
+    _, inverse = np.unique(codes, return_inverse=True)
+    counts = np.bincount(inverse)
+    sums = np.bincount(inverse, weights=values)
+    residuals = values - sums[inverse] / counts[inverse]
+    residuals[np.abs(residuals) <= epsilon] = 0.0
+    return residuals
+
+
 def clean_factor_cross_sections(
     factor: npt.ArrayLike,
     universe_mask: npt.ArrayLike | None = None,
@@ -156,21 +247,29 @@ def clean_factor_cross_sections(
 
 def clean_candidate_factor_cross_sections(
     factor: npt.ArrayLike,
-    industry_labels: npt.ArrayLike,
+    industry_labels: npt.ArrayLike | None,
     universe_mask: npt.ArrayLike | None = None,
     *,
     row_indices: npt.ArrayLike | None = None,
     config: CrossSectionalCleaningConfig = DEFAULT_CLEANING_CONFIG,
     diagnostics: NeutralizationDiagnostics | None = None,
+    encoded_industries: EncodedIndustryPanel | None = None,
 ) -> npt.NDArray[np.float64]:
     """Winsorize, industry-neutralize, then z-score candidate factors.
 
     Industry labels may be a static ``(stock,)`` vector or a point-in-time
-    ``(date, stock)`` matrix. Missing-industry stocks keep their winsorized
-    value and join the final z-score, but do not enter the OLS fit.
+    ``(date, stock)`` matrix. Stocks without a known industry are excluded from
+    the cleaned row. If the industry regression cannot run, the entire date is
+    left NaN; the global evaluation calendar is never shifted or backfilled.
     """
     values, universe, rows = _validate_inputs(factor, universe_mask, row_indices)
-    industries = _industry_matrix(industry_labels, values.shape)
+    if encoded_industries is None:
+        if industry_labels is None:
+            raise ValueError("industry_labels 与 encoded_industries 不能同时为空")
+        encoded_industries = encode_industry_panel(industry_labels, values.shape)
+    industry_codes = np.asarray(encoded_industries.codes)
+    if industry_codes.shape != values.shape or industry_codes.dtype != np.int32:
+        raise ValueError("encoded_industries 必须是与 factor 同形的 int32 编码")
     result = np.full(values.shape, np.nan, dtype=np.float64)
 
     for date_index in rows:
@@ -180,64 +279,63 @@ def clean_candidate_factor_cross_sections(
             continue
 
         clipped = _winsorize(values[date_index, valid], config)
-        raw_labels = industries[date_index, valid]
-        normalized_labels = [_valid_industry_label(value) for value in raw_labels]
-        known = np.fromiter(
-            (label is not None for label in normalized_labels),
-            dtype=bool,
-            count=count,
-        )
-        adjusted = clipped.copy()
-        if known.any():
-            labels = np.asarray(
-                [label for label in normalized_labels if label is not None],
-                dtype=object,
-            )
-            categories = np.unique(labels)
-            known_count = int(known.sum())
-            if known_count < len(categories) + 1:
-                if diagnostics is not None:
-                    diagnostics.record_skip(int(date_index))
-                warnings.warn(
-                    f"日期索引 {date_index} 的行业回归样本数 {known_count} 少于"
-                    f"行业数+1 ({len(categories) + 1})，已跳过行业中性化",
-                    IndustryNeutralizationWarning,
-                    stacklevel=2,
-                )
-            else:
-                design = np.column_stack(
-                    [np.ones(known_count)]
-                    + [(labels == category).astype(np.float64) for category in categories]
-                )
-                try:
-                    coefficients = np.linalg.lstsq(
-                        design,
-                        clipped[known],
-                        rcond=None,
-                    )[0]
-                    residuals = clipped[known] - design @ coefficients
-                    residuals[np.abs(residuals) <= config.epsilon] = 0.0
-                    adjusted[known] = residuals
-                except np.linalg.LinAlgError:
-                    if diagnostics is not None:
-                        diagnostics.record_skip(int(date_index))
-                    warnings.warn(
-                        f"日期索引 {date_index} 的行业 OLS 求解失败，已跳过行业中性化",
-                        IndustryNeutralizationWarning,
-                        stacklevel=2,
-                    )
+        row_codes = industry_codes[date_index, valid]
+        known = row_codes >= 0
+        known_count = int(known.sum())
+        known_codes = row_codes[known]
+        industry_count = int(np.unique(known_codes).size) if known_count else 0
+        skip_reason: str | None = None
+        if known_count == 0:
+            skip_reason = "no_known_industry_labels"
+        elif known_count < industry_count + 1:
+            skip_reason = "insufficient_industry_regression_samples"
 
-        standardized = _zscore(adjusted, config)
+        residuals: npt.NDArray[np.float64] | None = None
+        if skip_reason is None:
+            try:
+                residuals = _industry_group_residuals(
+                    clipped[known],
+                    known_codes,
+                    config.epsilon,
+                )
+            except (ArithmeticError, np.linalg.LinAlgError):
+                skip_reason = "industry_ols_failure"
+
+        if skip_reason is not None:
+            if diagnostics is not None:
+                diagnostics.record_skip(
+                    int(date_index),
+                    factor_valid_count=count,
+                    known_industry_count=known_count,
+                    industry_count=industry_count,
+                    reason=skip_reason,
+                )
+            warnings.warn(
+                f"日期索引 {date_index} 的行业中性化失败 "
+                f"(reason={skip_reason}, factor_valid={count}, "
+                f"known_industry={known_count}, industries={industry_count})，"
+                "已排除当日候选截面",
+                IndustryNeutralizationWarning,
+                stacklevel=2,
+            )
+            continue
+
+        assert residuals is not None
+        standardized = _zscore(residuals, config)
         if standardized is not None:
-            result[date_index, valid] = standardized
+            valid_positions = np.flatnonzero(valid)
+            result[date_index, valid_positions[known]] = standardized
     return result
 
 
 __all__ = [
     "DEFAULT_CLEANING_CONFIG",
     "CrossSectionalCleaningConfig",
+    "EncodedIndustryPanel",
     "IndustryNeutralizationWarning",
     "NeutralizationDiagnostics",
+    "NeutralizationSkipDetail",
     "clean_candidate_factor_cross_sections",
     "clean_factor_cross_sections",
+    "encode_industry_panel",
 ]

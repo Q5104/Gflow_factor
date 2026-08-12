@@ -22,6 +22,33 @@ from factor_gfn.grammar.operators import (
 )
 from factor_gfn.grammar.tokens import WINDOWS
 
+from .numba_kernels import (
+    BINARY_BETA,
+    BINARY_CORR,
+    BINARY_COV,
+    BINARY_ORTH,
+    ROLLING_ARGMAX,
+    ROLLING_ARGMIN,
+    ROLLING_MAX,
+    ROLLING_MIN,
+    ROLLING_POSITION,
+    ROLLING_RANGE,
+    ROLLING_RANK,
+    UNARY_MEAN,
+    UNARY_STD,
+    UNARY_ZSCORE,
+    WEIGHTED_RESIDUAL,
+    WEIGHTED_SLOPE,
+    WEIGHTED_WMA,
+    cross_sectional_average_rank_kernel,
+    ema_kernel,
+    rolling_binary_moment_kernel,
+    rolling_sum_kernel,
+    rolling_unary_moment_kernel,
+    rolling_weighted_kernel,
+    rolling_window_kernel,
+)
+
 
 FloatMatrix = NDArray[np.float64]
 OperatorFunction = Callable[..., FloatMatrix]
@@ -36,9 +63,11 @@ def _matrix(values: ArrayLike, label: str = "输入") -> FloatMatrix:
     array = np.asarray(values, dtype=np.float64)
     if array.ndim != 2:
         raise ValueError(f"{label}必须是二维 (date, stock) 数组，实际形状为 {array.shape}")
-    result = array.copy()
-    result[~np.isfinite(result)] = np.nan
-    return result
+    if np.isinf(array).any():
+        result = array.copy()
+        result[~np.isfinite(result)] = np.nan
+        return result
+    return array
 
 
 def _binary_matrices(x: ArrayLike, y: ArrayLike) -> tuple[FloatMatrix, FloatMatrix]:
@@ -50,7 +79,8 @@ def _binary_matrices(x: ArrayLike, y: ArrayLike) -> tuple[FloatMatrix, FloatMatr
 
 
 def _finite_or_nan(values: ArrayLike) -> FloatMatrix:
-    result = np.asarray(values, dtype=np.float64).copy()
+    array = np.asarray(values, dtype=np.float64)
+    result = array if array.flags.owndata and array.flags.writeable else array.copy()
     result[~np.isfinite(result)] = np.nan
     return result
 
@@ -228,10 +258,9 @@ def _cross_sectional(
 
 
 def cs_rank(x: ArrayLike) -> FloatMatrix:
-    return _cross_sectional(
-        x,
-        lambda values: (_average_zero_based_rank(values) + 0.5) / values.size,
-    )
+    ranks, counts = cross_sectional_average_rank_kernel(_matrix(x))
+    denominator = np.maximum(counts, 1)
+    return (ranks + 0.5) / denominator[:, None]
 
 
 def cs_zscore(x: ArrayLike) -> FloatMatrix:
@@ -295,18 +324,15 @@ def cs_truncate(x: ArrayLike) -> FloatMatrix:
 
 
 def cs_quantile(x: ArrayLike) -> FloatMatrix:
-    def transform(values: FloatMatrix) -> FloatMatrix:
-        return _average_zero_based_rank(values) / (values.size - 1)
-
-    return _cross_sectional(x, transform)
+    ranks, counts = cross_sectional_average_rank_kernel(_matrix(x))
+    denominator = np.maximum(counts - 1, 1)
+    return ranks / denominator[:, None]
 
 
 def cs_rank_gauss(x: ArrayLike) -> FloatMatrix:
-    def transform(values: FloatMatrix) -> FloatMatrix:
-        probability = (_average_zero_based_rank(values) + 0.5) / values.size
-        return ndtri(probability)
-
-    return _cross_sectional(x, transform)
+    ranks, counts = cross_sectional_average_rank_kernel(_matrix(x))
+    probability = (ranks + 0.5) / np.maximum(counts, 1)[:, None]
+    return ndtri(probability)
 
 
 def _window(window: int) -> int:
@@ -373,31 +399,284 @@ def _rolling_binary(
     return result
 
 
+def _rolling_sum_complete(values: FloatMatrix, window: int) -> FloatMatrix:
+    """完整窗口滑动和；只保留股票轴状态，避免逐窗口切片。"""
+
+    result = np.full_like(values, np.nan)
+    running_sum = np.zeros(values.shape[1], dtype=np.float64)
+    missing_count = np.zeros(values.shape[1], dtype=np.int32)
+    for date_index in range(values.shape[0]):
+        current = values[date_index]
+        current_valid = np.isfinite(current)
+        np.add(running_sum, current, out=running_sum, where=current_valid)
+        missing_count += ~current_valid
+        if date_index >= window:
+            expired = values[date_index - window]
+            expired_valid = np.isfinite(expired)
+            np.subtract(running_sum, expired, out=running_sum, where=expired_valid)
+            missing_count -= ~expired_valid
+        if date_index >= window - 1:
+            complete = missing_count == 0
+            result[date_index, complete] = running_sum[complete]
+    return result
+
+
+def _rolling_unary_moment(
+    values: FloatMatrix,
+    window: int,
+    mode: str,
+) -> FloatMatrix:
+    """用平移后的滑动一、二阶矩计算 mean/std/zscore。"""
+
+    result = np.full_like(values, np.nan)
+    origin = np.zeros(values.shape[1], dtype=np.float64)
+    has_origin = np.zeros(values.shape[1], dtype=bool)
+    running_sum = np.zeros(values.shape[1], dtype=np.float64)
+    running_square_sum = np.zeros(values.shape[1], dtype=np.float64)
+    missing_count = np.zeros(values.shape[1], dtype=np.int32)
+    centered = np.zeros(values.shape[1], dtype=np.float64)
+    for date_index in range(values.shape[0]):
+        current = values[date_index]
+        current_valid = np.isfinite(current)
+        new_origin = current_valid & ~has_origin
+        origin[new_origin] = current[new_origin]
+        has_origin |= current_valid
+        centered.fill(0.0)
+        np.subtract(current, origin, out=centered, where=current_valid)
+        np.add(running_sum, centered, out=running_sum)
+        np.add(running_square_sum, centered * centered, out=running_square_sum)
+        missing_count += ~current_valid
+        if date_index >= window:
+            expired = values[date_index - window]
+            expired_valid = np.isfinite(expired)
+            centered.fill(0.0)
+            np.subtract(expired, origin, out=centered, where=expired_valid)
+            np.subtract(running_sum, centered, out=running_sum)
+            np.subtract(
+                running_square_sum,
+                centered * centered,
+                out=running_square_sum,
+            )
+            missing_count -= ~expired_valid
+        if date_index < window - 1:
+            continue
+        complete = missing_count == 0
+        if mode == "mean":
+            result[date_index, complete] = (
+                origin[complete] + running_sum[complete] / window
+            )
+            continue
+        variance = (
+            running_square_sum[complete]
+            - running_sum[complete] * running_sum[complete] / window
+        ) / window
+        variance = np.maximum(variance, 0.0)
+        standard_deviation = np.sqrt(variance)
+        if mode == "std":
+            result[date_index, complete] = standard_deviation
+        elif mode == "zscore":
+            eligible = standard_deviation > EPSILON
+            complete_indices = np.flatnonzero(complete)
+            selected = complete_indices[eligible]
+            result[date_index, selected] = (
+                values[date_index, selected]
+                - origin[selected]
+                - running_sum[selected] / window
+            ) / standard_deviation[eligible]
+        else:
+            raise ValueError(f"未知滑动矩模式：{mode}")
+    return result
+
+
+def _rolling_weighted_statistic(
+    values: FloatMatrix,
+    window: int,
+    mode: str,
+) -> FloatMatrix:
+    """用滑动和及线性加权和计算 WMA、趋势斜率和当前残差。"""
+
+    result = np.full_like(values, np.nan)
+    origin = np.zeros(values.shape[1], dtype=np.float64)
+    has_origin = np.zeros(values.shape[1], dtype=bool)
+    running_sum = np.zeros(values.shape[1], dtype=np.float64)
+    weighted_sum = np.zeros(values.shape[1], dtype=np.float64)
+    missing_count = np.zeros(values.shape[1], dtype=np.int32)
+    centered = np.zeros(values.shape[1], dtype=np.float64)
+    denominator = window * (window**2 - 1) / 12.0
+    mean_time = (window - 1) / 2.0
+    weight_total = window * (window + 1) / 2.0
+    for date_index in range(values.shape[0]):
+        current = values[date_index]
+        current_valid = np.isfinite(current)
+        new_origin = current_valid & ~has_origin
+        origin[new_origin] = current[new_origin]
+        has_origin |= current_valid
+        centered.fill(0.0)
+        np.subtract(current, origin, out=centered, where=current_valid)
+        if date_index < window:
+            running_sum += centered
+            weighted_sum += (date_index + 1) * centered
+            missing_count += ~current_valid
+        else:
+            previous_sum = running_sum.copy()
+            expired = values[date_index - window]
+            expired_valid = np.isfinite(expired)
+            expired_centered = np.zeros_like(centered)
+            np.subtract(expired, origin, out=expired_centered, where=expired_valid)
+            running_sum += centered - expired_centered
+            weighted_sum += window * centered - previous_sum
+            missing_count += (~current_valid).astype(np.int32)
+            missing_count -= (~expired_valid).astype(np.int32)
+        if date_index < window - 1:
+            continue
+        complete = missing_count == 0
+        if mode == "wma":
+            result[date_index, complete] = (
+                origin[complete]
+                + weighted_sum[complete] / weight_total
+            )
+            continue
+        zero_based_weighted = weighted_sum[complete] - running_sum[complete]
+        slope = (
+            zero_based_weighted - mean_time * running_sum[complete]
+        ) / denominator
+        if mode == "slope":
+            result[date_index, complete] = slope
+        elif mode == "residual":
+            complete_indices = np.flatnonzero(complete)
+            mean = origin[complete] + running_sum[complete] / window
+            result[date_index, complete] = (
+                values[date_index, complete_indices]
+                - mean
+                - slope * (window - 1 - mean_time)
+            )
+        else:
+            raise ValueError(f"未知线性滑动统计模式：{mode}")
+    return result
+
+
+def _rolling_binary_moment(
+    left: FloatMatrix,
+    right: FloatMatrix,
+    window: int,
+    mode: str,
+) -> FloatMatrix:
+    """用平移后的滑动联合矩计算 cov/corr/beta/orth。"""
+
+    result = np.full_like(left, np.nan)
+    left_origin = np.zeros(left.shape[1], dtype=np.float64)
+    right_origin = np.zeros(right.shape[1], dtype=np.float64)
+    has_left_origin = np.zeros(left.shape[1], dtype=bool)
+    has_right_origin = np.zeros(right.shape[1], dtype=bool)
+    sum_left = np.zeros(left.shape[1], dtype=np.float64)
+    sum_right = np.zeros(left.shape[1], dtype=np.float64)
+    sum_left_square = np.zeros(left.shape[1], dtype=np.float64)
+    sum_right_square = np.zeros(left.shape[1], dtype=np.float64)
+    sum_product = np.zeros(left.shape[1], dtype=np.float64)
+    missing_count = np.zeros(left.shape[1], dtype=np.int32)
+    left_centered = np.zeros(left.shape[1], dtype=np.float64)
+    right_centered = np.zeros(left.shape[1], dtype=np.float64)
+
+    def update(date_index: int, sign_: float) -> NDArray[np.bool_]:
+        left_row = left[date_index]
+        right_row = right[date_index]
+        left_valid = np.isfinite(left_row)
+        right_valid = np.isfinite(right_row)
+        left_new_origin = left_valid & ~has_left_origin
+        right_new_origin = right_valid & ~has_right_origin
+        left_origin[left_new_origin] = left_row[left_new_origin]
+        right_origin[right_new_origin] = right_row[right_new_origin]
+        has_left_origin[:] |= left_valid
+        has_right_origin[:] |= right_valid
+        joint_valid = left_valid & right_valid
+        left_centered.fill(0.0)
+        right_centered.fill(0.0)
+        np.subtract(left_row, left_origin, out=left_centered, where=joint_valid)
+        np.subtract(right_row, right_origin, out=right_centered, where=joint_valid)
+        sum_left[:] += sign_ * left_centered
+        sum_right[:] += sign_ * right_centered
+        sum_left_square[:] += sign_ * left_centered * left_centered
+        sum_right_square[:] += sign_ * right_centered * right_centered
+        sum_product[:] += sign_ * left_centered * right_centered
+        return joint_valid
+
+    for date_index in range(left.shape[0]):
+        current_valid = update(date_index, 1.0)
+        missing_count += ~current_valid
+        if date_index >= window:
+            expired_valid = update(date_index - window, -1.0)
+            missing_count -= ~expired_valid
+        if date_index < window - 1:
+            continue
+        complete = missing_count == 0
+        complete_indices = np.flatnonzero(complete)
+        covariance = (
+            sum_product[complete]
+            - sum_left[complete] * sum_right[complete] / window
+        ) / window
+        if mode == "cov":
+            result[date_index, complete] = covariance
+            continue
+        left_variance = (
+            sum_left_square[complete]
+            - sum_left[complete] * sum_left[complete] / window
+        ) / window
+        right_variance = (
+            sum_right_square[complete]
+            - sum_right[complete] * sum_right[complete] / window
+        ) / window
+        left_variance = np.maximum(left_variance, 0.0)
+        right_variance = np.maximum(right_variance, 0.0)
+        if mode == "corr":
+            eligible = (np.sqrt(left_variance) > EPSILON) & (
+                np.sqrt(right_variance) > EPSILON
+            )
+            selected = complete_indices[eligible]
+            result[date_index, selected] = covariance[eligible] / np.sqrt(
+                left_variance[eligible] * right_variance[eligible]
+            )
+            continue
+        eligible = right_variance > EPSILON
+        selected = complete_indices[eligible]
+        beta = covariance[eligible] / right_variance[eligible]
+        if mode == "beta":
+            result[date_index, selected] = beta
+        elif mode == "orth":
+            left_mean = left_origin[selected] + sum_left[selected] / window
+            right_mean = right_origin[selected] + sum_right[selected] / window
+            result[date_index, selected] = (
+                left[date_index, selected]
+                - left_mean
+                - beta * (right[date_index, selected] - right_mean)
+            )
+        else:
+            raise ValueError(f"未知二元滑动矩模式：{mode}")
+    return result
+
+
 def ts_mean(x: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_unary(x, window, lambda sample: np.mean(sample, axis=0))
+    values = _matrix(x)
+    return rolling_unary_moment_kernel(values, _window(window), UNARY_MEAN, EPSILON)
 
 
 def ts_std(x: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_unary(x, window, lambda sample: np.std(sample, axis=0, ddof=0))
+    values = _matrix(x)
+    return rolling_unary_moment_kernel(values, _window(window), UNARY_STD, EPSILON)
 
 
 def ts_max(x: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_unary(x, window, lambda sample: np.max(sample, axis=0))
+    values = _matrix(x)
+    return rolling_window_kernel(values, _window(window), ROLLING_MAX, EPSILON)
 
 
 def ts_min(x: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_unary(x, window, lambda sample: np.min(sample, axis=0))
+    values = _matrix(x)
+    return rolling_window_kernel(values, _window(window), ROLLING_MIN, EPSILON)
 
 
 def ts_rank(x: ArrayLike, window: int) -> FloatMatrix:
-    def transform(sample: FloatMatrix) -> FloatMatrix:
-        output = np.empty(sample.shape[1], dtype=np.float64)
-        for stock_index in range(sample.shape[1]):
-            ranks = _average_zero_based_rank(sample[:, stock_index])
-            output[stock_index] = (ranks[-1] + 0.5) / sample.shape[0]
-        return output
-
-    return _rolling_unary(x, window, transform)
+    values = _matrix(x)
+    return rolling_window_kernel(values, _window(window), ROLLING_RANK, EPSILON)
 
 
 def ts_delay(x: ArrayLike, window: int) -> FloatMatrix:
@@ -425,56 +704,28 @@ def ts_delta(x: ArrayLike, window: int) -> FloatMatrix:
 
 
 def ts_sum(x: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_unary(x, window, lambda sample: np.sum(sample, axis=0))
+    values = _matrix(x)
+    return rolling_sum_kernel(values, _window(window))
 
 
 def ts_argmax(x: ArrayLike, window: int) -> FloatMatrix:
-    def transform(sample: FloatMatrix) -> FloatMatrix:
-        maximum = np.max(sample, axis=0)
-        # 翻转后首次出现的位置对应原窗口中最近一次极值。
-        return sample.shape[0] - 1 - np.argmax(sample[::-1] == maximum, axis=0)
-
-    return _rolling_unary(x, window, transform)
+    values = _matrix(x)
+    return rolling_window_kernel(values, _window(window), ROLLING_ARGMAX, EPSILON)
 
 
 def ts_argmin(x: ArrayLike, window: int) -> FloatMatrix:
-    def transform(sample: FloatMatrix) -> FloatMatrix:
-        minimum = np.min(sample, axis=0)
-        return sample.shape[0] - 1 - np.argmax(sample[::-1] == minimum, axis=0)
-
-    return _rolling_unary(x, window, transform)
+    values = _matrix(x)
+    return rolling_window_kernel(values, _window(window), ROLLING_ARGMIN, EPSILON)
 
 
 def ts_wma(x: ArrayLike, window: int) -> FloatMatrix:
-    window = _window(window)
-    weights = np.arange(1, window + 1, dtype=np.float64)
-    weights /= np.sum(weights)
-    return _rolling_unary(x, window, lambda sample: weights @ sample)
+    values = _matrix(x)
+    return rolling_weighted_kernel(values, _window(window), WEIGHTED_WMA)
 
 
 def ts_ema(x: ArrayLike, window: int) -> FloatMatrix:
     values = _matrix(x)
-    window = _window(window)
-    result = np.full_like(values, np.nan)
-    alpha = 2.0 / (window + 1.0)
-
-    for stock_index in range(values.shape[1]):
-        ema = np.nan
-        consecutive_valid = 0
-        for date_index in range(values.shape[0]):
-            value = values[date_index, stock_index]
-            if not np.isfinite(value):
-                ema = np.nan
-                consecutive_valid = 0
-                continue
-            if consecutive_valid == 0:
-                ema = value
-            else:
-                ema = alpha * value + (1.0 - alpha) * ema
-            consecutive_valid += 1
-            if consecutive_valid >= window:
-                result[date_index, stock_index] = ema
-    return result
+    return ema_kernel(values, _window(window))
 
 
 def _time_regression(sample: FloatMatrix) -> tuple[FloatMatrix, FloatMatrix]:
@@ -488,69 +739,42 @@ def _time_regression(sample: FloatMatrix) -> tuple[FloatMatrix, FloatMatrix]:
 
 
 def ts_slope(x: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_unary(x, window, lambda sample: _time_regression(sample)[1])
+    values = _matrix(x)
+    return rolling_weighted_kernel(values, _window(window), WEIGHTED_SLOPE)
 
 
 def ts_residual(x: ArrayLike, window: int) -> FloatMatrix:
-    def transform(sample: FloatMatrix) -> FloatMatrix:
-        intercept, slope = _time_regression(sample)
-        fitted_current = intercept + slope * (sample.shape[0] - 1)
-        return sample[-1] - fitted_current
-
-    return _rolling_unary(x, window, transform)
+    values = _matrix(x)
+    return rolling_weighted_kernel(values, _window(window), WEIGHTED_RESIDUAL)
 
 
 def ts_zscore(x: ArrayLike, window: int) -> FloatMatrix:
-    def transform(sample: FloatMatrix) -> FloatMatrix:
-        mean = np.mean(sample, axis=0)
-        standard_deviation = np.std(sample, axis=0, ddof=0)
-        output = np.full(sample.shape[1], np.nan, dtype=np.float64)
-        valid = standard_deviation > EPSILON
-        output[valid] = (sample[-1, valid] - mean[valid]) / standard_deviation[valid]
-        return output
-
-    return _rolling_unary(x, window, transform)
+    values = _matrix(x)
+    return rolling_unary_moment_kernel(values, _window(window), UNARY_ZSCORE, EPSILON)
 
 
 def ts_position(x: ArrayLike, window: int) -> FloatMatrix:
-    def transform(sample: FloatMatrix) -> FloatMatrix:
-        minimum = np.min(sample, axis=0)
-        value_range = np.max(sample, axis=0) - minimum
-        return (sample[-1] - minimum) / (value_range + EPSILON)
-
-    return _rolling_unary(x, window, transform)
+    values = _matrix(x)
+    return rolling_window_kernel(values, _window(window), ROLLING_POSITION, EPSILON)
 
 
 def ts_range(x: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_unary(
-        x,
-        window,
-        lambda sample: np.max(sample, axis=0) - np.min(sample, axis=0),
-    )
+    values = _matrix(x)
+    return rolling_window_kernel(values, _window(window), ROLLING_RANGE, EPSILON)
 
 
 def ts_corr(x: ArrayLike, y: ArrayLike, window: int) -> FloatMatrix:
-    def transform(left: FloatMatrix, right: FloatMatrix) -> FloatMatrix:
-        left_centered = left - np.mean(left, axis=0)
-        right_centered = right - np.mean(right, axis=0)
-        left_scale = np.sqrt(np.mean(left_centered**2, axis=0))
-        right_scale = np.sqrt(np.mean(right_centered**2, axis=0))
-        output = np.full(left.shape[1], np.nan, dtype=np.float64)
-        valid = (left_scale > EPSILON) & (right_scale > EPSILON)
-        covariance = np.mean(left_centered * right_centered, axis=0)
-        output[valid] = covariance[valid] / (left_scale[valid] * right_scale[valid])
-        return output
-
-    return _rolling_binary(x, y, window, transform)
+    left, right = _binary_matrices(x, y)
+    return rolling_binary_moment_kernel(
+        left, right, _window(window), BINARY_CORR, EPSILON
+    )
 
 
 def ts_cov(x: ArrayLike, y: ArrayLike, window: int) -> FloatMatrix:
-    def transform(left: FloatMatrix, right: FloatMatrix) -> FloatMatrix:
-        left_centered = left - np.mean(left, axis=0)
-        right_centered = right - np.mean(right, axis=0)
-        return np.mean(left_centered * right_centered, axis=0)
-
-    return _rolling_binary(x, y, window, transform)
+    left, right = _binary_matrices(x, y)
+    return rolling_binary_moment_kernel(
+        left, right, _window(window), BINARY_COV, EPSILON
+    )
 
 
 def _cross_regression(
@@ -571,15 +795,17 @@ def _cross_regression(
 
 
 def ts_beta(x: ArrayLike, y: ArrayLike, window: int) -> FloatMatrix:
-    return _rolling_binary(x, y, window, lambda left, right: _cross_regression(left, right)[1])
+    left, right = _binary_matrices(x, y)
+    return rolling_binary_moment_kernel(
+        left, right, _window(window), BINARY_BETA, EPSILON
+    )
 
 
 def ts_orth(x: ArrayLike, y: ArrayLike, window: int) -> FloatMatrix:
-    def transform(left: FloatMatrix, right: FloatMatrix) -> FloatMatrix:
-        intercept, beta = _cross_regression(left, right)
-        return left[-1] - intercept - beta * right[-1]
-
-    return _rolling_binary(x, y, window, transform)
+    left, right = _binary_matrices(x, y)
+    return rolling_binary_moment_kernel(
+        left, right, _window(window), BINARY_ORTH, EPSILON
+    )
 
 
 NON_TS_OPERATOR_FUNCTIONS = MappingProxyType(

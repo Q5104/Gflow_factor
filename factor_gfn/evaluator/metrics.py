@@ -23,6 +23,10 @@ from .cross_section import (
     clean_candidate_factor_cross_sections,
     clean_factor_cross_sections,
 )
+from .numba_kernels import (
+    cleaned_portfolio_series_kernel,
+    rank_ic_values_kernel,
+)
 
 
 FloatMatrix = npt.NDArray[np.float64]
@@ -547,6 +551,150 @@ def long_short_portfolio_series(
     )
 
 
+def rank_ic_values_from_cleaned(
+    cleaned_factor: npt.ArrayLike,
+    forward_returns: npt.ArrayLike,
+    min_count: int = DEFAULT_CONFIG.min_cross_section_count,
+) -> FloatVector:
+    """计算已清洗紧凑面板的逐截面 RankIC，不再次执行截面清洗。"""
+
+    if min_count < 2:
+        raise ValueError("min_count 至少为 2")
+    factor_matrix = np.asarray(cleaned_factor, dtype=np.float64)
+    return_matrix = np.asarray(forward_returns, dtype=np.float64)
+    if factor_matrix.ndim != 2 or 0 in factor_matrix.shape:
+        raise ValueError("cleaned_factor 必须是非空 (date, stock) 矩阵")
+    if return_matrix.shape != factor_matrix.shape:
+        raise ValueError("forward_returns 必须与 cleaned_factor 同形")
+
+    return rank_ic_values_kernel(factor_matrix, return_matrix, min_count)
+
+
+def cleaned_portfolio_returns_from_cleaned(
+    cleaned_factor: npt.ArrayLike,
+    forward_returns: npt.ArrayLike,
+    direction: int,
+    config: EvaluationConfig = DEFAULT_CONFIG,
+) -> tuple[FloatVector, FloatVector]:
+    """Return directed long excess and raw-direction LS from one stable sort."""
+
+    if direction not in (-1, 1):
+        raise ValueError("direction 只能为 -1 或 1")
+    factor_matrix = np.asarray(cleaned_factor, dtype=np.float64)
+    return_matrix = np.asarray(forward_returns, dtype=np.float64)
+    if factor_matrix.ndim != 2 or 0 in factor_matrix.shape:
+        raise ValueError("cleaned_factor 必须是非空 (date, stock) 矩阵")
+    if return_matrix.shape != factor_matrix.shape:
+        raise ValueError("forward_returns 必须与 cleaned_factor 同形")
+    return cleaned_portfolio_series_kernel(
+        factor_matrix,
+        return_matrix,
+        direction,
+        config.min_cross_section_count,
+        config.long_quantile,
+        np.finfo(np.float64).eps,
+    )
+
+
+def long_portfolio_series_from_cleaned(
+    cleaned_factor: npt.ArrayLike,
+    forward_returns: npt.ArrayLike,
+    direction: int,
+    config: EvaluationConfig = DEFAULT_CONFIG,
+) -> LongPortfolioSeries:
+    """构造已清洗紧凑面板的多头序列，不再次执行截面清洗。"""
+
+    if direction not in (-1, 1):
+        raise ValueError("direction 只能为 -1 或 1")
+    factor_matrix = np.asarray(cleaned_factor, dtype=np.float64)
+    return_matrix = np.asarray(forward_returns, dtype=np.float64)
+    if factor_matrix.ndim != 2 or 0 in factor_matrix.shape:
+        raise ValueError("cleaned_factor 必须是非空 (date, stock) 矩阵")
+    if return_matrix.shape != factor_matrix.shape:
+        raise ValueError("forward_returns 必须与 cleaned_factor 同形")
+
+    date_count = factor_matrix.shape[0]
+    long_return = np.full(date_count, np.nan)
+    benchmark_return = np.full(date_count, np.nan)
+    excess_return = np.full(date_count, np.nan)
+    universe_count = np.zeros(date_count, dtype=np.int64)
+    long_count = np.zeros(date_count, dtype=np.int64)
+    for date_index in range(date_count):
+        valid = np.isfinite(factor_matrix[date_index]) & np.isfinite(
+            return_matrix[date_index]
+        )
+        count = int(valid.sum())
+        universe_count[date_index] = count
+        if count < config.min_cross_section_count:
+            continue
+        scores = direction * factor_matrix[date_index, valid]
+        if np.ptp(scores) <= np.finfo(np.float64).eps:
+            continue
+        returns = return_matrix[date_index, valid]
+        selected_count = max(1, ceil(count * config.long_quantile))
+        selected = np.argsort(scores, kind="stable")[-selected_count:]
+        long_count[date_index] = selected_count
+        long_return[date_index] = float(returns[selected].mean())
+        benchmark_return[date_index] = float(returns.mean())
+        excess_return[date_index] = long_return[date_index] - benchmark_return[date_index]
+    return LongPortfolioSeries(
+        long_return=long_return,
+        benchmark_return=benchmark_return,
+        excess_return=excess_return,
+        universe_count=universe_count,
+        long_count=long_count,
+    )
+
+
+def long_short_portfolio_series_from_cleaned(
+    cleaned_factor: npt.ArrayLike,
+    forward_returns: npt.ArrayLike,
+    config: EvaluationConfig = DEFAULT_CONFIG,
+) -> LongShortPortfolioSeries:
+    """构造已清洗紧凑面板的原始方向多空序列，不再次执行截面清洗。"""
+
+    factor_matrix = np.asarray(cleaned_factor, dtype=np.float64)
+    return_matrix = np.asarray(forward_returns, dtype=np.float64)
+    if factor_matrix.ndim != 2 or 0 in factor_matrix.shape:
+        raise ValueError("cleaned_factor 必须是非空 (date, stock) 矩阵")
+    if return_matrix.shape != factor_matrix.shape:
+        raise ValueError("forward_returns 必须与 cleaned_factor 同形")
+
+    date_count = factor_matrix.shape[0]
+    long_return = np.full(date_count, np.nan)
+    short_return = np.full(date_count, np.nan)
+    long_short_return = np.full(date_count, np.nan)
+    universe_count = np.zeros(date_count, dtype=np.int64)
+    leg_count = np.zeros(date_count, dtype=np.int64)
+    for date_index in range(date_count):
+        valid = np.isfinite(factor_matrix[date_index]) & np.isfinite(
+            return_matrix[date_index]
+        )
+        count = int(valid.sum())
+        universe_count[date_index] = count
+        if count < config.min_cross_section_count:
+            continue
+        scores = factor_matrix[date_index, valid]
+        if np.ptp(scores) <= np.finfo(np.float64).eps:
+            continue
+        returns = return_matrix[date_index, valid]
+        selected_count = min(max(1, ceil(count * config.long_quantile)), count // 2)
+        order = np.argsort(scores, kind="stable")
+        bottom = order[:selected_count]
+        top = order[-selected_count:]
+        leg_count[date_index] = selected_count
+        long_return[date_index] = float(returns[top].mean())
+        short_return[date_index] = float(returns[bottom].mean())
+        long_short_return[date_index] = long_return[date_index] - short_return[date_index]
+    return LongShortPortfolioSeries(
+        long_return=long_return,
+        short_return=short_return,
+        long_short_return=long_short_return,
+        universe_count=universe_count,
+        leg_count=leg_count,
+    )
+
+
 def summarize_excess_returns(
     excess_returns: npt.ArrayLike,
     config: EvaluationConfig = DEFAULT_CONFIG,
@@ -672,13 +820,17 @@ __all__ = [
     "LongShortPortfolioSeries",
     "PerformanceSummary",
     "build_forward_returns",
+    "cleaned_portfolio_returns_from_cleaned",
     "evaluate_rank_ic",
     "excess_return_correlation",
     "factor_cross_sectional_correlation",
     "infer_long_direction",
     "long_portfolio_series",
+    "long_portfolio_series_from_cleaned",
     "long_short_portfolio_series",
+    "long_short_portfolio_series_from_cleaned",
     "rank_ic_series",
+    "rank_ic_values_from_cleaned",
     "select_rebalance_indices",
     "summarize_correlation",
     "summarize_excess_returns",

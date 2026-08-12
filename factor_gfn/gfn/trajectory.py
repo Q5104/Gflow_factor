@@ -13,6 +13,7 @@ import torch
 from torch import Tensor
 
 from factor_gfn.grammar import (
+    CATEGORY_TO_INDEX,
     DAGAction,
     Expression,
     GrammarState,
@@ -61,8 +62,21 @@ class TrajectoryStep:
     log_pb: float
     policy_entropy: float | None = None
     normalized_policy_entropy: float | None = None
+    selected_token_group: int | None = None
+    group_probabilities: tuple[float, float, float] | None = None
+    group_entropy: float | None = None
+    normalized_group_entropy: float | None = None
+    selected_grammar_category: int | None = None
+    grammar_category_probabilities: tuple[float, ...] | None = None
+    grammar_category_entropy: float | None = None
+    normalized_grammar_category_entropy: float | None = None
+    operator_entropy: float | None = None
+    normalized_operator_entropy: float | None = None
+    window_probabilities: tuple[float, ...] | None = None
+    window_entropy: float | None = None
+    normalized_window_entropy: float | None = None
 
-    def validate(self) -> None:
+    def validate(self, *, check_tensor_values: bool = True) -> None:
         _validate_hash(self.state_hash, "state_hash")
         _validate_hash(self.child_state_hash, "child_state_hash")
         if (
@@ -96,9 +110,11 @@ class TrajectoryStep:
         ):
             if not isinstance(value, Tensor) or value.ndim:
                 raise ValueError(f"{name} 必须是标量 Tensor")
-            if not torch.is_floating_point(value) or not bool(torch.isfinite(value)):
+            if not torch.is_floating_point(value):
+                raise ValueError(f"{name} 必须是浮点标量 Tensor")
+            if check_tensor_values and not bool(torch.isfinite(value)):
                 raise ValueError(f"{name} 必须是有限浮点标量 Tensor")
-            if float(value.detach()) > 1e-6:
+            if check_tensor_values and float(value.detach()) > 1e-6:
                 raise ValueError(f"{name} 作为 log 概率不能大于 0")
         if not isinstance(self.log_pb, Real) or isinstance(self.log_pb, bool):
             raise ValueError("log_pb 必须是实数")
@@ -120,6 +136,135 @@ class TrajectoryStep:
                 or not -1e-10 <= float(self.normalized_policy_entropy) <= 1.0 + 1e-10
             ):
                 raise ValueError("normalized_policy_entropy 必须位于 [0, 1] 或为 None")
+        group_fields = (
+            self.selected_token_group,
+            self.group_probabilities,
+            self.group_entropy,
+            self.normalized_group_entropy,
+        )
+        if any(value is not None for value in group_fields):
+            if any(value is None for value in group_fields):
+                raise ValueError("分组策略轨迹字段必须同时存在或同时为空")
+            if self.selected_token_group not in (0, 1, 2):
+                raise ValueError("selected_token_group 必须属于 {0, 1, 2}")
+            if (
+                not isinstance(self.group_probabilities, tuple)
+                or len(self.group_probabilities) != 3
+                or any(
+                    not isinstance(value, Real)
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    or not 0.0 <= float(value) <= 1.0
+                    for value in self.group_probabilities
+                )
+                or not math.isclose(
+                    math.fsum(float(value) for value in self.group_probabilities),
+                    1.0,
+                    rel_tol=1e-6,
+                    abs_tol=1e-6,
+                )
+            ):
+                raise ValueError("group_probabilities 必须是和为1的三元概率")
+            if self.selected_token_group != get_action(int(self.selected_token_id)).arity:
+                raise ValueError("selected_token_group 与 Token 元数不一致")
+            if (
+                not isinstance(self.group_entropy, Real)
+                or isinstance(self.group_entropy, bool)
+                or not math.isfinite(float(self.group_entropy))
+                or float(self.group_entropy) < -1e-10
+            ):
+                raise ValueError("group_entropy 必须是有限非负实数")
+            if (
+                not isinstance(self.normalized_group_entropy, Real)
+                or isinstance(self.normalized_group_entropy, bool)
+                or not math.isfinite(float(self.normalized_group_entropy))
+                or not -1e-10 <= float(self.normalized_group_entropy) <= 1.0 + 1e-10
+            ):
+                raise ValueError("normalized_group_entropy 必须位于 [0, 1]")
+        grammar_fields = (
+            self.selected_grammar_category,
+            self.grammar_category_probabilities,
+            self.grammar_category_entropy,
+            self.normalized_grammar_category_entropy,
+            self.operator_entropy,
+            self.normalized_operator_entropy,
+        )
+        if any(value is not None for value in grammar_fields):
+            if any(value is None for value in grammar_fields):
+                raise ValueError("完整文法策略轨迹字段必须同时存在或同时为空")
+            action = get_action(int(self.selected_token_id))
+            if self.selected_grammar_category != CATEGORY_TO_INDEX[action.category]:
+                raise ValueError("selected_grammar_category 与 Token 类别不一致")
+            if (
+                not isinstance(self.grammar_category_probabilities, tuple)
+                or len(self.grammar_category_probabilities) != 6
+                or any(
+                    not isinstance(value, Real)
+                    or isinstance(value, bool)
+                    or not math.isfinite(float(value))
+                    or not 0.0 <= float(value) <= 1.0
+                    for value in self.grammar_category_probabilities
+                )
+                or not math.isclose(
+                    math.fsum(float(value) for value in self.grammar_category_probabilities),
+                    1.0,
+                    rel_tol=1e-6,
+                    abs_tol=1e-6,
+                )
+            ):
+                raise ValueError("grammar_category_probabilities 必须是和为1的六元概率")
+            for name, value in (
+                ("grammar_category_entropy", self.grammar_category_entropy),
+                ("operator_entropy", self.operator_entropy),
+            ):
+                if not isinstance(value, Real) or not math.isfinite(float(value)) or value < -1e-10:
+                    raise ValueError(f"{name} 必须是有限非负实数")
+            for name, value in (
+                ("normalized_grammar_category_entropy", self.normalized_grammar_category_entropy),
+                ("normalized_operator_entropy", self.normalized_operator_entropy),
+            ):
+                if not isinstance(value, Real) or not -1e-10 <= float(value) <= 1.0 + 1e-10:
+                    raise ValueError(f"{name} 必须位于 [0, 1]")
+            expects_window = action.window != 0
+            window_fields = (
+                self.window_probabilities,
+                self.window_entropy,
+                self.normalized_window_entropy,
+            )
+            if expects_window != all(value is not None for value in window_fields):
+                raise ValueError("Window 诊断必须且只能出现在时序算子动作上")
+            if expects_window:
+                if (
+                    not isinstance(self.window_probabilities, tuple)
+                    or len(self.window_probabilities) != 5
+                    or any(
+                        not isinstance(value, Real)
+                        or isinstance(value, bool)
+                        or not math.isfinite(float(value))
+                        or not 0.0 <= float(value) <= 1.0
+                        for value in self.window_probabilities
+                    )
+                    or not math.isclose(
+                        math.fsum(float(value) for value in self.window_probabilities),
+                        1.0,
+                        rel_tol=1e-6,
+                        abs_tol=1e-6,
+                    )
+                ):
+                    raise ValueError("window_probabilities 必须是和为1的五元概率")
+                if not isinstance(self.window_entropy, Real) or not math.isfinite(float(self.window_entropy)) or self.window_entropy < -1e-10:
+                    raise ValueError("window_entropy 必须是有限非负实数")
+                if not isinstance(self.normalized_window_entropy, Real) or not -1e-10 <= float(self.normalized_window_entropy) <= 1.0 + 1e-10:
+                    raise ValueError("normalized_window_entropy 必须位于 [0, 1]")
+        elif any(
+            value is not None
+            for value in (
+                self.window_probabilities,
+                self.window_entropy,
+                self.normalized_window_entropy,
+            )
+        ):
+            raise ValueError("Window 诊断不能脱离完整文法策略字段存在")
         if (
             self.log_p_slot.device != self.log_p_token.device
             or self.log_p_slot.device != self.log_pf.device
@@ -203,13 +348,13 @@ class Trajectory:
     def sum_log_pb(self) -> float:
         return math.fsum(step.log_pb for step in self.steps)
 
-    def validate(self) -> None:
+    def validate(self, *, check_tensor_values: bool = True) -> None:
         if not self.steps:
             raise ValueError("轨迹至少需要一个步骤")
         if self.sampling_mode not in ("stochastic", "greedy"):
             raise ValueError("sampling_mode 必须是 stochastic 或 greedy")
         for step in self.steps:
-            step.validate()
+            step.validate(check_tensor_values=check_tensor_values)
         for current, following in zip(self.steps, self.steps[1:]):
             if current.child_state_hash != following.state_hash:
                 raise ValueError("相邻轨迹步骤的状态哈希不连续")
