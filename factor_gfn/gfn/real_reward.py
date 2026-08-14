@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import warnings
 from collections import OrderedDict
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -13,7 +14,11 @@ from typing import Any, Mapping
 
 import numpy as np
 
-from factor_gfn.evaluator import FactorInterpreter, SUBEXPRESSION_CACHE_SCHEMA
+from factor_gfn.evaluator import (
+    FactorInterpreter,
+    IndustryNeutralizationWarning,
+    SUBEXPRESSION_CACHE_SCHEMA,
+)
 from factor_gfn.evaluator.numba_kernels import NUMBA_KERNEL_SCHEMA, warm_numba_kernels
 from factor_gfn.grammar import Expression
 
@@ -23,7 +28,7 @@ from .reward import RewardCache, RewardEvaluator, RewardResult
 from .trainer import RewardAssignment, RewardProvider
 
 
-REAL_REWARD_PROVIDER_SCHEMA = "factor_gfn.real_reward_provider.v7"
+REAL_REWARD_PROVIDER_SCHEMA = "factor_gfn.real_reward_provider.v8"
 # The first real 50-step profile produced only 3 hits for 6,425 lookups while
 # evicting 6,417 full-history matrices.  Keep the optional implementation for
 # targeted workloads, but do not pay its hashing and memory-churn cost in the
@@ -134,6 +139,8 @@ class RealRewardProvider(RewardProvider):
         ).hexdigest()
         self._manifest: dict[str, Any] = {
             "schema": REAL_REWARD_PROVIDER_SCHEMA,
+            "data_scope": "training_only",
+            "validation_oos_loaded": False,
             "context_fingerprint": context.fingerprint,
             "reward_evaluator_context_fingerprint": self._evaluator.context_fingerprint,
             "evaluation_config": asdict(context.config.evaluation),
@@ -302,7 +309,12 @@ class RealRewardProvider(RewardProvider):
         )
 
         reward_started = perf_counter()
-        evaluation = self._evaluator.evaluate(expression_hash, factor)
+        # Per-date insufficient samples are an expected, fully audited
+        # candidate-level exclusion.  Keep details in RewardResult metadata but
+        # do not flood real-search/diagnostic notebook output.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", IndustryNeutralizationWarning)
+            evaluation = self._evaluator.evaluate(expression_hash, factor)
         reward_seconds = perf_counter() - reward_started
         result = evaluation.result
 

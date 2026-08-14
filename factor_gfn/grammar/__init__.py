@@ -15,6 +15,14 @@ from .config import (
     SEARCH_SPACE_CONFIG_SCHEMA,
     SearchSpaceConfig,
 )
+from .exact_node import (
+    ConditionedStateKey,
+    ExactNodeGrammarState,
+    ExactNodeParentTransition,
+    ExactNodeReachability,
+    ExactNodeStrata,
+    resolve_exact_node_strata,
+)
 from .grammar_state import (
     STATE_SPACE_SCHEMA,
     TRANSITION_SPACE_SCHEMA,
@@ -76,6 +84,7 @@ __all__ = [
     "BINARY_OPERATORS",
     "CATEGORY_TO_INDEX",
     "CROSS_SECTIONAL_OPERATORS",
+    "ConditionedStateKey",
     "DEFAULT_MAX_DEPTH",
     "DEFAULT_MAX_NODES",
     "DEFAULT_SEARCH_SPACE",
@@ -84,6 +93,10 @@ __all__ = [
     "ExpressionNode",
     "ExpressionParseError",
     "ExpressionStats",
+    "ExactNodeGrammarState",
+    "ExactNodeParentTransition",
+    "ExactNodeReachability",
+    "ExactNodeStrata",
     "GrammarSnapshot",
     "GrammarState",
     "HASH_SCHEMA",
@@ -119,6 +132,7 @@ __all__ = [
     "get_operator",
     "get_token_indices",
     "partial_ast_canonical_json",
+    "resolve_exact_node_strata",
     "state_space_fingerprint",
     "state_space_manifest",
     "transition_space_fingerprint",

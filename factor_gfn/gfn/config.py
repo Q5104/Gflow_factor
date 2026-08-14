@@ -12,13 +12,14 @@ from typing import Any, Literal
 from factor_gfn.grammar import (
     SearchSpaceConfig,
     action_space_fingerprint,
+    resolve_exact_node_strata,
     state_space_fingerprint,
     transition_space_fingerprint,
 )
 
 
-CONFIG_SCHEMA = "factor_gfn.gfn_config.v5"
-STATE_ADAPTER_SCHEMA = "factor_gfn.state_adapter.v1"
+CONFIG_SCHEMA = "factor_gfn.gfn_config.v10"
+STATE_ADAPTER_SCHEMA = "factor_gfn.state_adapter.v2"
 TokenPolicyMode = Literal["flat", "arity_hierarchical", "grammar_hierarchical"]
 TOKEN_POLICY_MODES = ("flat", "arity_hierarchical", "grammar_hierarchical")
 LEGACY_TOKEN_POLICY_MODES = ("flat", "arity_hierarchical")
@@ -37,7 +38,16 @@ def state_adapter_manifest() -> dict[str, Any]:
             "operator_count/max_nodes",
             "node_count/max_nodes",
         ],
-        "legal_mask_source": "GrammarState.legal_transitions",
+        "condition_features": [
+            "target_node_count/max_nodes",
+            "(target_node_count-current_node_count)/max_nodes",
+        ],
+        "condition_projection": "bias_free_linear_2_to_d_model",
+        "legacy_condition_features": [0.0, 0.0],
+        "legal_mask_source": {
+            "legacy": "GrammarState.legal_transitions",
+            "exact_node": "ExactNodeGrammarState.legal_transitions",
+        },
     }
 
 
@@ -94,6 +104,81 @@ class SamplingConfig:
         if not isinstance(self.greedy, bool):
             raise ValueError("greedy 必须严格为 bool")
         object.__setattr__(self, "temperature", float(self.temperature))
+
+
+@dataclass(frozen=True, slots=True)
+class ComplexitySchedulerConfig:
+    enabled: bool = False
+    exhaustive_node_counts: tuple[int, ...] = ()
+    exact_node_retry_budget: int = 0
+    low_effective_update_rate_warning_threshold: float | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("enabled must be bool")
+        if not isinstance(self.exhaustive_node_counts, tuple):
+            raise ValueError("exhaustive_node_counts must be a tuple")
+        normalized: list[int] = []
+        for node_count in self.exhaustive_node_counts:
+            if (
+                not isinstance(node_count, int)
+                or isinstance(node_count, bool)
+                or node_count < 1
+            ):
+                raise ValueError("exhaustive_node_counts must contain positive integers")
+            normalized.append(node_count)
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("exhaustive_node_counts must not contain duplicates")
+        object.__setattr__(self, "exhaustive_node_counts", tuple(sorted(normalized)))
+        if (
+            not isinstance(self.exact_node_retry_budget, int)
+            or isinstance(self.exact_node_retry_budget, bool)
+            or self.exact_node_retry_budget < 0
+        ):
+            raise ValueError("exact_node_retry_budget must be a non-negative integer")
+        threshold = self.low_effective_update_rate_warning_threshold
+        if threshold is not None:
+            if (
+                not isinstance(threshold, Real)
+                or isinstance(threshold, bool)
+                or not math.isfinite(float(threshold))
+                or not 0.0 <= float(threshold) <= 1.0
+            ):
+                raise ValueError(
+                    "low_effective_update_rate_warning_threshold must be in [0, 1] or None"
+                )
+            object.__setattr__(
+                self,
+                "low_effective_update_rate_warning_threshold",
+                float(threshold),
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizerCalibrationConfig:
+    enabled: bool = False
+    minimum_valid_calibration_samples: int = 64
+    maximum_requested_calibration_slots_per_N: int = 128
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ValueError("calibration enabled must be bool")
+        _positive_int(
+            self.minimum_valid_calibration_samples,
+            "minimum_valid_calibration_samples",
+        )
+        _positive_int(
+            self.maximum_requested_calibration_slots_per_N,
+            "maximum_requested_calibration_slots_per_N",
+        )
+        if (
+            self.maximum_requested_calibration_slots_per_N
+            < self.minimum_valid_calibration_samples
+        ):
+            raise ValueError(
+                "maximum_requested_calibration_slots_per_N must be at least "
+                "minimum_valid_calibration_samples"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +267,30 @@ class GFNConfig:
     sampling: SamplingConfig = SamplingConfig()
     reward: RewardConfig = RewardConfig()
     training: TrainingConfig = TrainingConfig()
+    complexity_scheduler: ComplexitySchedulerConfig = ComplexitySchedulerConfig()
+    calibration: NormalizerCalibrationConfig = NormalizerCalibrationConfig()
+
+    def resolved_complexity_strata(self) -> dict[str, tuple[int, ...]] | None:
+        if not self.complexity_scheduler.enabled:
+            return None
+        strata = resolve_exact_node_strata(self.search_space)
+        feasible = strata.resolved_feasible_node_counts
+        exhaustive = self.complexity_scheduler.exhaustive_node_counts
+        unknown = sorted(set(exhaustive) - set(feasible))
+        if unknown:
+            raise ValueError(
+                f"exhaustive_node_counts contains infeasible strata: {unknown}"
+            )
+        discovery = tuple(
+            node_count for node_count in feasible if node_count not in exhaustive
+        )
+        if not discovery:
+            raise ValueError("resolved discovery strata S=F-E must not be empty")
+        return {
+            "resolved_feasible_node_counts": feasible,
+            "resolved_exhaustive_node_counts": exhaustive,
+            "resolved_discovery_node_counts": discovery,
+        }
 
     def manifest(self) -> dict[str, Any]:
         return {
@@ -191,6 +300,7 @@ class GFNConfig:
             "token_space_fingerprint": action_space_fingerprint(),
             "state_space_fingerprint": state_space_fingerprint(),
             "transition_space_fingerprint": transition_space_fingerprint(),
+            "resolved_complexity_strata": self.resolved_complexity_strata(),
         }
 
     def fingerprint(self) -> str:
@@ -318,13 +428,22 @@ class TrainingStats:
     illegal_action_rate: float = 0.0
     batch_corr_mean: float | None = None
     batch_corr_median: float | None = None
+    requested_count_by_N: dict[int, int] | None = None
+    sampled_attempt_count_by_N: dict[int, int] | None = None
+    valid_count_by_N: dict[int, int] | None = None
+    successful_update_count_by_N: dict[int, int] | None = None
+    retry_exhausted_count_by_N: dict[int, int] | None = None
+    effective_update_rate_by_N: dict[int, float] | None = None
+    low_effective_update_rate_node_counts: tuple[int, ...] = ()
 
 
 __all__ = [
     "CONFIG_SCHEMA",
+    "ComplexitySchedulerConfig",
     "GFNConfig",
     "LEGACY_TOKEN_POLICY_MODES",
     "ModelConfig",
+    "NormalizerCalibrationConfig",
     "RewardConfig",
     "SamplingConfig",
     "STAGE5_REAL_MODEL",

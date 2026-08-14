@@ -127,6 +127,7 @@ class ForwardPolicyNetwork(nn.Module):
             enable_nested_tensor=False,
         )
         self.state_aux_projection = nn.Linear(3, d_model)
+        self.condition_projection = nn.Linear(2, d_model, bias=False)
         self.budget_projection = nn.Linear(3, d_model)
         self.slot_fusion = nn.Sequential(
             nn.Linear(7 * d_model, d_model),
@@ -449,6 +450,14 @@ class ForwardPolicyNetwork(nn.Module):
             raise ValueError("temperature 必须为正数")
         if batch.token_ids.ndim != 2 or batch.legal_token_mask.ndim != 3:
             raise ValueError("StateBatch 张量维度不正确")
+        if batch.condition_features.shape != (batch.token_ids.shape[0], 2):
+            raise ValueError("condition_features 必须为 (batch, 2)")
+        if not bool(torch.isfinite(batch.condition_features).all()):
+            raise ValueError("condition_features 必须全部有限")
+        if not bool(
+            ((batch.condition_features >= 0.0) & (batch.condition_features <= 1.0)).all()
+        ):
+            raise ValueError("condition_features 必须归一化到 [0, 1]")
         if any(
             state.search_space != self.search_space
             for state in batch.states
@@ -474,6 +483,7 @@ class ForwardPolicyNetwork(nn.Module):
         mask_float = batch.node_mask.unsqueeze(-1).to(encoded.dtype)
         global_state = (encoded * mask_float).sum(dim=1) / mask_float.sum(dim=1).clamp_min(1)
         global_state = global_state + self.state_aux_projection(batch.auxiliary_features)
+        global_state = global_state + self.condition_projection(batch.condition_features)
 
         slot_count = batch.slot_node_indices.shape[1]
         gather_indices = batch.slot_node_indices.unsqueeze(-1).expand(

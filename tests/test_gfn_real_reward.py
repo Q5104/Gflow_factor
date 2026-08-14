@@ -4,7 +4,7 @@ import warnings
 import numpy as np
 
 from factor_gfn.barra import STYLE_NAMES, BarraConfig, LongShortSeries
-from factor_gfn.evaluator import EvaluationConfig
+from factor_gfn.evaluator import EvaluationConfig, IndustryNeutralizationWarning
 from factor_gfn.gfn import (
     GFNConfig,
     GFNTrainer,
@@ -231,9 +231,13 @@ class RealRewardProviderTests(unittest.TestCase):
         )
         expression = Expression.from_prefix([get_action_id("close")])
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             assignment = provider.evaluate(expression)
+
+        self.assertFalse(
+            any(item.category is IndustryNeutralizationWarning for item in caught)
+        )
 
         result = assignment.metadata["reward_result"]
         self.assertFalse(assignment.valid)

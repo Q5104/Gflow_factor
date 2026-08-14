@@ -16,10 +16,15 @@ from factor_gfn.grammar import (
     CATEGORY_TO_INDEX,
     DAGAction,
     Expression,
+    ExactNodeGrammarState,
     GrammarState,
     get_action,
     state_space_fingerprint,
 )
+
+
+CONDITION_SCHEMA = "factor_gfn.exact_node_condition.v1"
+ReplayState = GrammarState | ExactNodeGrammarState
 
 
 def _validate_hash(value: str, name: str) -> None:
@@ -31,15 +36,46 @@ def _validate_hash(value: str, name: str) -> None:
         raise ValueError(f"{name} 必须是 64 位 SHA-256 十六进制字符串") from exc
 
 
-def state_hash(state: GrammarState) -> str:
-    """哈希完整 DAG 状态身份，包括结构和搜索空间约束。"""
-
+def target_condition_fingerprint(
+    target_node_count: int,
+    search_space_fingerprint: str,
+) -> str:
+    if not isinstance(target_node_count, Integral) or isinstance(target_node_count, bool):
+        raise ValueError("target_node_count 必须是正整数")
+    if int(target_node_count) < 1:
+        raise ValueError("target_node_count 必须是正整数")
+    _validate_hash(search_space_fingerprint, "search_space_fingerprint")
     payload = json.dumps(
         {
-            "state_key": state.state_key,
-            "state_space_fingerprint": state_space_fingerprint(),
-            "search_space_fingerprint": state.search_space.fingerprint(),
+            "schema": CONDITION_SCHEMA,
+            "target_node_count": int(target_node_count),
+            "search_space_fingerprint": search_space_fingerprint,
         },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def state_hash(state: ReplayState) -> str:
+    """哈希完整 DAG 状态身份，包括结构和搜索空间约束。"""
+
+    structural_state = (
+        state.state if isinstance(state, ExactNodeGrammarState) else state
+    )
+    manifest: dict[str, object] = {
+        "state_key": structural_state.state_key,
+        "state_space_fingerprint": state_space_fingerprint(),
+        "search_space_fingerprint": structural_state.search_space.fingerprint(),
+    }
+    if isinstance(state, ExactNodeGrammarState):
+        manifest["condition_fingerprint"] = target_condition_fingerprint(
+            state.target_node_count,
+            state.search_space.fingerprint(),
+        )
+    payload = json.dumps(
+        manifest,
         ensure_ascii=True,
         sort_keys=True,
         separators=(",", ":"),
@@ -281,6 +317,9 @@ class Trajectory:
     terminal_state_hash: str
     terminal_expression: Expression
     sampling_mode: Literal["stochastic", "greedy"]
+    target_node_count: int | None = None
+    terminal_node_count: int | None = None
+    condition_fingerprint: str | None = None
     reward: float | None = None
     log_reward: float | None = None
 
@@ -360,6 +399,35 @@ class Trajectory:
                 raise ValueError("相邻轨迹步骤的状态哈希不连续")
         if self.steps[-1].child_state_hash != self.terminal_state_hash:
             raise ValueError("最后一步没有到达 terminal_state_hash")
+        if self.terminal_node_count is not None:
+            if (
+                not isinstance(self.terminal_node_count, Integral)
+                or isinstance(self.terminal_node_count, bool)
+                or int(self.terminal_node_count) < 1
+            ):
+                raise ValueError("terminal_node_count 必须是正整数或 None")
+            if self.terminal_expression.stats.node_count != self.terminal_node_count:
+                raise ValueError("terminal_node_count 与终止表达式不一致")
+        conditioned = (
+            self.target_node_count is not None
+            or self.condition_fingerprint is not None
+        )
+        if conditioned:
+            if self.target_node_count is None or self.condition_fingerprint is None:
+                raise ValueError(
+                    "conditioned 轨迹必须同时保存目标 N 与 condition fingerprint"
+                )
+            if self.terminal_node_count is None:
+                raise ValueError("conditioned 轨迹必须保存 terminal_node_count")
+            if (
+                not isinstance(self.target_node_count, Integral)
+                or isinstance(self.target_node_count, bool)
+                or int(self.target_node_count) < 1
+            ):
+                raise ValueError("target_node_count 必须是正整数")
+            _validate_hash(self.condition_fingerprint, "condition_fingerprint")
+            if self.terminal_node_count != self.target_node_count:
+                raise ValueError("terminal_node_count 必须等于 target_node_count")
         expected_pf = torch.stack([step.log_pf for step in self.steps]).sum()
         torch.testing.assert_close(self.sum_log_pf, expected_pf)
         expected_pb = math.fsum(step.log_pb for step in self.steps)
@@ -370,11 +438,30 @@ class Trajectory:
         if self.reward is not None:
             self.require_valid_reward()
 
-    def replay(self, initial_state: GrammarState) -> GrammarState:
+    def replay(self, initial_state: ReplayState) -> ReplayState:
         """按记录的规范槽位和 Token 重放轨迹并核对每个状态。"""
 
         self.validate()
-        state = initial_state
+        if self.target_node_count is None:
+            if isinstance(initial_state, ExactNodeGrammarState):
+                raise ValueError("无条件轨迹不能用 conditioned 初始状态重放")
+            state: ReplayState = initial_state
+        else:
+            if isinstance(initial_state, ExactNodeGrammarState):
+                if initial_state.target_node_count != self.target_node_count:
+                    raise ValueError("重放初始状态的目标 N 与轨迹不一致")
+                state = initial_state
+            else:
+                state = ExactNodeGrammarState(
+                    initial_state,
+                    target_node_count=self.target_node_count,
+                )
+            expected_condition_fingerprint = target_condition_fingerprint(
+                self.target_node_count,
+                state.search_space.fingerprint(),
+            )
+            if expected_condition_fingerprint != self.condition_fingerprint:
+                raise ValueError("重放 condition fingerprint 与轨迹不一致")
         for step in self.steps:
             if state_hash(state) != step.state_hash:
                 raise ValueError("重放时当前状态哈希与轨迹记录不一致")
@@ -401,7 +488,15 @@ class Trajectory:
             raise ValueError("轨迹重放没有到达记录的终止状态")
         if state.to_expression().structural_hash() != self.terminal_expression.structural_hash():
             raise ValueError("轨迹重放得到的终止表达式不一致")
+        if self.terminal_node_count is not None and state.node_count != self.terminal_node_count:
+            raise ValueError("轨迹重放得到的终止节点数不一致")
         return state
 
 
-__all__ = ["Trajectory", "TrajectoryStep", "state_hash"]
+__all__ = [
+    "CONDITION_SCHEMA",
+    "Trajectory",
+    "TrajectoryStep",
+    "state_hash",
+    "target_condition_fingerprint",
+]

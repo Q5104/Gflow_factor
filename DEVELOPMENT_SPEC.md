@@ -2,8 +2,8 @@
 
 > 状态：初版、持续更新  
 > 建立日期：2026-08-04  
-> 最近同步：2026-08-12
-> 当前阶段：阶段 1–4 工程验收及阶段 6 前置防泄露合同已完成，正在执行阶段 5 GPU 真实训练准备
+> 最近同步：2026-08-13
+> 当前阶段：阶段 1–4 工程验收及阶段 6 前置防泄露合同已完成；阶段 5 已冻结 `6/20` no-anchor 搜索边界并完成正式架构、checkpoint 与 synthetic smoke，等待人工运行 Step 12 训练健康检查
 > 重要说明：本文用于记录开发路线、已确认决策、待确认问题和验收标准，不是不可修改的冻结规格。
 
 ## 1. 项目目标
@@ -622,10 +622,10 @@ Trainer 最多采样 `10*batch_size` 个候选以补满有效 batch，未补满�
 
 目标：在冻结的训练数据与 Reward 口径上，以可恢复的 GPU 正式训练生成足量、来源可追踪的候选表达式；本阶段不使用验证集或最终样本外结果调整策略。
 
-#### 5.1 冻结模型与搜索空间，校准训练动态参数（2026-08-11 更新）
+#### 5.1 旧 scalar-logZ 基线的模型、搜索空间与训练动态（2026-08-11 历史合同）
 
-- 正式搜索空间固定为 `max_depth=6`、`max_nodes=15`。该上限是人为确定的语言复杂度边界，不通过训练期、验证期或 OOS 收益网格选择。
-- 正式策略网络结构固定为 `d_model=128`、`num_heads=4`、`num_layers=4`、`dim_feedforward=512`、`dropout=0`。模型结构和表达式搜索空间已经冻结，不因训练期 Reward、验证期或 OOS 表现调整。
+- 本节记录2026-08-11至2026-08-12已经完成并提交的旧 `grammar_hierarchical + scalar logZ` 可回退基线，不再定义5.3新架构的最终配置。该基线搜索空间固定为 `max_depth=6`、`max_nodes=15`；历史 run、候选和检查点继续只读保留，禁止跨 schema 恢复到新架构。
+- 旧基线策略网络结构固定为 `d_model=128`、`num_heads=4`、`num_layers=4`、`dim_feedforward=512`、`dropout=0`。5.3重构继续保留 `grammar_hierarchical` 主体，但搜索边界改为配置化；6/15兼容性smoke已经完成，当前独立6/20 diagnostic只判断`max_depth=6`是否可能过紧。`max_nodes=20`是当前人为固定上限，不做自动扩边；最终`max_depth`与训练动态参数须按5.3验收，不继承本节“正式冻结”表述。
 - 下一轮延长诊断配置使用有效 `batch_size=8`、`temperature=1.0`、`greedy=False`、Transformer 学习率 `1e-4`、`initial_log_z=39.0`、`logZ` 学习率 `1e-2`，模型与 `logZ` 继续采用各自 `max_norm=5.0` 的独立梯度裁剪；Adam `betas=(0.9,0.999)`、`eps=1e-8`、无 weight decay、补采倍数 10、确定性算法和强制候选行业中性化保持不变。`initial_log_z=39.0` 与 `logZ` 学习率 `1e-2` 来自旧 run 的训练期 TB 诊断，不使用验证期或 OOS。
 - 上述学习率、`initial_log_z`、独立梯度裁剪和 batch 等训练动态参数仍处于阶段 5 诊断优化期，当前值只是具有独立配置指纹的工程基线，尚未最终冻结为后续全部 seed 的正式配置。平坦 Token 策略的 300 步、元数分组策略的 100 步和完整文法分层策略的首个 100 步均已完成并分别保留；当前只允许从完整文法分层 run 的同策略检查点续跑，不丢弃前 100 步候选，不跨策略配置续接或改写历史 run。
 - 代码通过 `build_stage5_real_training_config(max_steps=..., seed=...)` 生成完整 `GFNConfig` 和配置指纹。总步数属于每次运行预算，seed 属于独立 run 身份，二者必须显式记录，不在本步固定为单一全局值。
@@ -653,7 +653,7 @@ Trainer 最多采样 `10*batch_size` 个候选以补满有效 batch，未补满�
 
 这套分层只消除了“某一类别因 Token 个数多而在平坦 softmax 中机械占据更大初始总质量”的局部动作偏置。它没有改变各节点长度下终态表达式数量随组合深度增长的事实，也不保证训练后短表达式占优；相关底层问题、当前实证与待研究方案统一记录在附录 B 首项。
 
-#### 5.2 GPU 正式搜索入口（2026-08-11 已实现并进入参数校准实跑）
+#### 5.2 旧 scalar-logZ 基线的 GPU 搜索入口（2026-08-11 已实现，历史运行只读保留）
 
 - `factor_gfn/gfn/search_runner.py` 提供新 run 与恢复入口；只接受 `cuda`/`cuda:<index>`，CUDA 不可用时立即失败，不允许回落 CPU。策略网络、TB Loss 与优化器位于 GPU，真实因子解释、截面清洗和 Reward 继续使用既有 NumPy CPU 路径。
 - 新 run 写入 `runs/real_search/<run_id>/`。不同 seed 通过分别创建新 run 实现；每个 run 固定完整配置指纹、真实数据上下文指纹、Reward Provider 指纹和 CUDA 型号/能力/设备数/运行时摘要。
@@ -664,13 +664,259 @@ Trainer 最多采样 `10*batch_size` 个候选以补满有效 batch，未补满�
 - 监控覆盖 Trainer 全部统计、每步墙钟耗时、Reward 请求/有效/唯一数量、真实因子与 Reward 累计耗时、Provider 缓存命中以及当前/峰值 GPU allocated/reserved 显存。缓存命中不重复计入实际因子和 Reward 耗时。每步完成后立即向控制台打印 `current_step`、`optimizer_step`、Loss、Reward、拒绝率、归一化熵及耗时，并刷新该 run 的 TensorBoard 标量与 Reward 直方图。TB 优化诊断同时记录 `delta_mean/std`、前向/后向/Reward 对数均值、Transformer 与 `logZ` 裁剪前梯度、实际裁剪系数、Transformer 绝对/相对参数更新量及 `logZ` 单步更新量；历史检查点缺少这些字段时按空值恢复，不改写旧统计。
 - `run_state.json` 使用原子写入记录 `ready/running/completed/failed/interrupted`、正在计算的 `active_step`、步骤开始时间、最后完成时间和最近异常。`factor_gfn.gfn.search_monitor status/watch` 只读取状态、训练统计及逐步性能文件，不加载模型或修改训练产物，可在独立终端持续查看进度与基础告警。
 - 正式扩大训练前，允许通过 `factor_gfn.gfn.search_monitor freeze` 为已停止的 run 生成带 SHA-256、文件大小和核心计数的只增不改基线快照；若同名快照后的原始产物发生变化，工具拒绝覆盖。
-- `notebooks/run_real_candidate_search.ipynb` 是唯一手动入口：当前正式 Stage 5 新 run 只使用 `grammar_hierarchical` 完整文法分层策略；恢复模式从原 run 读取冻结配置，只允许提高 `TARGET_STEP`，不得改写原 seed、配置或指纹。历史 `flat` 与 `arity_hierarchical` run 只读参与同期工程对照和后续候选导入，不创建第二个 Trainer，也不恢复到当前策略。Notebook 由用户手动运行，代码验收不启动真实训练。
+- `notebooks/run_real_candidate_search.ipynb` 是旧基线的手动入口：旧 run 只使用 `grammar_hierarchical` 完整文法分层策略，恢复模式从原 run 读取冻结配置，只允许提高 `TARGET_STEP`，不得改写原 seed、配置或指纹。历史 `flat`、`arity_hierarchical` 与 scalar-logZ `grammar_hierarchical` run 均只读参与工程对照和后续候选导入；5.3新架构须升级入口、schema和指纹后创建独立 run，不得恢复这些旧检查点。Notebook 由用户手动运行，代码验收不启动真实训练。
 
 后续工作：
 
-- 继续用训练期诊断当前 `initial_log_z`、`logZ` 学习率、模型/logZ 独立梯度裁剪、batch 和分组动作策略的动态表现；在训练动态与策略口径最终冻结前，不启动其他 seed 的批量正式搜索。
+- Complexity-conditioned无-anchor正式架构完成极短integration smoke后，只做训练动态健康检查：检查same-N retry、policy与learned-logZ学习率、两组独立梯度裁剪和batch是否出现结构性异常；不把短期Reward/IC高低作为optimizer选择依据，不进行六维网格搜索。无明确异常时优先沿用`policy_lr=1e-4`、`learned_logz_lr=1e-2`、两组`max_norm=5`和`batch_size=8`工程baseline；在训练动态与策略口径最终冻结前，不启动其他seed的批量正式搜索。
 - 参数冻结后，按完全相同的模型、搜索空间、Reward 与训练配置执行一个或多个独立 seed，并持续记录吞吐、拒绝率、唯一率、策略熵、耗时、显存、检查点和完整候选清单。
 - 若拒绝率持续超过 80%、出现 NaN/Inf、非法动作、显存不足或候选多样性坍缩，先分析原因，不自动改变 Reward、行业中性化、搜索空间或模型规模。
+
+#### 5.3 Complexity-conditioned GFlowNet 重构合同（2026-08-12 已确认，分阶段实现中）
+
+##### 5.3.1 问题定义、目标分布与不变合同
+
+旧 `grammar_hierarchical` 已消除平坦 Token 数量造成的局部动作初始概率偏置，但仍保留不同终态节点数层之间的组合数量优势。标准未条件化 GFlowNet 的节点数层总质量满足：
+
+`P(node_count = n) ∝ Σ_{x: node_count(x)=n} R(x)`。
+
+因此，本轮将 Stage 5 的正式候选生成方法改为外部先选择目标节点数 `N`，再学习该复杂度层内部的 Reward 比例分布：
+
+```text
+N ~ q(N)
+P_F(x | N) ∝ R_TB(x)
+```
+
+第一版 complexity condition 只使用终态 `node_count`，不同时条件化 terminal depth。`depth` 继续作为硬结构约束并按 `(node_count, terminal_depth)` 进行二维诊断；只有在固定 N 后仍观察到无质量增益的 `max_depth` 机械堆积，才另立实验研究 depth conditioning。本轮不加入复杂度 Reward、长度归一化、复杂度惩罚、课程学习、learned `q(N)`、高 Reward 重放或 depth 配额。
+
+以下合同保持不变：
+
+- 六个原始 Feature、52 个非叶子算子、142 个 Token、规范部分 AST、多路径 DAG、canonicalization、父状态枚举和原 `(slot, token_id)` 环境动作；
+- `grammar_hierarchical` 的 Feature/UnaryFamily/BinaryFamily、六类文法、Operator 与条件 Window 概率分解；
+- 固定均匀后向概率 `P_B=1/n_parents`；
+- 原始 Reward 公式、Reward floor、严格行业中性化、Barra 定义、训练期数据边界和固定五日调仓日历；
+- 阶段 6 的训练/验证/OOS 切分、方向、联合硬筛选、排序和贪心去相关合同。
+
+`N` 是整条 trajectory 的外部 condition，不是 Grammar Token、环境动作或 AST 节点，不增加 trajectory length。Conditional TB 对每条轨迹 `i` 定义为：
+
+```text
+delta_i
+  = logZ(N_i)
+  + sum_log_pf(a_t | s_t, N_i)
+  - log_reward_TB_i
+  - sum_log_pb_i
+
+TB_loss = mean(delta_i^2)
+```
+
+外部调度分布 `q(N)` 只负责训练任务覆盖，不进入 TB 方程；禁止加入 `log q(N)` 或 `-log q(N)`。固定均匀 `P_B` 的数值定义不变，但父状态重建、父边合法性复核和 trajectory replay 必须携带同一个 `target_node_count`，确保前向与后向工作在同一个 conditioned DAG 上。
+
+##### 5.3.2 Exact-N 可达性、状态身份与缓存合同
+
+对每条 trajectory 先确定 `target_node_count=N`，其 terminal 必须同时满足：
+
+```text
+node_count == N
+holes == 0
+terminal_depth <= max_depth
+N <= max_nodes
+```
+
+每个 conditioned legal action 不仅要满足旧的 Token、槽位、`max_depth/max_nodes` 约束，还必须保证 action 执行后至少存在一种合法 completion 能够恰好终止于 N。Exact completion feasibility 必须考虑当前节点数、Hole 数量与深度、unary/binary arity 和剩余 depth budget；禁止只用 `max_nodes - node_count` 粗略判断，也禁止“先进入 dead state、最后再拒绝 trajectory”。
+
+代码不得假定 `1..max_nodes` 全部可达。必须在当前 Grammar、`max_depth` 和 `max_nodes` 下解析，并将“是否参加normal discovery”与“normalizer是否exact”彻底解耦：
+
+```text
+F = resolved feasible node-count strata
+D = normal discovery strata = F
+E = exact-normalizer strata = exhaustive evaluated strata
+L = learned-normalizer strata = F - E
+```
+
+例如当前若解析为`F=(1,...,20)`、`E=(1,2)`，则`D=(1,...,20)`、`L=(3,...,20)`。`exhaustive`只描述完整评价与normalizer类型，不再决定该层是否进入discovery。配置的 `max_depth/max_nodes`、解析后的 `F/D/E/L` 及其生成依据全部写入配置 manifest、运行元数据和指纹。所有底层结构必须依赖配置动态创建，禁止为 6/15、6/20、7/20 或具体 N 写死数组长度和分支。
+
+现有结构身份继续分层：
+
+- `GrammarState.state_key` 只代表 canonical partial AST；
+- terminal structural hash 只代表 canonical expression；
+- Stage 6 仍按结构哈希跨来源去重；
+- 凡是合法动作、模型输入、采样或缓存结果依赖目标 N 的组件，完整 key 必须至少包含 `(state_key, target_node_count, search_space_fingerprint)`。
+
+禁止将 N 写入表达式 structural hash，亦禁止只用旧 `GrammarState.state_key` 缓存 conditioned legal mask。
+
+##### 5.3.3 Balanced discovery scheduler、same-N retry 与公平性诊断
+
+Discovery scheduler 遍历`D=F`，包括exact-normalizer strata。理论覆盖目标为 `q(N)=Uniform(D)`，工程实现使用可确定性恢复的 balanced shuffled cycle，而不是逐轨迹 IID `random.choice`。Scheduler 至少持久化：
+
+```text
+resolved normal discovery strata D
+current shuffled permutation
+cycle index
+position within cycle
+scheduler RNG state
+```
+
+Batch size 与 strata 数量、`max_nodes` 解耦；`batch_size=8` 只作为第一轮诊断起点，不是最终冻结值。每个 batch slot 一旦由 scheduler 分配 N，Reward 无效后的补采必须继续使用相同 N，不得消费下一个 N 顶替。达到配置化 exact-node retry budget 后，fail-closed 跳过整个 optimizer update、记录导致耗尽的 N 并继续 scheduler；禁止换 N、放宽 Reward、关闭行业中性化、降低 Barra 共同期数或自动修改 `q(N)`。
+
+必须按 N 持久化：
+
+```text
+requested_count_by_N
+valid_count_by_N
+successful_update_count_by_N
+retry_exhausted_count_by_N
+effective_update_rate_by_N = successful_update_count_by_N / requested_count_by_N
+```
+
+如果 mixed-N batch 整体跳过，该 batch 内所有 N 均不得计为 successful update。`effective_update_rate_by_N` 低于配置化告警阈值时只提示“均匀请求未转化为均匀梯度暴露”，不自动重新分配配额。
+
+##### 5.3.4 动态 per-N conditional normalizer
+
+旧全局 scalar `logZ` 在新模式下改为按 `max_nodes` 动态创建的独立 Parameter vector：
+
+```python
+log_z_by_node_count = nn.Parameter(torch.empty(max_nodes))
+```
+
+索引固定为 `N -> N-1`，不得硬编码 15/30 个变量。Normalizer 同时持久化动态长度的：
+
+```text
+exact_tb_log_z_by_node_count
+exact_log_z_mask
+```
+
+两类 strata 使用同一 conditional normalizer 接口：
+
+- `N in E`：该轨迹仍来自normal discovery，forward使用buffer中固定的`exact_tb_log_z[N]`，不使用对应Parameter值；TB只训练conditional policy，exact Z不接收梯度且不得被optimizer momentum、weight decay或checkpoint恢复路径改变；
+- `N in L`：forward 使用 `log_z_by_node_count[N-1]`，由 TB 正常学习；未出现在当前 batch 的 N 不应更新。
+
+禁止仅依赖 gradient hook 或 step 前后手动归零冻结 exhaustive index。Exact buffer 必须是 forward 的权威值；Parameter vector 仍保持动态统一结构，便于 mixed-N batch、状态保存和 legacy/conditional 模式隔离。
+
+Policy 参数与 non-exhaustive normalizer 参数使用独立 optimizer group、学习率、梯度裁剪和监控。具体学习率与 max norm 仍待 synthetic 与真实短测确定，旧 scalar `logZ` 参数不直接视为新 vector 的最终配置。
+
+##### 5.3.5 Exhaustive strata、Reward mass 与固定 exact Z
+
+是否 exhaustive 不按 `N<=k` 硬编码。先按 canonical terminal expression 进行 bounded counting：统计 `canonical_terminal_count`、depth distribution、exact reachability 和估计 RealReward 成本；达到配置化 count cap 时立即停止并判为非 exhaustive，无需为了证明空间过大而继续枚举。Exhaustive 判定同时考虑 canonical terminal 数量和完整 RealReward 预算，阈值、预算比例及显式 include/exclude 均保持配置化。
+
+当前文法下已确认：
+
+- `N=1` 有 6 个 canonical terminal，直接 exhaustive；
+- `N=2` 有 `106 × 6 = 636` 个 canonical terminal；现有真实 run 中 63 个唯一 N=2 表达式平均完整评价约 0.53 秒，据此全量约 5.6 分钟，P90 粗估仍低于 8 分钟，因此当前已确认的 resolved 结果将 N=2 直接 exhaustive；
+- 以上是当前 Grammar 和实测预算得到的解析结果，不得实现为 `if N <= 2`。
+
+Exhaustive evaluation 必须可恢复并逐条保存结构、formula、prefix Token、Reward 拆解、valid/invalid、拒绝原因、context/provider/reward 指纹和 `source=exhaustive_full_evaluation`。只有在完整 canonical coverage 可证明、结构不重复且 Provider/Reward 上下文一致时，才能宣称该层 exact Z 已知。
+
+当前 TB 对“指标有效但 raw Reward 低于 floor”的候选实际使用：
+
+```text
+R_TB(x) = max(R_raw(x), reward_floor)
+```
+
+无效 candidate 仍是零 target mass，不应用 floor、不进入 partition sum，但必须保留审计。因此 exhaustive 层同时保存：
+
+```text
+exact_raw_reward_log_mass
+  = log(sum_{valid x} R_raw(x))
+
+exact_tb_log_z
+  = log(sum_{valid x} R_TB(x))
+  = logsumexp(valid terminal log_reward)
+```
+
+`exact_raw_reward_log_mass` 只用于经济口径与审计；固定 normalizer 必须使用与 TB 实际 `log_reward` 完全一致的 `exact_tb_log_z`。若某个 exhaustive N 没有任何有效 terminal，则 `Z_N=0`、不存在有限 `logZ_N`；正式run在启动normal discovery前整体fail-closed并要求人工审查，不得静默将该层改成learned Z或从`D`中删除。
+
+##### 5.3.6 Training-only calibration
+
+Learned-normalizer strata `L` 在正式 joint training 前使用训练期 conditioned trajectory 计算：
+
+```text
+logZ_implied
+  = log_reward_TB
+  + sum_log_pb
+  - sum_log_pf
+```
+
+每个 N 同时记录：
+
+```text
+calibration_requested
+calibration_valid
+median(logZ_implied)
+logmeanexp(logZ_implied)
+P10 / P25 / P75 / P90
+IQR
+```
+
+第一版使用 `median(logZ_implied)` 作为learned scalar的工程初始化，`logmeanexp`及分布统计只作高方差重要性估计诊断，不增加auxiliary loss。当前6/20 no-anchor正式入口优先复用已完成的旧6/20 training-only diagnostic中N=3...20的median，作为新Parameter的**初始化常数**；复用前必须严格核对Grammar/operator/interpreter、provider/data context、Reward config、reward floor、`max_depth=6`、`max_nodes=20`及逐N来源统计。只复制通过验证的数值和审计来源，不恢复旧Parameter、model、optimizer、scheduler、anchor或checkpoint state。
+
+Exact-normalizer strata `E` 直接使用固定`exact_tb_log_z`，不参加implied-logZ calibration。64/128 calibration不再是所有L层进入Step 12前的强制全量步骤，而是问题驱动的targeted fallback：只有Step 12显示某个N的历史median明显失配，才在**全新的、optimizer step为0的no-anchor training state**中只重校准该N；其他N继续使用已验证的历史median。Targeted calibration固定`minimum_valid=64`、`maximum_requested=128`、`comparison_window=16`、`median_abs_tolerance=0.25 logZ`、`IQR_abs_tolerance=0.50 logZ`作为工程预检合同，不进入第12步调参，也不声称最优；达到64 valid后比较最近两个不重叠16-valid窗口，若不稳定则每增加16 valid复检，到128 requested仍不足或不稳定即fail-closed。Calibration使用独立、可恢复scheduler/RNG，不消费normal discovery scheduler，冻结policy且不执行optimizer update，只读取training-only，禁止validation/OOS；禁止在已经训练过的Trainer中途重置任何logZ。
+
+##### 5.3.7 Unified normal discovery 与 exhaustive registry cache
+
+正式Stage 5不再为exhaustive strata创建独立anchor训练路径。所有`N in D=F`都由同一个balanced shuffled-cycle scheduler分配normal discovery slot，执行同一条流程：
+
+1. scheduler分配固定target N；
+2. conditional policy在exact-N合法mask下生成trajectory；
+3. Reward无效时只做same-N retry；
+4. 有效trajectory进入统一mixed-N TB batch；
+5. `N in E`使用fixed exact Z且只产生policy gradient，`N in L`同时更新policy与对应learned Z。
+
+不允许因某层已完成exhaustive evaluation而跳过其normal discovery、用其他N替换其slot，或另设anchor frequency/batch/scheduler/RNG/optimizer step。设计原则固定为：**能用exhaustive信息提高exact Z和缓存效率，就到这里为止；不要仅因为某层可exhaustive，就再人为创造一套独立训练机制。**
+
+当normal discovery再次生成`N in E`的terminal时，必须优先按canonical structural hash从已完成的exhaustive registry读取RewardAssignment，避免重复调用RealReward。Registry命中必须同时核对terminal身份、valid/invalid、stored Reward/log_reward、provider、data context、Reward config和reward floor，并明确审计`source=normal_discovery`及`reward_source=exhaustive_registry_cache`；invalid记录仍返回原拒绝原因并触发same-N retry。任何缺失、指纹不一致或数值合同不一致都fail-closed或显式回退fresh evaluation并记录原因，禁止伪装成cache hit。
+
+N=1/2允许跨等价search space复用exhaustive registry，但不得只依赖全局search-space fingerprint。每个目标run只在初始化阶段执行一次严格equivalence verification：在目标Grammar下重新枚举该N的全部canonical terminal并逐层核对structural-hash全集，同时核对Grammar/operator/interpreter semantics、provider/data context、Reward config与reward floor。全部一致才允许复用stored Reward和exact Z，否则必须fresh evaluation；验证完成后，每个normal discovery candidate只按structural hash查询只读registry，不得重复枚举全集。该逐层证明只放宽与N=1/2终态集合无关的全局边界差异，不放宽任何计算语义或数据指纹。
+
+##### 5.3.8 配置、检查点、旧 run 与实施边界
+
+新的正式模式使用独立的no-anchor architecture schema（首版命名为`factor_gfn.complexity_conditioned_no_anchor.v1`），并升级config、model、trainer、checkpoint和运行manifest schema。正式active path的配置、schema、指纹、metadata及checkpoint不得再包含anchor frequency、batch size、scheduler、cycle/position、RNG、optimizer step、loss或resume state。历史anchor实现及其旧run可只读保留，但不得由formal conditional Stage 5 runner调用。
+
+新正式模式将以下内容纳入指纹与兼容检查：
+
+```text
+max_depth / max_nodes
+resolved F / D / E / L
+complexity scheduler config and state
+exact-node retry config
+conditional policy features
+normalizer mode and vector length
+exact_tb_log_z values and mask
+calibration config and completion state
+exhaustive counting/evaluation contract
+per-stratum exhaustive registry reuse proof
+```
+
+旧`flat`、`arity_hierarchical`、`grammar_hierarchical + scalar logZ` run全部保持只读，仍可作为Stage 6候选来源；旧checkpoint不得恢复到complexity-conditioned模型。所有带anchor training state的旧conditional checkpoint，包括6/15 smoke和当前6/20 diagnostic checkpoint，都必须被新的no-anchor formal schema拒绝。当前6/20 run继续按创建时的原Trainer、配置、checkpoint context和Notebook运行到既定停止点，不得中途修改；它只提供depth统计结论，模型、optimizer、scheduler、anchor state、learned scalar和checkpoint均不得进入后续正式训练。
+
+所有正式实现继续支持配置化`max_depth/max_nodes`，但当前`max_nodes=20`是人为固定complexity upper bound，不根据`node_count==max_nodes`占比、Reward或IC自动扩大。当前真实运行与迁移顺序为：
+
+1. 用 6/15 做很短的兼容性 smoke，只回答新代码是否破坏已验证环境；
+2. 兼容性smoke通过后建立独立`max_depth=6/max_nodes=20` diagnostic run；`max_nodes=20`为本轮人工固定上限，不做自动扩边判断；
+3. 当前6/20沿旧anchor架构运行，只使用training-only normal discovery候选诊断depth分布、depth=6饱和、按depth的Reward/IC和评价成本；只对max_depth输出人工建议，其checkpoint不进入正式训练；
+4. 只有6/20输出`consider_expansion`并经人工确认，才新建独立7/20；仍有证据时再新建8/20，禁止在原run中修改边界；
+5. 最终depth确认后，创建极短no-anchor integration smoke，验证`D=F`、E/L normalizer选择、registry cache、same-N retry、mixed-N梯度、无anchor state和确定性恢复；不判断Reward/IC质量；
+6. smoke通过后执行精简的第12步训练动态健康检查并冻结配置，才创建多个独立seed的正式Stage 5 run；
+7. 所有长时间RealReward、真实smoke、diagnostic和正式训练均由用户手动启动。
+
+分阶段验收顺序更新为：保留第0–10步和当前第11步作为历史实现/诊断证据；当前6/20完成后确认最终depth；实现no-anchor formal schema与unified normal discovery；执行极短no-anchor integration smoke；完成精简后的第12步训练动态健康检查与冻结；再进入多seed正式训练。每一阶段完成测试和结果记录后暂停，未经人工确认不得自动进入下一阶段。
+
+##### 5.3.9 第12步：最终训练动态健康检查与冻结
+
+第12步不再全量重做non-exhaustive calibration，也不调整anchor frequency/batch size、exhaustive count/budget threshold或搜索边界。N=3...20先使用5.3.6所述、经语义核验的历史median初始化；E resolution属于搜索空间预检；当前搜索边界已冻结为`max_depth=6`、`max_nodes=20`，不建立7/20。
+
+优先沿用以下工程baseline，不声称数学最优：
+
+```text
+policy_lr = 1e-4
+learned_logz_lr = 1e-2
+policy_max_norm = 5
+logz_max_norm = 5
+batch_size = 8
+```
+
+待检查参数只包括same-N retry budget及上述两组学习率、两组梯度裁剪和batch size，但禁止把它们展开成六维超参数搜索。无明确异常时不重新搜索；retry budget优先使用当前depth diagnostic的真实`retry_exhausted_count_by_N`与effective update rate判断，若budget=2已表现稳定则直接冻结2，只有某些N系统性耗尽时才调整。
+
+成功标准只看训练健康：per-N delta mean/std与finite TB loss；learned `logZ_N`轨迹、更新幅度和振荡；policy gradient norm、clipping rate、实际参数更新、entropy和non-finite rate；逐N requested/valid/retry-exhausted/successful/effective-update统计；吞吐、factor/reward耗时、GPU显存与wall time；以及checkpoint恢复后的deterministic continuation。32个logical batches只是初始总预算，不能自动代表每个L层证据充分；每个N必须同时报告valid trajectory count与successful gradient exposure，任一不足都只能判`insufficient_evidence`。每层分别保存initialization/pre-update、early、late TB delta，以及initial/current/net-change logZ，防止短run内learned logZ自行修正后掩盖初值失配。只有证据充分且显示异常的N才进入targeted recalibration候选；重校准完成后必须从全新no-anchor training state启动，禁止原Trainer中途重置。短期Reward/IC P90/P99和高质量Alpha数量不用于选择optimizer参数。
 
 ### 阶段 6：因子筛选与回测验证
 
@@ -811,8 +1057,10 @@ factor_gfn/
 
 ### GFlowNet
 
-- 正式训练模型、搜索空间、batch size 和第一版优化器口径已经冻结；训练总步数、运行数量和 GPU 硬件预算仍待按正式入口与人工运行预算确认；
-- 正式规模训练中的无效轨迹比例、有效 batch 补采上限及是否需要调整；
+- Complexity-conditioned模型主体、exact-N、`D=F` balanced normal discovery、per-N exact/learned normalizer和exhaustive registry合同已确认；正式架构不再使用anchor。N=3...20先复用通过语义核验的旧6/20 training-only median作为初始化常数，64/128 median/IQR稳定性calibration只作为异常N的targeted fallback；
+- 6/15只作为已完成的历史兼容性smoke；legacy 6/20 depth diagnostic已经完成并支持冻结`max_depth=6/max_nodes=20`，不建立7/20。旧模型及checkpoint不进入no-anchor正式训练，但其depth结论、N=1/2 registry/exact Z和N=3...20 implied-logZ诊断可按各自严格等价性合同复用；
+- 第12步只检查same-N retry、两组学习率、两组梯度裁剪和batch的训练健康；无明确异常时不做网格搜索，Reward/IC短期高低不作为optimizer调参目标；
+- 正式训练总步数、运行数量和 GPU 硬件预算仍待按新入口与人工运行预算确认；
 - 训练期间候选表达式持久化归档、验证检查点选择和训练后补采规模；
 - 数值指纹、退化因子和高度相关因子的阶段 6 去重与筛选细节。
 
@@ -899,7 +1147,7 @@ factor_gfn/
 - 真实数据自动检查得到 727 个计划调仓日，其中训练、验证、OOS 分别计划 387、98、242 期，各因边界标签排除 1 期，最终有效 386、97、241 期；全局锚点仍为 2011-01-18，OOS 候选评价数为 0。
 - 当前最小真实训练的 `evaluations.jsonl` 共 15 行：13 行主分支候选全部通过公式、Token、结构哈希和来源指纹审计并形成 13 个唯一结构，2 行确定性重放仅审计不登记。历史 run 缺少中性化跳过字段且 manifest 未列出自身，均按历史产物缺口记录，不改写旧文件。
 - 本步未新增人工验证 Notebook；使用合成自动化测试和真实只读装配验证，后续候选指标仍须在统一阶段 6 上下文中重新计算。
-- 新阶段 5 单纯负责 GPU 真实训练与候选生成；冻结正式配置为 `max_depth=6`、`max_nodes=15`、`d_model=128`、4 heads、4 layers、feedforward 512、dropout 0、batch size 8，并由 `build_stage5_real_training_config()` 统一生成可指纹化配置。超参数网格探索转入未来待优化内容，不作为当前正式训练前置步骤。
+- 当时的新阶段 5 单纯负责 GPU 真实训练与候选生成，并将旧 scalar-logZ 基线配置冻结为 `max_depth=6`、`max_nodes=15`、`d_model=128`、4 heads、4 layers、feedforward 512、dropout 0、batch size 8，由 `build_stage5_real_training_config()` 统一生成可指纹化配置。该条是历史决策记录；2026-08-12起由5.3 complexity-conditioned合同取代其“当前正式配置”地位，旧run及候选继续只读保留。
 - 完成阶段 5.2 GPU 正式搜索入口的静态与合成验证：强制 CUDA、训练区间隔离、配置/数据/Reward/CUDA 环境恢复校验、逐步候选持久化、latest 与周期归档检查点、孤儿日志保留恢复、耗时和显存监控均已接入。首次人工启动发现 CUDA 确定性模式还要求在 CuBLAS 运算前设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`；补齐后恢复又暴露 `map_location=cuda` 会错误搬移 RNG ByteTensor，现已改为 CPU 暂存加载并显式规范化全部 RNG 状态，同时为零步失败 run 保留受限兼容恢复。完整自动化回归 195 项通过，真实 GPU 训练仍由用户通过 Notebook 手动启动。
 - 阶段 5 正式配置首个 GPU run 已完成 20 步启动验收：`current_step=optimizer_step=20`，190 次评价中 160 次有效、186 个唯一结构，无跳过更新、非法动作或非有限 Loss；累计耗时约 5585.53 秒，其中因子解释约占 83.2%。该 run 已冻结为 step 20 工程性能基线，不作为行业中性化口径修订后的正式候选池续跑依据。
 - 为后续长运行加入逐步控制台输出、TensorBoard、状态机式 `run_state.json` 和独立只读监控入口；基线冻结文件保存关键产物 SHA-256，旧 run、检查点和评价记录均不改写或删除。历史 20 步已一次性导出为可回读的 TensorBoard 事件。
@@ -932,6 +1180,56 @@ factor_gfn/
 - 完成完整文法策略的低风险采样热区优化：Trainer专用路径不再为每个AST动作分别执行策略熵、组概率、六类文法概率、Operator熵、Window概率及三项log概率的GPU到CPU同步；同一补采轮次的全部诊断改在GPU保持为紧凑向量，统一回传后在CPU逐项执行原有有限性、范围与归一化审计。`torch.multinomial`调用次数、顺序、输入联合概率、Reward、TB Loss和模型配置均未改变；相同seed下逐动作旧路径与批量路径的动作序列、终态表达式及全部诊断值已有回归对照。新增`sampling_seconds`、`reward_provider_seconds`、`training_update_seconds`以及TB前向、backward、optimizer的CUDA Event耗时，写入`step_metrics.jsonl`、TensorBoard、控制台和只读监控，但不写入确定性checkpoint历史。完整237项测试通过；真实CUDA加速幅度仍须由用户从现有100步检查点续跑少量步骤实测，代码验收未启动真实训练。
 - 分组策略工程实现已完成：配置升级为`factor_gfn.gfn_config.v4`，通用`ModelConfig`默认保留`flat`以维持既有合成与旧接口语义，阶段5正式预设显式使用`arity_hierarchical`。策略网络新增零初始化三分类head，动态屏蔽无合法Token的组，并把组概率与组内概率合成为严格归一化的142维联合分布；greedy与随机采样仍直接依据该联合分布。Trainer、控制台、TensorBoard、历史导出和独立只读监控已接入组概率、实际动作率、组熵及终止节点诊断；分组检查点已验证模型、head、logZ、优化器及RNG的确定性续跑。旧v3平坦策略的通用检查点指纹仍可兼容读取，但其状态不能加载到分组模型；真实旧run仍按配置指纹拒绝迁移。正式搜索Notebook已清空旧输出，默认新建分组run、先运行100步，并只读比较`378fd0dd73da4ac489510b1b551c2839`的前100步训练期结果。Notebook静态验证及完整230项自动化测试通过；真实CUDA训练未由代理启动。
 
+### 2026-08-12
+
+- 完整文法分层 run 在100步后继续完成10步真实CUDA计时诊断，最终停在`current_step=110`、`optimizer_step=110`且状态`ready`，检查点、评价和逐步统计完整，无非法动作、跳过更新或非有限Loss。新增GPU批量诊断未产生可确认的整体提速：第101–110步平均wall约58.99秒，中位约57.44秒，采样/Reward Provider/训练更新分别约占66.4%/32.4%/1.2%；实现无严重冲突，作为旧scalar-logZ历史基线保留，不再围绕该微优化继续修改。
+- （历史方案，已于2026-08-13被no-anchor正式合同取代）终态组合数量优势的解决方案确定为complexity-conditioned GFlowNet：外部按可达节点数层进行balanced discovery，层内继续严格按原`R_TB`学习；不修改原始Reward或Stage6。该日最初方案让exhaustive层退出normal discovery并只通过少量anchor训练policy；这一双路径设计后来被确认没有必要，相关实现与6/15、6/20结果只保留为历史工程证据，不再定义正式Stage 5。
+- 完成第1步 exact-N Grammar 与可达性引擎：现有无条件`GrammarState`、AST `state_key`和终态结构哈希保持不变；新增外部`ExactNodeGrammarState(state, target_node_count)`分层，并将conditioned cache identity固定为`(state_key, target_node_count, search_space_fingerprint)`。可达性按实际Token arity、每个Hole绝对深度、剩余depth/node预算做精确节点数集合合成，从根状态独立解析`resolved_feasible_node_counts`与`resolved_infeasible_node_counts`，不假设层连续。conditioned mask保证每条legal successor至少存在严格`node_count=N`的completion；父状态重建、规范边复核和固定均匀`P_B`均携带同一个N。新增8项exact-N回归，并连同原无条件Grammar在完整245项自动化测试中通过；本步未接Transformer、Reward、Trajectory或Trainer，也未启动真实训练。
+- 完成第2步 conditioned Trajectory、StateAdapter 与 Policy 接口：conditioned trajectory持久化`target_node_count`、`terminal_node_count`及由N和search-space生成的condition fingerprint，验证并重放时全程使用同一个`ExactNodeGrammarState` conditioned DAG，强制终态节点数等于N。StateAdapter新增`target_node_count/max_nodes`与`(target_node_count-current_node_count)/max_nodes`两个归一化标量；legacy `GrammarState`对应特征固定为零。Policy保留原`grammar_hierarchical`全部层级，只通过无bias的`2 -> d_model`小型线性投影使`P_F(a|s,N)`感知condition，不增加Token、环境动作、轨迹步骤或node-count embedding。StateAdapter schema升级为v2、GFN config schema升级为v6以阻止旧scalar-logZ run误恢复；TB normalizer、Reward、scheduler和Trainer训练逻辑均未修改。新增6项conditioned policy/trajectory回归，完整251项自动化测试通过；本步未启动真实训练。
+- 完成第3步 balanced scheduler、same-N retry与per-N累计统计：对动态解析的`F`和配置给出的`E`生成`S=F-E`，使用独立RNG驱动的shuffled cycle逐slot分配N；完整保存当前permutation、cycle index、position与scheduler RNG state。`exact_node_retry_budget=k`严格定义为首次失败后最多额外k次same-N尝试，每个slot总尝试上限为`1+k`；retry不消费新scheduler N。任一slot耗尽即fail-closed跳过整个mixed-N optimizer update，batch中已有效slot仍计入`valid_count_by_N`但所有slot均不增加`successful_update_count_by_N`。累计持久化`requested_count_by_N`、`sampled_attempt_count_by_N`、`valid_count_by_N`、`successful_update_count_by_N`、`retry_exhausted_count_by_N`和`effective_update_rate_by_N`；低有效率阈值默认关闭，启用后只告警而不改变strata、permutation、RNG或配额。解析后的F/E/S进入配置manifest与指纹，scheduler及计数进入checkpoint；GFN config/checkpoint/Trainer schema分别升级为v7/v2/v2。新增8项调度与统计回归，完整259项自动化测试通过；per-N normalizer、calibration、exhaustive counting/anchor尚未实现，本步未启动真实训练。
+
+- 完成第4步动态 conditional normalizer：scheduler关闭时继续使用旧全局scalar `log_z`；开启时按`max_nodes`动态创建`log_z_by_node_count` Parameter vector，并固定`N -> N-1`。同时创建同长度`exact_tb_log_z_by_node_count`与`exact_log_z_mask` buffers，mask初始全False，不预填N=1/N=2；严格`set_exact_log_z(N, value)`只允许为已声明E注册有限exact值，相同值重复注册幂等、冲突覆盖则拒绝。Mixed-N TB逐轨迹选择normalizer：E内层必须mask=True并使用fixed exact buffer，否则fail-closed；S内层使用对应learned scalar。Policy与normalizer使用独立Adam group、学习率和梯度裁剪；normalizer group禁用weight decay，并保护当前batch未激活scalar不受既有momentum推动。Checkpoint schema升级为v3，持久化normalizer模式、动态长度、exact values/mask并显式拒绝legacy scalar恢复到conditional vector。新增7项conditional normalizer回归，完整266项自动化测试通过；本步未实现exhaustive counting、exact Reward求和、calibration或anchor，也未启动真实训练。
+
+- 完成第5步基础 conditional TB 合成闭环：在真实Grammar的N=1六个叶子终态上进行完整分布训练，constant Reward从故意打破均匀的policy初始化收敛回终态均匀分布；不等toy Reward的精确`Z_1=sum_x R(x)`验证learned `logZ_1`与`P(x|N=1)=R(x)/Z_1`共同收敛。Synthetic exact模式将同一精确值写入fixed buffer，只训练policy，exact buffer与对应Parameter均不移动。Mixed-N batch同时包含N=1单步和N=2两步trajectory，逐步从实际conditioned DAG重算`log_pf=log_p_slot+log_p_token`、`log_pb=-log(n_parents(child))`，再独立核对多步`sum_log_pf`、`sum_log_pb`、per-N normalizer选择及TB delta。Checkpoint恢复后下一批target N、动作/槽位序列、terminal state/structure、loss、selected logZ、delta及scheduler位置逐值一致。新增5项闭环回归；N=2不做636终态整体收敛，本步未接exhaustive registry、anchor、真实Reward或真实训练。
+
+- 完成第 6 步 bounded canonical counting 与 exhaustive pool：新增显式预解析层，避免 `GFNConfig.manifest()` 或配置指纹计算隐式触发枚举。默认 `canonical_count_cap=10_000`，非人工 include 层在发现第 `cap+1` 个唯一 canonical terminal 时立即停止，并以 `count_relation=">"`、`canonical_count_exact=False` 和成本下界记录，禁止伪装成精确等于 cap；计数对象为 canonical expression 的结构哈希，不是 trajectory 或 action sequence。当前完整计数确认 N=1 为 6 个、深度分布 `{0: 6}`，N=2 为 636 个、深度分布 `{1: 636}`。RealReward 单候选保守估算基线为 0.75 秒且可配置；`planned_real_reward_budget_seconds=3600` 与 `max_budget_fraction=0.20` 共同给出全部 resolved exhaustive strata 的累计 720 秒上限，默认 N=1+N=2 预计 481.5 秒，因此自动 E=(1,2)。`explicit_exclude` 优先级最高，排除层直接保持 discovery-only，不为证明排除而执行无用 canonical counting；include/exclude 重叠直接报错。`explicit_include` 可绕过自动 count/cost 规则，但未获二次批准时只允许计数到累计剩余预算可容纳的候选数，发现下一唯一终态即可证明超预算并 fail-closed；只有显式 `approve_explicit_include_over_budget=True` 后才允许超预算 include 绕过 cap 完整计数。新增独立 SQLite authoritative registry，与 discovery `evaluations.jsonl` 隔离；每个候选持久化固定 source、N、depth、formula、prefix token、structural hash、provider/context fingerprints、Reward details、valid/invalid、rejection reason 与 target mass。结构哈希为主键，已完成评价幂等恢复且禁止冲突覆盖；invalid 候选保留审计并强制 target mass=0；枚举覆盖与 Reward 评价覆盖分别记录，只有二者均完整才报告 coverage complete。本步只用 synthetic 评价验证断点续跑和覆盖状态，未执行真实 RealReward 全量评价、未求 exact Z、未接 anchor 或训练。
+
+- 完成第 7 步 Exact Z 与 training-only calibration：exhaustive registry schema 升级为 v2，在全量评价覆盖完成后逐候选核对 `raw_reward`、`reward=max(raw_reward,reward_floor)`、`log_reward=log(reward)` 与 registry target mass，再分别以稳定求和计算 `exact_raw_reward_log_mass` 和 `exact_tb_log_z`。raw 总质量为零时持久化 `exact_raw_reward_log_mass=None` 与 `raw_reward_mass_status=zero_mass`，TB floor 后质量仍可形成 finite exact Z；valid candidate 数为零时持久化 failed 状态并禁止 exact Z/anchor。Exact aggregate 绑定 provider/context/reward-floor 与候选级聚合指纹，完成后禁止冲突覆盖。TB fixed buffer 改为 float64，learned per-N Parameter 保持 float32；exact strata 只接受 audited `ExactMassResult`，buffer 与审计值必须逐值一致。新增配置化 `minimum_valid_calibration_samples=64` 与 `maximum_requested_calibration_slots_per_N=128` 诊断默认值，短 smoke 可降低；calibration 使用覆盖全部 feasible N 的独立 balanced scheduler/RNG，不消费 discovery scheduler，不执行 optimizer update，只在 `optimizer_step==0` 且 optimizer state 为空时运行。每个 slot 使用同 N 并允许既有 retry budget，持久化 requested/valid/sampled-attempts、全部 implied-logZ 观测、median、logmeanexp、P10/P25/P75/P90、IQR；non-exhaustive scalar 只用 median 初始化，exhaustive strata 不初始化 learned scalar而记录 median/logmeanexp 相对 exact TB logZ 的差值。任一 N 达到最大请求预算仍不足最小有效样本即 fail-closed；calibration 未完成时 Trainer 禁止训练。Provider 必须显式声明 `data_scope=training_only`、`validation_oos_loaded=False` 与 context fingerprint，缺失即拒绝；真实 Reward context 本身不暴露 validation/OOS。GFN config、Trainer、checkpoint、RealRewardProvider schema 分别升级为 v8/v4/v4/v8，并保留 pre-calibration scalar 配置与 provider 指纹的只读 checkpoint 兼容。本步仅执行 synthetic exact/calibration/恢复测试，未运行真实 N=1/N=2 exhaustive RealReward、真实 calibration、anchor 或真实训练。
+
+- （历史实现，已退出正式active path）第8步曾实现Exhaustive TB anchor并验证N=1/2 unique-trajectory抽样、固定exact Z、独立scheduler/RNG、共享Adam计数和checkpoint恢复合同。该机制用于当时“E不参加normal discovery”的方案；2026-08-13改为`D=F`后不再需要。旧模块、测试、run和checkpoint仅作历史审计；这些anchor字段在新的no-anchor formal config/schema/fingerprint/metadata/checkpoint中必须删除。
+- （历史实现）第9步曾将exact Z、calibration、discovery、anchor和deterministic checkpoint串成完整synthetic integration；除anchor专属部分外，exact/learned mixed-N TB、same-N retry、非连续feasible strata、动态`max_nodes/max_depth`和schema拒绝等测试资产继续作为no-anchor重构的回归基础。
+- 第 10 步新增独立手动入口 `notebooks/run_complexity_conditioned_smoke_6_15.ipynb`，默认 `RUN_SMOKE=False` 并强制CUDA，不复用或改写旧scalar-logZ正式搜索Notebook。该入口使用真实training-only 6/15上下文，显式E=(1,2)、S=(3..15)，以可恢复SQLite逐条完成N=1/2共642个canonical terminal的RealReward评价和exact TB logZ；随后用smoke专用1/2 calibration门槛完成全部feasible N初始化，只执行两次batch-8 discovery并按frequency=1插入两次batch-8 anchor。第1次更新后保存checkpoint，第2次连续运行与恢复运行在完整TrainingStats、policy参数、discovery/anchor scheduler及RNG上严格对照。Notebook输出并落盘resolved F/E/S、exact coverage/logZ、calibration、逐N requested/valid/successful/effective/retry、逐trajectory delta/Reward/depth、anchor loss、分阶段wall time、GPU显存与checkpoint acceptance；默认结果目录为`runs/complexity_smoke_6_15/manual_smoke_6_15_seed42/`。代码验收只完成Notebook语法、静态装配与自动化回归，真实评价和CUDA更新必须由用户人工打开安全锁运行；通过后立即停止6/15，不增加训练步数。
+- 第10步首次人工预检在真实评价前发现Notebook沿用了旧版`provider_manifest['industry_neutralization'] is True`布尔断言，而当前Provider manifest已将该字段升级为包含`enabled/policy_schema/...`的结构化合同；生产Provider与`RewardConfig.candidate_industry_neutralization=True`均未回退。Smoke入口与历史`validate_stage4_real_reward.ipynb`已统一改为同时检查嵌套`enabled`和权威RewardConfig；新增跨全部活跃Notebook的静态扫描，禁止旧布尔访问模式再次进入入口。该问题未开始exhaustive、calibration或optimizer update，无需清理运行产物。
+- 第10步真实6/15 smoke已由用户完成并通过：N=1的6个与N=2的636个canonical terminal均100%覆盖，分别有6/629个有效候选，固定`exact_tb_log_z=-1.7669613347/2.8494631164`；全部15个可达N完成smoke calibration，两次discovery与两次anchor更新均成功，所有discovery N最终有效更新率为1且无retry exhausted，连续与checkpoint恢复的第二步严格一致。行业中性化开启、Provider为training-only且未加载validation/OOS；总wall约611秒、N=1/2 exhaustive RealReward约345秒、CUDA峰值分配显存约110 MiB。该结果只确认真实主链兼容，不冻结单样本calibration质量或正式训练动态，6/15不再增加训练步数。
+- 第11步建立独立`max_depth=6/max_nodes=20`真实conditional diagnostic；此前暂定8/24方案作废。`max_nodes=20`仅是本轮人为配置化complexity upper bound，明确禁止用`node_count==max_nodes`占比、Reward或IC自动判断扩到24/30；`max_depth=6`是可检验起点，后续只有本run输出`consider_expansion`且经人工确认后，才能新建独立7/20 run，再视证据新建8/20，禁止原run运行中改边界。depth统计动态覆盖`0..max_depth`及每个resolved discovery N，重点比较`max_depth-2/-1/max_depth`。候选主口径为显式`source=discovery`且按structural hash去重，invalid进入valid-rate与耗时总体，Reward/abs(train_ic)只使用valid finite样本，耗时为首次实际评价元数据中的`factor_seconds+reward_seconds`；calibration、exhaustive、anchor及非training-only来源均排除。保守默认门槛为总unique 500、三个重点depth各100个unique且各100个finite Reward/IC；max-depth占比10%为consider门槛、3%为低碰撞门槛，valid-rate非恶化/明确下降阈值为5/10个百分点，质量相对非恶化/明确下降阈值为10%/15%。模块只输出`consider_expansion/no_expansion_evidence/insufficient_evidence`建议，强制advisory-only；固定输出为summary JSON、depth metrics CSV与candidate audit CSV。
+- 第11步工程入口新增通用`ConditionalDiagnosticRunner`与`DiagnosticRewardProvider`审计包装，不改变Reward返回值、TB方程、scheduler或共享Adam。每次RealReward调用必须显式声明`exhaustive_full_evaluation/calibration/discovery`来源并耐中断写入JSONL；depth统计只读取normal discovery记录。Trainer新增只读的最近discovery逐trajectory TB诊断，记录per-N selected logZ、`sum_log_pf/sum_log_pb`与delta，不进入优化状态。独立run context同时绑定search-space、完整config、model、training、provider和data-context指纹，拒绝6/15及legacy scalar-logZ恢复；checkpoint可恢复discovery/anchor scheduler与RNG。本次Notebook工作参数为batch8、same-N retry2、calibration 16/32、anchor frequency8、最少/最多64/128次成功discovery update和160 logical-batch硬上限，全部明确不是正式Stage 5冻结值。64次成功update只决定最早检查时点，样本充分性必须读取实际去重`unique_discovery_candidate_count`；即使update数达到下限，只要unique总数或重点depth样本不足，仍输出`insufficient_evidence`直至满足门槛或硬停止。该真实6/20 CUDA/Reward任务现已由用户启动并继续按原配置运行；2026-08-13的no-anchor决策不回写、不重启也不中断本run。
+- 第11步首次人工运行在配置单元暴露出不必要的重复计数成本：通用planner会对6/20中N=3…20逐层枚举到`canonical_count_cap+1`，20分钟仍未完成，用户已安全中断且尚未开始exhaustive RealReward、exact Z、calibration或训练。基于第6步及真实6/15 smoke已确认的N=1六个、N=2六百三十六个和N=3超过自动阈值，本次6/20 Notebook改为显式复用`E=(1,2)`：只重新复核N=1/2的canonical count，将当前search space中其余可达N全部以`explicit_exclude`保持为discovery，不再重复计数N=3…20。该选择仅属于本次diagnostic配置并进入配置/run指纹，不改变通用planner、未来独立实验或“代码不得用N<=2自动推断E”的底层合同。
+- 第二次人工运行已完成N=1/2共642条exhaustive评价及N=1…20 calibration，但在最终表格展示时错误地对`calibration_report()`已经返回的dict再次调用`dataclasses.asdict()`，40多分钟计算结果本身未失败。Notebook改为直接由dict构造DataFrame和summary；calibration循环每20个slot输出逐N requested/valid/sampled-attempts进度，并在calibration完成、runner context建立后立即保存checkpoint，避免展示错误导致重复长任务。当前审计已有486次calibration Reward调用、355个有效结果；若原Kernel仍存活，可先手工保存该完成状态再继续训练单元。
+- 同一审计表明行业中性化跳过不是可全局预剔除的固定日期集合：1128次评价中仅122个候选出现跳过、共有60种日期组合，1006个候选完全没有跳过；失败主要来自复杂表达式自身在某截面的finite factor覆盖不足，因候选和lookback而变化。故继续按候选逐截面fail-closed排除，不改变冻结全局调仓日历；全局删除这些日期会改变所有候选Reward、N=1/2 exact Z及provider/context指纹，当前不执行。
+
+### 2026-08-13
+
+- Complexity-conditioned Stage 5正式设计明确简化为no-anchor单路径：`F`表示exact-reachable strata，`D=F`表示全部normal discovery strata，`E`只表示exhaustive evaluated且使用fixed exact normalizer的strata，`L=F-E`使用learned per-N normalizer。N=1/2不再退出discovery，而是与N=3...20共同接受balanced normal discovery、same-N retry和policy gradient；唯一差别是N=1/2从float64 exact buffer读取固定`exact_tb_log_z`且对应Parameter无梯度，N>=3使用learned scalar。Exhaustive知识只用于normalizer准确性与Reward缓存，不再创造anchor training pathway。
+- 正式active path将删除anchor frequency/batch、scheduler/cycle/RNG、optimizer step、loss、checkpoint state和专属optimizer逻辑；新的architecture schema为`factor_gfn.complexity_conditioned_no_anchor.v1`，必须拒绝所有带anchor state的旧checkpoint。历史anchor模块、synthetic测试、6/15 smoke与当前6/20 run可只读保留用于审计，但不得被formal runner调用或恢复。
+- 旧6/20 diagnostic已完成：training-only审计包含1159个unique normal-discovery candidate，depth=4/5/6的unique与finite质量样本均达到预设门槛；自动建议为`no_expansion_evidence`，直接原因是depth=6相对depth=5的valid rate下降约10.50个百分点。虽然depth=6占比约57.03%且Reward/abs(IC)上尾仍有改善，但按预先冻结的保守规则，有效率达到“明确下降”阈值，因此不把撞边界单独解释为扩深证据。用户据此确认冻结`max_depth=6/max_nodes=20`，不建立7/20。旧run的模型、optimizer、scheduler、anchor和checkpoint均不进入正式训练；其depth结论、严格等价的N=1/2 registry/exact Z和经语义核验的N=3...20 implied-logZ median可分别按当前合同复用。
+- （已被后续决策取代）此前要求新no-anchor run对全部`L`重新执行64/128 calibration；最终口径改为：严格验证并复用旧6/20 training-only median作为新Parameter初始化常数，不继承任何旧训练状态。Step 12只在每N的valid trajectory与successful gradient exposure均充分时判断初始化健康；明显失配的N才在全新training state中执行64/128 targeted recalibration，其他N继续使用已验证历史median，禁止训练中途重置logZ。
+- N=1/2 exhaustive registry复用不得仅依赖全局search-space fingerprint。每个目标run初始化时只执行一次逐N canonical structural-hash全集重枚举与Grammar/operator/interpreter、provider/data context、Reward config、reward floor核验；全部一致才复用stored Reward/exact Z，否则fresh evaluation。初始化证明通过后，normal discovery逐候选只做structural-hash lookup，不重复枚举全集。
+- `6/20`边界确认后已执行极短no-anchor integration smoke，只验证`D=F`、N=1/2 normal discovery与registry cache、E/L normalizer选择、same-N retry、mixed-N梯度、所有N的policy exposure、无anchor state、旧checkpoint拒绝和确定性恢复，不比较Reward/IC质量。下一步第12步只做训练动态健康检查；无明确异常时优先沿用`policy_lr=1e-4`、`learned_logz_lr=1e-2`、两组`max_norm=5`、`batch_size=8`及budget=2，不做多维超参数搜索。
+- 2026-08-13已完成正式no-anchor checkpoint切换：唯一可写schema为`factor_gfn.checkpoint.no_anchor.v1`，只允许`NoAnchorGFNConfig`对应Trainer写入；payload不含任何anchor字段，并持久化F/D/E/L调度统计、L-only calibration、动态exact/learned normalizer和逐E registry equivalence proof。No-anchor Trainer严格拒绝旧v1-v5、scalar normalizer及任意嵌套anchor字段，不做隐式迁移。旧Stage 4非conditioned scalar Trainer仅保留历史checkpoint只读加载；兼容缺少condition projection的旧模型/optimizer布局且可继续运行，但所有`save_checkpoint()`均fail-closed，因此active代码已不能再生成旧schema。旧anchor模块、导出和专属测试已退出active path，6/15与旧6/20 Notebook标记为不可恢复的历史诊断归档，已有run文件不删除。
+- 新增`notebooks/run_no_anchor_integration_smoke_6_20.ipynb`与`notebooks/run_step12_no_anchor_training_health_6_20.ipynb`。前者已由Codex用项目解释器逐格执行通过：N=1/2分别完整覆盖6/636个canonical terminal，E/L、registry一次性证明、exact buffer冻结、learned更新、same-N retry、新schema确定性恢复和旧schema拒绝全部通过；该synthetic smoke仅验证工程闭环，不代表真实implied-logZ质量。Step 12 Notebook保持`RUN_REAL_STEP12=False`，只允许用户手动启动真实training-only CUDA 6/20新run；初始化阶段以只读registry及严格来源/语义证明导入N=1/2 exact Z和N=3...20历史median，不重复RealReward或全量calibration。训练每logical batch输出进度，并记录每N的pre-update/early/late delta、initial/current/net-change logZ、valid trajectory与successful gradient exposure、两组梯度/裁剪、retry、吞吐和显存；32 batches后逐N输出`usable/review_targeted_recalibration/insufficient_evidence/fixed_exact_diagnostic`，不自动重校准或修改配置。确定性恢复另行验证且不计入冻结的32-batch健康样本。Notebook所有代码格前均有用途与预计耗时说明，长provider加载、单batch与恢复验证每20秒heartbeat。真实Step 12仍未运行。
+- 2026-08-13最终文档同步后运行完整自动化回归。首次335项运行发现旧conditional calibration收尾会误把exhaustive层的diagnostic median写入learned scalar；现已改为exact strata仍保留implied-logZ偏差诊断，但只对non-exact strata调用learned初始化接口。相关exact/calibration、no-anchor和training-health 28项回归通过，随后完整335项全部通过。该自动化结果不等价于真实Step 12已运行；真实training-only CUDA健康检查仍由用户手动启动。
+- 真实Step 12已由用户完成：32个logical batch中24次成功optimizer update、8次按合同fail-closed跳过，所有N均达到至少7条valid trajectory与7次successful gradient exposure，成功更新无NaN/Inf或非法动作，N=1/2 exact Z固定，checkpoint continuation逐值确定。自动初始化健康检查将N=3...16、19、20判为`usable`，将N=17/18判为`review_targeted_recalibration`；后两层分别出现initial delta mean约-9.24/+5.88且late delta mean约-3.01/-4.60。Retry budget=2的25% logical-batch跳过率偏高，下一轮直接使用3并验证，不进行2/3/4网格。Policy在24/24成功更新中均被`max_norm=5`裁剪，median clip coefficient约0.019；这只证明当前处于强裁剪regime，不把Adam实际参数更新简单解释为缩小到2%，后续仅做5与20的极短同源初始化对照。
+- Targeted recalibration实现限定为N=17/18、training-only、policy冻结、optimizer step=0，固定`minimum_valid=64`、`maximum_requested=128`、`comparison_window=16`、median/IQR absolute tolerance=0.25/0.50和same-N retry=3。新增独立calibration-only progress schema，逐slot原子保存独立scheduler、观测和RNG，不保存或恢复model/optimizer/discovery state；完成结果写入严格指纹化JSON artifact。新Trainer必须先导入除17/18外的verified historical medians，再在fresh state中核对search/model/sampling/Reward/provider/context/registry equivalence、历史provenance和初始policy state fingerprint后导入artifact；只初始化17/18，禁止中途覆盖。该targeted provenance随no-anchor checkpoint持久化。
+- 新增手动入口`notebooks/run_targeted_logz_calibration_n17_n18_6_20.ipynb`，默认安全锁关闭且支持`new/resume`。真实数据加载、registry proof和每个calibration slot均有20秒heartbeat；每20个累计slot输出逐N requested/valid/sampled-attempts、稳定性、elapsed与upper-bound ETA，每个slot保存`latest_targeted_calibration.pt`。完成后输出targeted JSON、per-N CSV、summary和fresh-Trainer hybrid import verification；该Notebook不得执行任何训练，用户交回结果确认后才进入`policy_max_norm=5 vs 20`短对照。
+- N=17/18 targeted calibration在已有progress checkpoint中分别保留124/126条有效training-only implied-logZ观测。全样本median分别为46.30188640483371/46.427256389816854，IQR分别为10.402814921422546/12.405252585713164；严格的两个不重叠16-valid窗口稳定性检查未通过。经人工明确批准，不再bootstrap或扩样本；结果以`initialization_status=high_variance_engineering_estimate`、`strict_stability_check=failed`登记，只把全样本median作为工程初始化常数。严格stable artifact路径仍保持fail-closed，二者不得混称。该复用不恢复任何model/optimizer/scheduler/checkpoint训练状态，并承认异常strata的大TB residual可通过共享policy梯度影响其他N。
+- 下一步只做`policy_max_norm=5`与`20`的同源极短对照，same-N retry固定为3；batch=8、policy LR=1e-4、learned logZ LR=1e-2、logZ max-norm=5保持相同。每组目标16次成功optimizer update、最多32个logical batch；A/B必须具有相同初始policy、scheduler、exact/historical/targeted logZ和seed，并用各自checkpoint恢复RNG。只比较pre-clip gradient、clip coefficient、实际参数更新、TB RMS/loss、policy entropy、per-N delta、skip/吞吐/显存与非有限值，不使用短期Reward/IC选参数，不自动产生胜者。手动入口为`notebooks/run_policy_clip_comparison_5_vs_20_6_20.ipynb`，默认安全锁关闭，所有长batch具有20秒heartbeat和逐batch checkpoint。
+- `policy_max_norm=5/20`真实同源对照已完成：两组均为17个logical batch、16次成功update和1次skip，采样的128条trajectory结构身份完全相同且TB delta最大绝对差约1.53e-5；median pre-clip norm均约213.97，clip coefficient分别约0.02383/0.09533，但median实际policy参数更新范数分别约0.032632/0.032634，TB、loss、entropy和per-N delta近乎逐值一致。该结果符合Adam对统一梯度尺度近似不变的预期，不能据“裁剪系数更大”声称20更优；按预先约定保留更保守的`policy_max_norm=5`，不再扩展裁剪阈值搜索。Retry=3下skip由旧Step 12的25%降至1/17约5.9%，当前候选固定为3并在最终health确认中复核。
+- 进入正式Stage 5前新增唯一一次独立最终health confirmation：`max_depth=6/max_nodes=20`、batch=8、policy/logZ LR=1e-4/1e-2、policy/logZ max-norm=5/5、retry=3，使用同一verified exact/historical初始化以及N=17/18高方差工程初值，从全新model/optimizer/scheduler运行32个logical batch。逐N必须输出initialization/pre-update、early、late TB delta、initial/current/net-change logZ、valid trajectory与successful gradient exposure；同时输出skip/retry、梯度/裁剪、实际更新、entropy、吞吐、显存和非有限值，并做独立checkpoint确定性恢复。证据不足或异常仅输出`insufficient_evidence/review_required`，不得中途重置logZ、自动改参数或创建正式run。手动入口为`notebooks/run_final_no_anchor_health_confirmation_6_20.ipynb`，默认安全锁关闭，长阶段逐batch输出且每20秒heartbeat。
+- 最终health confirmation已完成并获准进入正式Stage 5：32个logical batch中31次成功update、1次fail-closed skip（3.125%），所有N均有至少11条valid trajectory及11次successful gradient exposure，无证据不足层、无自动targeted-recalibration层、无NaN/Inf，checkpoint恢复逐值确定。全局delta mean均值约-0.138；TB RMS首4/末4均值约4.36/4.65，entropy稳定，median实际policy参数更新范数约0.02777且随训练下降。N=13/15/16/19/20后期delta仍有较大方差或偏移，但learned logZ净移动绝对值均小于0.07，判为尚未收敛而非结构性错误；正式1000步必须持续监控，不因这些短期尾部值重新调参。
+- 正式6/20 no-anchor seed42合同现已冻结：`max_steps=1000`、batch=8、policy/logZ LR=1e-4/1e-2、policy/logZ max-norm=5/5、retry=3、Adam betas=0.9/0.999、eps=1e-8、weight decay=0、sampling multiplier=10、deterministic algorithms启用，N=17/18继续使用已登记的高方差工程初值。冻结配置指纹为`b6453816d90f89609e506e02d6c8c0a9d3eda37571ea64079ecd91c9ad341789`；运行控制的`TARGET_STEP`不进入配置，首次只到10，检查后从同一新schema checkpoint恢复至1000。所有complexity diagnostic、health、A/B、registry与checkpoint保持只读且不作为正式训练状态恢复来源。
+- 正式入口为`notebooks/run_stage5_no_anchor_formal_6_20.ipynb`，新run schema为`factor_gfn.no_anchor_real_search.v1`，旧scalar/anchor/legacy real-search schema均不得进入。Notebook默认安全锁关闭、首次`MODE=new/TARGET_STEP=10`；10步通过后显式填写同一run绝对目录并设`MODE=resume/TARGET_STEP=1000`。控制台仿照既有real candidate search但压缩为每step一行，记录step/target、optimizer、skip、valid/request、retry、loss、Reward、TB、裁剪、实际更新、entropy、learned-logZ范围、wall time、动态ETA与显存；每步原子保存latest checkpoint、每10步保存归档checkpoint，validation/OOS保持未加载。
+- 正式run `c3a1c2747cbb41dbbb3f8f23e6ddddcb` 的首10步检查已通过并获准从同一checkpoint续跑到1000：run状态为`ready`、current/optimizer step为10/9、无active step或last error；100次Reward请求得到71条valid、100个unique structural hash，唯一skip发生在step 2的N=17 retry耗尽，非法动作率始终为0。9次成功update的loss/TB/梯度/参数更新均有限，delta mean均值约-0.202，normalized entropy均值约0.897，实际policy相对更新从约6.73e-4下降到2.21e-4；显存峰值约161.4 MiB。`checkpoint_latest.pt`和step-10归档均存在，正式config/provider/context/初始化来源指纹一致。Notebook现已清空执行输出并固定为`MODE=resume`、`TARGET_STEP=1000`及该run绝对目录；禁止新建替代run或改配置。
+
 ## 附录A：暂缓的 Barra 风格因子参考实现
 
 本附录只记录后续版本的候选方案，不代表当前数据需求或第一版实现任务。下列因子不进入第一版 Barra 惩罚集合，不在当前阶段下载相应财务或分红数据。若后续启用，必须首先确认财务报告披露日、可得日、除权除息日及历史成分映射，避免将事后数据回填到历史截面。
@@ -949,15 +1247,66 @@ factor_gfn/
 
 ### 首要待优化项：终态数量导致的长结构总质量优势
 
-这是当前 GFlowNet 搜索最重要、但尚未冻结解决方案的底层问题。理想收敛时，单个终态表达式 `x` 的采样概率满足 `P(x) ∝ R(x)`；然而某一长度层的总采样概率取决于该层所有终态 Reward 的总和：
+这是当前 GFlowNet 搜索最重要的底层问题；解决方案已收敛为5.3所述的no-anchor complexity-conditioned GFlowNet。理想收敛时，单个终态表达式 `x` 的采样概率满足 `P(x) ∝ R(x)`；然而某一长度层的总采样概率取决于该层所有终态 Reward 的总和：
 
 `P(node_count = n) ∝ Σ_{x: node_count(x)=n} R(x)`。
 
 因此，即使单个长表达式的平均 Reward 低于短表达式，只要长表达式的合法组合数量大得多，该长度层仍可能获得更大的总概率质量。完整文法分层消除了“某类 Token 数量更多，初始化时自然占据更多动作概率”的局部偏置，但不会自动抵消完整终态空间随节点数增长产生的组合数量优势。这不是实现错误，也不能仅凭“训练最终偏向高 Reward”推断长表达式比例必然下降。
 
-当前100步完整文法分层run已经出现直接证据：前50步到后50步，有效候选平均节点数由6.74升至11.16，Reward P90由0.05416降至0.03520；两个半程内节点数与Reward的相关性分别约为-0.32和-0.35。该现象仍可能包含早期训练和logZ校准影响，尚不足以确定最终稳态，但必须作为长跑监控和后续方法研究的最高优先级问题。
+当前100步完整文法分层run已经出现直接证据：前50步到后50步，有效候选平均节点数由6.74升至11.16，Reward P90由0.05416降至0.03520；两个半程内节点数与Reward的相关性分别约为-0.32和-0.35。该现象仍可能包含早期训练和logZ校准影响，尚不足以确定最终稳态，但已足以要求独立处理复杂度层覆盖，而不能假设继续训练会自动消失。
 
-后续评估必须先按节点数分层记录候选数量、唯一结构数、Reward/IC尾部、训练侧通过密度及长度层累计Reward质量，再判断是否干预。可研究方向包括：仅供搜索使用且完整审计的复杂度先验、按长度层校准终态质量、分层采样或配额、较小搜索边界对照，以及不改变原始Reward的高Reward轨迹重放。任何方案都不得静默修改原始Reward、阶段6筛选指标或验证/OOS隔离合同；课程学习、复杂度先验、重放和长度归一化目前仍是待优化选项，不在本轮训练中启用。
+已确认方法先解析可达节点数层，并让全部`D=F`通过同一个balanced shuffled cycle参加normal discovery和exact-N conditional TB；小型canonical终态空间额外完成100% exhaustive coverage并固定精确TB partition，但不再创建anchor训练路径。后续必须按N记录候选数量、唯一结构数、Reward/IC尾部、训练侧通过密度、TB、有效更新率和depth分布。任何实现都不得静默修改原始Reward、阶段6筛选指标或验证/OOS隔离合同；复杂度Reward、课程学习、重放和长度归一化仍不在本轮方法中启用。
+
+### Reward v2：待优化方向
+
+在当前研报Reward复现完成后，考虑增加一个更对称、可解释的多目标Reward作为独立实验，不覆盖当前基线。
+
+第一版候选采用**Weighted Sum**，暂不使用pilot数据自动标准化；各指标的质量映射$q(\cdot)$根据金融含义、风险偏好和明确阈值预先设定，并在单个run内保持固定：
+
+\[
+Q =
+w_{IC}q_{IC}
++w_{IS}q_{ICStability}
++w_{RET}q_{NetLongMean}
++w_{RS}q_{LongStability},
+\qquad
+\sum_i w_i=1.
+\]
+
+最终保留现有Barra风险折扣：
+
+\[
+\boxed{
+R = Q\left(1-\mu_B\cdot BarraCorr\right)
+}
+\]
+
+四个质量维度分别表示：
+
+- `q_IC`：平均RankIC的预测强度；
+- `q_ICStability`：IC时间序列稳定性，具体指标待确认，可考虑`std(IC_t)`的反向质量、分期一致性等；
+- `q_NetLongMean`：扣除交易成本后的多头超额收益均值；
+- `q_LongStability`：净多头超额收益的时间稳定性，第一候选可用`std(net_long_excess_t)`的反向质量，也可后续比较downside deviation、正收益胜率等定义；
+- `BarraCorr`：继续使用现有`max_k |corr_k|`，通过$1-\mu_B BarraCorr$独立惩罚传统风险因子暴露。
+
+这里不再直接使用`ICIR`或`LongIR`作为Reward项，目的是把“均值水平”和“时间稳定性”拆开，减少同一均值信息在IR中重复进入Reward。
+
+权重$w_i$、各$q(\cdot)$映射阈值/尺度以及$\mu_B$均作为待研究参数，优先依据经济意义和风险偏好设定少量候选配置，再仅使用训练期做敏感性分析，不通过validation/OOS精细调参。
+
+同时保留**weighted geometric**作为后续独立对照：
+
+\[
+R_{\rm geo} =
+q_{IC}^{w_{IC}}
+q_{ICStability}^{w_{IS}}
+q_{NetLongMean}^{w_{RET}}
+q_{LongStability}^{w_{RS}}
+\left(1-\mu_B BarraCorr\right).
+\]
+
+该对照用于比较Weighted Sum的“目标之间允许补偿”和geometric的“单项短板惩罚更强”哪一种更适合Alpha discovery。
+
+暂不纳入第一版的内容包括Alpha-pool novelty、动态regime、learned weights和在线动态normalization；等基础因子池建立后再研究。
 
 ### Barra 相关性惩罚为何采用最大绝对相关性
 

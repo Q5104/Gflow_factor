@@ -9,6 +9,7 @@ from torch import Tensor
 
 from factor_gfn.grammar import (
     TOTAL_ACTIONS,
+    ExactNodeGrammarState,
     GrammarState,
     OpenSlot,
     PartialNode,
@@ -16,6 +17,8 @@ from factor_gfn.grammar import (
     get_action,
     get_operator,
 )
+
+PolicyGrammarState = GrammarState | ExactNodeGrammarState
 
 HOLE_TOKEN_ID = TOTAL_ACTIONS
 PAD_TOKEN_ID = TOTAL_ACTIONS + 1
@@ -42,7 +45,7 @@ class _NodeRecord:
 
 @dataclass(frozen=True, slots=True)
 class StateBatch:
-    states: tuple[GrammarState, ...]
+    states: tuple[PolicyGrammarState, ...]
     open_slots: tuple[tuple[OpenSlot, ...], ...]
     token_ids: Tensor
     depths: Tensor
@@ -59,6 +62,7 @@ class StateBatch:
     slot_mask: Tensor
     legal_token_mask: Tensor
     auxiliary_features: Tensor
+    condition_features: Tensor
 
     def to(self, device: torch.device | str) -> "StateBatch":
         updates = {
@@ -79,6 +83,7 @@ class StateBatch:
                 "slot_mask",
                 "legal_token_mask",
                 "auxiliary_features",
+                "condition_features",
             )
         }
         return replace(self, **updates)
@@ -138,20 +143,27 @@ class StateAdapter:
     def __init__(self, search_space: SearchSpaceConfig = SearchSpaceConfig()) -> None:
         self.search_space = search_space
 
-    def _validate_state(self, state: GrammarState) -> None:
+    def _validate_state(self, state: PolicyGrammarState) -> None:
         if state.done:
             raise ValueError("终止状态没有前向动作，不能送入策略网络")
         if state.search_space != self.search_space:
             raise ValueError("GrammarState 与 StateAdapter 的 SearchSpaceConfig 必须等价")
 
-    def batch(self, states: list[GrammarState] | tuple[GrammarState, ...]) -> StateBatch:
+    def batch(
+        self,
+        states: list[PolicyGrammarState] | tuple[PolicyGrammarState, ...],
+    ) -> StateBatch:
         states = tuple(states)
         if not states:
             raise ValueError("states 不能为空")
         for state in states:
             self._validate_state(state)
 
-        all_records = tuple(_node_records(state.root) for state in states)
+        structural_states = tuple(
+            state.state if isinstance(state, ExactNodeGrammarState) else state
+            for state in states
+        )
+        all_records = tuple(_node_records(state.root) for state in structural_states)
         all_slots = tuple(state.open_slots() for state in states)
         batch_size = len(states)
         max_nodes_in_batch = max(len(records) for records in all_records)
@@ -182,8 +194,11 @@ class StateAdapter:
             (batch_size, max_slots, TOTAL_ACTIONS), dtype=torch.bool
         )
         auxiliary_features = torch.zeros((batch_size, 3), dtype=torch.float32)
+        condition_features = torch.zeros((batch_size, 2), dtype=torch.float32)
 
-        for batch_index, (state, records, slots) in enumerate(zip(states, all_records, all_slots)):
+        for batch_index, (state, structural_state, records, slots) in enumerate(
+            zip(states, structural_states, all_records, all_slots, strict=True)
+        ):
             path_to_node = {record.path: index for index, record in enumerate(records)}
             for node_index, record in enumerate(records):
                 token_ids[batch_index, node_index] = record.token_id
@@ -222,15 +237,30 @@ class StateAdapter:
                 slot_parent_token_ids[batch_index, slot_index] = record.parent_token_id
                 slot_mask[batch_index, slot_index] = True
                 legal_token_mask[batch_index, slot_index] = token_mask
-                remaining_nodes = (state.max_nodes - state.node_count) / state.max_nodes
-                depth_denominator = max(state.max_depth, 1)
-                remaining_depth = (state.max_depth - slot.depth) / depth_denominator
-                holes = state.pending_slots / (state.max_nodes + 1)
+                remaining_nodes = (
+                    self.search_space.max_nodes - state.node_count
+                ) / self.search_space.max_nodes
+                depth_denominator = max(self.search_space.max_depth, 1)
+                remaining_depth = (
+                    self.search_space.max_depth - slot.depth
+                ) / depth_denominator
+                holes = state.pending_slots / (self.search_space.max_nodes + 1)
                 slot_budget_features[batch_index, slot_index] = torch.tensor(
                     (remaining_nodes, remaining_depth, holes), dtype=torch.float32
                 )
 
-            auxiliary_features[batch_index] = torch.from_numpy(state.auxiliary_features())
+            auxiliary_features[batch_index] = torch.from_numpy(
+                structural_state.auxiliary_features()
+            )
+            if isinstance(state, ExactNodeGrammarState):
+                condition_features[batch_index] = torch.tensor(
+                    (
+                        state.target_node_count / self.search_space.max_nodes,
+                        (state.target_node_count - state.node_count)
+                        / self.search_space.max_nodes,
+                    ),
+                    dtype=torch.float32,
+                )
 
         if not bool(slot_mask.any(dim=1).all()):
             raise RuntimeError("非终止状态必须至少存在一条规范前向边")
@@ -253,6 +283,7 @@ class StateAdapter:
             slot_mask=slot_mask,
             legal_token_mask=legal_token_mask,
             auxiliary_features=auxiliary_features,
+            condition_features=condition_features,
         )
 
 
@@ -268,4 +299,5 @@ __all__ = [
     "ROLE_ROOT",
     "StateAdapter",
     "StateBatch",
+    "PolicyGrammarState",
 ]

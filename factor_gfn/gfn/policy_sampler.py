@@ -13,14 +13,20 @@ from factor_gfn.grammar import (
     OPERATOR_TO_INDEX,
     WINDOWS,
     DAGAction,
+    ExactNodeGrammarState,
     GrammarState,
     get_action,
 )
 
 from .config import SamplingConfig
 from .model import ForwardPolicyNetwork
-from .state_adapter import StateAdapter
-from .trajectory import Trajectory, TrajectoryStep, state_hash
+from .state_adapter import PolicyGrammarState, StateAdapter
+from .trajectory import (
+    Trajectory,
+    TrajectoryStep,
+    state_hash,
+    target_condition_fingerprint,
+)
 
 
 _COMPACT_DIAGNOSTIC_SIZE = 24
@@ -425,24 +431,53 @@ def sample_trajectories(
     *,
     num_trajectories: int,
     sampling_config: SamplingConfig = SamplingConfig(),
-    initial_states: Sequence[GrammarState] | None = None,
+    initial_states: Sequence[PolicyGrammarState] | None = None,
+    target_node_counts: Sequence[int] | None = None,
     batched_policy_diagnostics: bool = False,
 ) -> list[Trajectory]:
     """批量推进所有未终止状态，并保留前向概率的计算图。"""
 
     if isinstance(num_trajectories, bool) or not isinstance(num_trajectories, int) or num_trajectories < 1:
         raise ValueError("num_trajectories 必须是正整数")
+    if target_node_counts is not None and len(target_node_counts) != num_trajectories:
+        raise ValueError("target_node_counts 数量必须等于 num_trajectories")
     if initial_states is None:
-        states = [
-            GrammarState(
-                search_space=adapter.search_space,
-            )
+        structural_sources = [
+            GrammarState(search_space=adapter.search_space)
             for _ in range(num_trajectories)
         ]
+        if target_node_counts is None:
+            states: list[PolicyGrammarState] = structural_sources
+        else:
+            states = [
+                ExactNodeGrammarState(source, target_node_count=target)
+                for source, target in zip(
+                    structural_sources, target_node_counts, strict=True
+                )
+            ]
     else:
         if len(initial_states) != num_trajectories:
             raise ValueError("initial_states 数量必须等于 num_trajectories")
-        states = list(initial_states)
+        if target_node_counts is None:
+            states = list(initial_states)
+        else:
+            states = []
+            for initial_state, target in zip(
+                initial_states, target_node_counts, strict=True
+            ):
+                if isinstance(initial_state, ExactNodeGrammarState):
+                    if initial_state.target_node_count != target:
+                        raise ValueError(
+                            "initial_state 与 target_node_counts 的目标 N 不一致"
+                        )
+                    states.append(initial_state)
+                else:
+                    states.append(
+                        ExactNodeGrammarState(
+                            initial_state,
+                            target_node_count=target,
+                        )
+                    )
         if any(state.done for state in states):
             raise ValueError("初始状态必须全部为非终止状态")
 
@@ -601,6 +636,20 @@ def sample_trajectories(
             terminal_state_hash=state_hash(state),
             terminal_expression=state.to_expression(),
             sampling_mode="greedy" if sampling_config.greedy else "stochastic",
+            target_node_count=(
+                state.target_node_count
+                if isinstance(state, ExactNodeGrammarState)
+                else None
+            ),
+            terminal_node_count=state.node_count,
+            condition_fingerprint=(
+                target_condition_fingerprint(
+                    state.target_node_count,
+                    state.search_space.fingerprint(),
+                )
+                if isinstance(state, ExactNodeGrammarState)
+                else None
+            ),
         )
         for index, state in enumerate(states)
     ]
@@ -614,7 +663,8 @@ def sample_trajectory(
     adapter: StateAdapter,
     *,
     sampling_config: SamplingConfig = SamplingConfig(),
-    initial_state: GrammarState | None = None,
+    initial_state: PolicyGrammarState | None = None,
+    target_node_count: int | None = None,
 ) -> Trajectory:
     initial_states = None if initial_state is None else [initial_state]
     return sample_trajectories(
@@ -623,6 +673,9 @@ def sample_trajectory(
         num_trajectories=1,
         sampling_config=sampling_config,
         initial_states=initial_states,
+        target_node_counts=(
+            None if target_node_count is None else [target_node_count]
+        ),
     )[0]
 
 
