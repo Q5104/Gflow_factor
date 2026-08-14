@@ -3,7 +3,13 @@ import unittest
 from pathlib import Path
 
 
-NOTEBOOK = Path(__file__).resolve().parents[1] / "notebooks" / "run_complexity_conditioned_diagnostic_6_20.ipynb"
+NOTEBOOK = (
+    Path(__file__).resolve().parents[1]
+    / "notebooks"
+    / "archive"
+    / "diagnostics"
+    / "run_complexity_conditioned_diagnostic_6_20.ipynb"
+)
 
 
 class HistoricalComplexityDiagnosticNotebookTests(unittest.TestCase):

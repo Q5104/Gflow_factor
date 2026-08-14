@@ -3,7 +3,7 @@
 > 状态：初版、持续更新  
 > 建立日期：2026-08-04  
 > 最近同步：2026-08-13
-> 当前阶段：阶段 1–4 工程验收及阶段 6 前置防泄露合同已完成；阶段 5 已冻结 `6/20` no-anchor 搜索边界并完成正式架构、checkpoint 与 synthetic smoke，等待人工运行 Step 12 训练健康检查
+> 当前阶段：阶段 1–4 工程验收及阶段 6 前置防泄露合同已完成；阶段 5 已冻结 `6/20` no-anchor 正式配置并进入 1000-step training-only 正式 run
 > 重要说明：本文用于记录开发路线、已确认决策、待确认问题和验收标准，不是不可修改的冻结规格。
 
 ## 1. 项目目标
@@ -1229,6 +1229,7 @@ factor_gfn/
 - 正式6/20 no-anchor seed42合同现已冻结：`max_steps=1000`、batch=8、policy/logZ LR=1e-4/1e-2、policy/logZ max-norm=5/5、retry=3、Adam betas=0.9/0.999、eps=1e-8、weight decay=0、sampling multiplier=10、deterministic algorithms启用，N=17/18继续使用已登记的高方差工程初值。冻结配置指纹为`b6453816d90f89609e506e02d6c8c0a9d3eda37571ea64079ecd91c9ad341789`；运行控制的`TARGET_STEP`不进入配置，首次只到10，检查后从同一新schema checkpoint恢复至1000。所有complexity diagnostic、health、A/B、registry与checkpoint保持只读且不作为正式训练状态恢复来源。
 - 正式入口为`notebooks/run_stage5_no_anchor_formal_6_20.ipynb`，新run schema为`factor_gfn.no_anchor_real_search.v1`，旧scalar/anchor/legacy real-search schema均不得进入。Notebook默认安全锁关闭、首次`MODE=new/TARGET_STEP=10`；10步通过后显式填写同一run绝对目录并设`MODE=resume/TARGET_STEP=1000`。控制台仿照既有real candidate search但压缩为每step一行，记录step/target、optimizer、skip、valid/request、retry、loss、Reward、TB、裁剪、实际更新、entropy、learned-logZ范围、wall time、动态ETA与显存；每步原子保存latest checkpoint、每10步保存归档checkpoint，validation/OOS保持未加载。
 - 正式run `c3a1c2747cbb41dbbb3f8f23e6ddddcb` 的首10步检查已通过并获准从同一checkpoint续跑到1000：run状态为`ready`、current/optimizer step为10/9、无active step或last error；100次Reward请求得到71条valid、100个unique structural hash，唯一skip发生在step 2的N=17 retry耗尽，非法动作率始终为0。9次成功update的loss/TB/梯度/参数更新均有限，delta mean均值约-0.202，normalized entropy均值约0.897，实际policy相对更新从约6.73e-4下降到2.21e-4；显存峰值约161.4 MiB。`checkpoint_latest.pt`和step-10归档均存在，正式config/provider/context/初始化来源指纹一致。Notebook现已清空执行输出并固定为`MODE=resume`、`TARGET_STEP=1000`及该run绝对目录；禁止新建替代run或改配置。
+- 2026-08-14完成入口清理：根目录Notebook只保留数据下载/准备、旧输出格式参考和唯一正式no-anchor训练入口；validation、synthetic/real smoke及Barra手工Notebook删除，参数诊断Notebook统一移入`notebooks/archive/diagnostics/`并标记为只读历史证据。该清理不删除任何`runs/`、checkpoint、exhaustive registry、logZ初始化来源、候选表达式或阶段6可导入记录，也不移除no-anchor依赖的legacy只读/拒绝代码路径。
 
 ## 附录A：暂缓的 Barra 风格因子参考实现
 
