@@ -69,6 +69,8 @@ class RewardResult:
     neutralization_skipped_dates: tuple[str, ...]
     neutralization_skipped_rate: float
     neutralization_skipped_details: tuple[dict[str, int | str], ...]
+    train_long_excess_dates: tuple[str, ...] = ()
+    train_long_excess_values: tuple[float | None, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +115,31 @@ def _dominant_barra(correlations: Mapping[str, float]) -> tuple[str | None, floa
     return max(finite, key=lambda item: abs(item[1]))
 
 
+def _train_long_excess_payload(
+    dates: npt.ArrayLike | None,
+    values: npt.ArrayLike | None,
+) -> tuple[tuple[str, ...], tuple[float | None, ...]]:
+    """Serialize an already-computed Train long-excess series without recomputing it."""
+
+    if dates is None and values is None:
+        return (), ()
+    if dates is None or values is None:
+        raise ValueError("Train long-excess dates and values must be provided together")
+    date_values = np.asarray(dates)
+    excess_values = np.asarray(values, dtype=np.float64)
+    if date_values.ndim != 1 or excess_values.ndim != 1:
+        raise ValueError("Train long-excess dates and values must be one-dimensional")
+    if date_values.size != excess_values.size:
+        raise ValueError("Train long-excess dates and values must have equal length")
+    return (
+        tuple(str(value) for value in date_values),
+        tuple(
+            float(value) if np.isfinite(value) else None
+            for value in excess_values
+        ),
+    )
+
+
 def _invalid_result(
     expression_hash: str,
     reason: str,
@@ -127,6 +154,8 @@ def _invalid_result(
     neutralization_skipped_dates: tuple[str, ...] = (),
     neutralization_skipped_rate: float = 0.0,
     neutralization_skipped_details: tuple[dict[str, int | str], ...] = (),
+    train_long_excess_dates: tuple[str, ...] = (),
+    train_long_excess_values: tuple[float | None, ...] = (),
 ) -> RewardResult:
     correlations = (
         {name: float(penalty.correlations[name]) for name in STYLE_NAMES}
@@ -161,6 +190,8 @@ def _invalid_result(
         neutralization_skipped_dates=neutralization_skipped_dates,
         neutralization_skipped_rate=float(neutralization_skipped_rate),
         neutralization_skipped_details=deepcopy(neutralization_skipped_details),
+        train_long_excess_dates=tuple(train_long_excess_dates),
+        train_long_excess_values=tuple(train_long_excess_values),
     )
 
 
@@ -177,12 +208,18 @@ def combine_reward_components(
     neutralization_skipped_dates: tuple[str, ...] = (),
     neutralization_skipped_rate: float = 0.0,
     neutralization_skipped_details: tuple[dict[str, int | str], ...] = (),
+    train_long_excess_dates: npt.ArrayLike | None = None,
+    train_long_excess_values: npt.ArrayLike | None = None,
 ) -> RewardResult:
     """应用冻结公式并同时保留 raw reward 与 TB 正值 reward。"""
 
     if not expression_hash:
         raise ValueError("expression_hash 不能为空")
     neutralized = config.candidate_industry_neutralization
+    long_dates, long_values = _train_long_excess_payload(
+        train_long_excess_dates,
+        train_long_excess_values,
+    )
     if not np.isfinite(train_ic):
         return _invalid_result(
             expression_hash,
@@ -197,6 +234,8 @@ def combine_reward_components(
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
             neutralization_skipped_details=neutralization_skipped_details,
+            train_long_excess_dates=long_dates,
+            train_long_excess_values=long_values,
         )
     if not np.isfinite(train_long_ir):
         return _invalid_result(
@@ -212,6 +251,8 @@ def combine_reward_components(
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
             neutralization_skipped_details=neutralization_skipped_details,
+            train_long_excess_dates=long_dates,
+            train_long_excess_values=long_values,
         )
     if not np.isfinite(penalty.barra_ts_corr):
         return _invalid_result(
@@ -227,6 +268,8 @@ def combine_reward_components(
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
             neutralization_skipped_details=neutralization_skipped_details,
+            train_long_excess_dates=long_dates,
+            train_long_excess_values=long_values,
         )
 
     clipped_ir = float(np.clip(train_long_ir, 0.0, config.long_ir_cap))
@@ -250,6 +293,8 @@ def combine_reward_components(
             neutralization_skipped_dates=neutralization_skipped_dates,
             neutralization_skipped_rate=neutralization_skipped_rate,
             neutralization_skipped_details=neutralization_skipped_details,
+            train_long_excess_dates=long_dates,
+            train_long_excess_values=long_values,
         )
     reward = max(raw_reward, config.reward_floor)
     correlations = {name: float(penalty.correlations[name]) for name in STYLE_NAMES}
@@ -277,6 +322,8 @@ def combine_reward_components(
         neutralization_skipped_dates=neutralization_skipped_dates,
         neutralization_skipped_rate=float(neutralization_skipped_rate),
         neutralization_skipped_details=deepcopy(neutralization_skipped_details),
+        train_long_excess_dates=long_dates,
+        train_long_excess_values=long_values,
     )
 
 
@@ -580,6 +627,12 @@ class RewardEvaluator:
             neutralization_skipped_dates=skipped_dates,
             neutralization_skipped_rate=skipped_rate,
             neutralization_skipped_details=skipped_details,
+            train_long_excess_dates=(
+                self.evaluation_dates[self.rebalance_indices]
+                if self.evaluation_dates is not None
+                else None
+            ),
+            train_long_excess_values=long_excess,
         )
 
     def evaluate(self, expression_hash: str, factor: npt.ArrayLike) -> RewardEvaluation:
@@ -682,6 +735,16 @@ class RewardEvaluator:
             neutralization_skipped_dates=skipped_dates,
             neutralization_skipped_rate=skipped_rate,
             neutralization_skipped_details=skipped_details,
+            train_long_excess_dates=(
+                self.evaluation_dates[ic.rebalance_indices]
+                if self.evaluation_dates is not None
+                else None
+            ),
+            train_long_excess_values=(
+                long_series.excess_return[ic.rebalance_indices]
+                if self.evaluation_dates is not None
+                else None
+            ),
         )
         self.cache.put(key, result)
         return RewardEvaluation(result=result, cache_hit=False)

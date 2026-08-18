@@ -419,6 +419,7 @@ class TrainingStats:
     model_parameter_update_norm: float | None = None
     model_relative_update_norm: float | None = None
     log_z_update: float | None = None
+    log_z_update_by_N: dict[int, float] | None = None
     sampled_count: int = 0
     effective_batch_size: int = 0
     invalid_reward_count: int = 0

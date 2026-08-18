@@ -114,6 +114,7 @@ def save_checkpoint(path: str | os.PathLike[str], trainer: "GFNTrainer") -> None
         "model_state": trainer.model.state_dict(),
         "tb_loss_state": trainer.tb_loss.state_dict(),
         "normalizer_manifest": trainer.tb_loss.normalizer_manifest(),
+        "optimizer_contract": trainer.optimizer_contract(),
         "optimizer_state": trainer.optimizer.state_dict(),
         "step": trainer.step,
         "optimizer_step": trainer.optimizer_step,
@@ -324,6 +325,17 @@ def _load_no_anchor(payload: dict[str, Any], trainer: "GFNTrainer") -> dict[str,
         raise ValueError("deterministic resume requires the same device type")
     if payload.get("normalizer_manifest") != trainer.tb_loss.normalizer_manifest():
         raise ValueError("checkpoint normalizer vector/exact strata mismatch")
+    saved_optimizer_contract = payload.get("optimizer_contract")
+    if saved_optimizer_contract is None:
+        saved_optimizer_contract = {
+            **trainer.optimizer_contract(),
+            "normalizer_optimizer": "adam",
+            "normalizer_learning_rate": trainer.config.training.log_z_learning_rate,
+            "normalizer_momentum": None,
+            "normalizer_active_indices_only": False,
+        }
+    if saved_optimizer_contract != trainer.optimizer_contract():
+        raise ValueError("checkpoint optimizer contract mismatch")
     if payload["normalizer_manifest"].get("mode") != "conditional_vector":
         raise ValueError("no-anchor checkpoint rejects legacy scalar logZ")
     trainer.model.load_state_dict(payload["model_state"], strict=True)

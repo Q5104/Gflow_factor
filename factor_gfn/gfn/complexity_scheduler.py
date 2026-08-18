@@ -24,6 +24,15 @@ def _normalize_strata(values: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(sorted(normalized))
 
 
+@dataclass(frozen=True)
+class ConditionAssignment:
+    """Immutable token identifying one pending condition update."""
+
+    cycle_index: int
+    condition_position_in_cycle: int
+    condition_N: int
+
+
 @dataclass
 class BalancedNodeCountScheduler:
     """Consume a shuffled permutation of every stratum before reshuffling."""
@@ -50,12 +59,42 @@ class BalancedNodeCountScheduler:
         self._rng.shuffle(self.current_permutation)
         self.position = 0
 
-    def next_node_count(self) -> int:
+    def peek(self) -> ConditionAssignment:
+        """Return the pending assignment without consuming it."""
+
+        if self.position < len(self.current_permutation):
+            return ConditionAssignment(
+                cycle_index=self.cycle_index,
+                condition_position_in_cycle=self.position,
+                condition_N=self.current_permutation[self.position],
+            )
+
+        prospective_rng = random.Random()
+        prospective_rng.setstate(self._rng.getstate())
+        prospective_permutation = list(self.resolved_discovery_strata)
+        prospective_rng.shuffle(prospective_permutation)
+        return ConditionAssignment(
+            cycle_index=self.cycle_index + 1,
+            condition_position_in_cycle=0,
+            condition_N=prospective_permutation[0],
+        )
+
+    def commit(self, assignment: ConditionAssignment) -> None:
+        """Consume exactly the assignment returned by :meth:`peek`."""
+
+        if not isinstance(assignment, ConditionAssignment):
+            raise TypeError("assignment must be a ConditionAssignment")
+        pending = self.peek()
+        if assignment != pending:
+            raise ValueError("condition assignment is stale or does not match pending state")
         if self.position == len(self.current_permutation):
             self._start_next_cycle()
-        value = self.current_permutation[self.position]
         self.position += 1
-        return value
+
+    def next_node_count(self) -> int:
+        assignment = self.peek()
+        self.commit(assignment)
+        return assignment.condition_N
 
     def next_batch(self, batch_size: int) -> tuple[int, ...]:
         if not isinstance(batch_size, Integral) or isinstance(batch_size, bool):
@@ -103,4 +142,8 @@ class BalancedNodeCountScheduler:
         self._rng.setstate(state["rng_state"])
 
 
-__all__ = ["BalancedNodeCountScheduler", "SCHEDULER_SCHEMA"]
+__all__ = [
+    "BalancedNodeCountScheduler",
+    "ConditionAssignment",
+    "SCHEDULER_SCHEMA",
+]

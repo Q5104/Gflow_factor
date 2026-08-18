@@ -44,6 +44,7 @@ class _FakeCudaTrainer:
             "backward_cuda_seconds": 0.02,
             "optimizer_cuda_seconds": 0.03,
         }
+        self.last_discovery_trajectory_diagnostics = []
 
     def train_step(self):
         assignment = self.reward_provider.evaluate(Expression.from_prefix([3]))
@@ -58,6 +59,21 @@ class _FakeCudaTrainer:
             reward_median=assignment.reward,
             effective_batch_size=1,
         )
+        self.last_discovery_trajectory_diagnostics = [
+            {
+                "source": "discovery",
+                "target_node_count": 14,
+                "terminal_node_count": 14,
+                "terminal_depth": 6,
+                "structural_hash": "a" * 64,
+                "reward": float(assignment.reward),
+                "log_reward": float(assignment.log_reward),
+                "sum_log_pf": -20.0,
+                "sum_log_pb": -4.0,
+                "selected_log_z": 40.0,
+                "tb_delta": -2.0,
+            }
+        ]
         self.history.append(stats)
         return stats
 
@@ -265,6 +281,25 @@ class RealSearchPersistenceTests(unittest.TestCase):
             self.assertEqual(metrics[-1]["reward_provider_seconds"], 0.50)
             self.assertEqual(metrics[-1]["training_update_seconds"], 0.125)
             self.assertEqual(metrics[-1]["backward_cuda_seconds"], 0.02)
+            trajectory_diagnostics = [
+                json.loads(line)
+                for line in runner.trajectory_diagnostics_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()
+            ]
+            self.assertEqual(
+                [item["logical_step"] for item in trajectory_diagnostics],
+                [1, 2],
+            )
+            self.assertEqual(
+                [item["optimizer_step"] for item in trajectory_diagnostics],
+                [1, 2],
+            )
+            self.assertTrue(
+                all(item["target_node_count"] == 14 for item in trajectory_diagnostics)
+            )
+            self.assertEqual(trajectory_diagnostics[-1]["selected_log_z"], 40.0)
+            self.assertEqual(trajectory_diagnostics[-1]["tb_delta"], -2.0)
             self.assertTrue(runner.latest_checkpoint_path.is_file())
             self.assertTrue(runner._archive_checkpoint_path(2).is_file())
             state = json.loads(
@@ -278,6 +313,11 @@ class RealSearchPersistenceTests(unittest.TestCase):
                 (run_dir / "experiment_manifest.json").read_text(encoding="utf-8")
             )
             self.assertIn(str(run_dir / "experiment_manifest.json"), manifest["artifacts"])
+            self.assertIn(
+                str(runner.trajectory_diagnostics_path),
+                manifest["artifacts"],
+            )
+            self.assertEqual(manifest["trajectory_diagnostic_records"], 2)
             self.assertNotIn(str(runner.tensorboard_dir), manifest["artifacts"])
 
     @patch("factor_gfn.gfn.search_runner.torch.cuda.reset_peak_memory_stats")
@@ -461,19 +501,29 @@ class RealSearchPersistenceTests(unittest.TestCase):
                 {"logical_step": 2, "request_index": 2},
             ]
             metrics = [{"step": 1}, {"step": 2}]
-            kept_evaluations, kept_metrics = _archive_orphans(
+            trajectory_diagnostics = [
+                {"logical_step": 1, "target_node_count": 14},
+                {"logical_step": 2, "target_node_count": 20},
+            ]
+            kept_evaluations, kept_metrics, kept_trajectory_diagnostics = _archive_orphans(
                 run_dir,
                 checkpoint_step=1,
                 evaluations=evaluations,
                 metrics=metrics,
+                trajectory_diagnostics=trajectory_diagnostics,
             )
             self.assertEqual(kept_evaluations, evaluations[:1])
             self.assertEqual(kept_metrics, metrics[:1])
+            self.assertEqual(kept_trajectory_diagnostics, trajectory_diagnostics[:1])
             archives = list((run_dir / "recovery_archives").glob("*.json"))
             self.assertEqual(len(archives), 1)
             archived = json.loads(archives[0].read_text(encoding="utf-8"))
             self.assertEqual(archived["evaluations"], evaluations[1:])
             self.assertEqual(archived["metrics"], metrics[1:])
+            self.assertEqual(
+                archived["trajectory_diagnostics"],
+                trajectory_diagnostics[1:],
+            )
 
 
 if __name__ == "__main__":

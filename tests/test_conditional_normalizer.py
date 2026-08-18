@@ -163,6 +163,32 @@ class ConditionalNormalizerMathTests(unittest.TestCase):
 
 
 class ConditionalNormalizerTrainerTests(unittest.TestCase):
+    def test_plain_sgd_updates_only_active_logz_and_records_per_n_update(self):
+        trainer = GFNTrainer(
+            _conditioned_config(batch_size=1),
+            SyntheticRewardProvider(),
+            device="cpu",
+            normalizer_optimizer="sgd",
+        )
+        self.assertEqual(
+            [group["name"] for group in trainer.optimizer.param_groups],
+            ["policy", "normalizer"],
+        )
+        self.assertEqual(trainer.optimizer.param_groups[1]["momentum"], 0.0)
+        self.assertEqual(trainer.optimizer.param_groups[1]["weight_decay"], 0.0)
+        before = trainer.tb_loss.log_z_by_node_count.detach().clone()
+        stats = trainer.train_step()
+        after = trainer.tb_loss.log_z_by_node_count.detach().clone()
+        changed = torch.nonzero(after != before, as_tuple=False).flatten().tolist()
+        self.assertEqual(len(changed), 1)
+        node_count = changed[0] + 1
+        self.assertEqual(set(stats.log_z_update_by_N or {}), {node_count})
+        self.assertAlmostEqual(
+            stats.log_z_update_by_N[node_count],
+            float(after[changed[0]] - before[changed[0]]),
+        )
+        self.assertEqual(trainer.optimizer_contract()["normalizer_optimizer"], "sgd")
+
     def test_optimizer_groups_are_separate_and_absent_scalars_do_not_move(self):
         trainer = GFNTrainer(
             _conditioned_config(batch_size=1),

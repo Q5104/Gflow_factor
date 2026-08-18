@@ -356,6 +356,7 @@ class RealSearchRunner:
         cuda_environment: dict[str, Any],
         evaluation_records: list[dict[str, Any]] | None = None,
         step_metrics: list[dict[str, Any]] | None = None,
+        trajectory_diagnostics: list[dict[str, Any]] | None = None,
     ) -> None:
         if trainer.device.type != "cuda":
             raise ValueError("RealSearchRunner 拒绝非 CUDA Trainer")
@@ -367,6 +368,7 @@ class RealSearchRunner:
         self.cuda_environment = deepcopy(cuda_environment)
         self.evaluation_records = list(evaluation_records or [])
         self.step_metrics = list(step_metrics or [])
+        self.trajectory_diagnostics = list(trajectory_diagnostics or [])
         self.recording_provider.set_request_index(len(self.evaluation_records))
 
     @property
@@ -376,6 +378,10 @@ class RealSearchRunner:
     @property
     def metrics_path(self) -> Path:
         return self.run_dir / "step_metrics.jsonl"
+
+    @property
+    def trajectory_diagnostics_path(self) -> Path:
+        return self.run_dir / "trajectory_diagnostics.jsonl"
 
     @property
     def latest_checkpoint_path(self) -> Path:
@@ -391,6 +397,10 @@ class RealSearchRunner:
     def _persist_tables(self) -> None:
         _atomic_write_jsonl(self.evaluations_path, self.evaluation_records)
         _atomic_write_jsonl(self.metrics_path, self.step_metrics)
+        _atomic_write_jsonl(
+            self.trajectory_diagnostics_path,
+            self.trajectory_diagnostics,
+        )
 
     def _valid_records(self) -> list[dict[str, Any]]:
         return [
@@ -433,6 +443,7 @@ class RealSearchRunner:
                 "latest_checkpoint": str(self.latest_checkpoint_path),
                 "evaluation_records": len(self.evaluation_records),
                 "step_metric_records": len(self.step_metrics),
+                "trajectory_diagnostic_records": len(self.trajectory_diagnostics),
                 "complete": complete,
             },
         )
@@ -454,6 +465,7 @@ class RealSearchRunner:
                 "optimizer_step": self.trainer.optimizer_step,
                 "history": [asdict(item) for item in self.trainer.history],
                 "performance": self.step_metrics,
+                "trajectory_diagnostic_records": len(self.trajectory_diagnostics),
                 "total_reward_requests": len(self.evaluation_records),
                 "valid_reward_requests": len(valid),
                 "unique_expressions": len(
@@ -483,6 +495,7 @@ class RealSearchRunner:
             self.run_dir / "training_stats.json",
             self.evaluations_path,
             self.metrics_path,
+            self.trajectory_diagnostics_path,
             self.run_dir / "best_candidate.json",
             self.latest_checkpoint_path,
             self.run_dir / "experiment_manifest.json",
@@ -510,6 +523,7 @@ class RealSearchRunner:
                     {record["structural_hash"] for record in self.evaluation_records}
                 ),
                 "valid_main_requests": len(valid),
+                "trajectory_diagnostic_records": len(self.trajectory_diagnostics),
                 "artifacts": [str(path) for path in artifact_paths],
             },
         )
@@ -678,6 +692,13 @@ class RealSearchRunner:
             )
         for tag, value in scalar_values.items():
             self._add_finite_scalar(writer, tag, value, step)
+        for node_count, update in (stats.log_z_update_by_N or {}).items():
+            self._add_finite_scalar(
+                writer,
+                f"diagnostics/log_z_update_by_N/{node_count}",
+                update,
+                step,
+            )
         rewards = np.asarray(
             [
                 float(record["reward"])
@@ -913,6 +934,17 @@ class RealSearchRunner:
                     ))
                 }
                 self.step_metrics.append(metric_record)
+                for trajectory_index, diagnostic in enumerate(
+                    self.trainer.last_discovery_trajectory_diagnostics
+                ):
+                    self.trajectory_diagnostics.append(
+                        {
+                            "logical_step": stats.step,
+                            "optimizer_step": stats.optimizer_step,
+                            "trajectory_index": trajectory_index,
+                            **diagnostic,
+                        }
+                    )
                 self._persist_tables()
                 self.trainer.save_checkpoint(self.latest_checkpoint_path)
                 if (
@@ -1043,7 +1075,12 @@ def _archive_orphans(
     checkpoint_step: int,
     evaluations: list[dict[str, Any]],
     metrics: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    trajectory_diagnostics: list[dict[str, Any]],
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+]:
     kept_evaluations = [
         record
         for record in evaluations
@@ -1052,13 +1089,26 @@ def _archive_orphans(
     kept_metrics = [
         record for record in metrics if int(record.get("step", -1)) <= checkpoint_step
     ]
+    kept_trajectory_diagnostics = [
+        record
+        for record in trajectory_diagnostics
+        if int(record.get("logical_step", -1)) <= checkpoint_step
+    ]
     kept_evaluation_ids = {id(record) for record in kept_evaluations}
     kept_metric_ids = {id(record) for record in kept_metrics}
+    kept_trajectory_diagnostic_ids = {
+        id(record) for record in kept_trajectory_diagnostics
+    }
     orphan_evaluations = [
         record for record in evaluations if id(record) not in kept_evaluation_ids
     ]
     orphan_metrics = [record for record in metrics if id(record) not in kept_metric_ids]
-    if orphan_evaluations or orphan_metrics:
+    orphan_trajectory_diagnostics = [
+        record
+        for record in trajectory_diagnostics
+        if id(record) not in kept_trajectory_diagnostic_ids
+    ]
+    if orphan_evaluations or orphan_metrics or orphan_trajectory_diagnostics:
         recovery_dir = run_dir / "recovery_archives"
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
         _atomic_write_json(
@@ -1068,9 +1118,10 @@ def _archive_orphans(
                 "checkpoint_step": checkpoint_step,
                 "evaluations": orphan_evaluations,
                 "metrics": orphan_metrics,
+                "trajectory_diagnostics": orphan_trajectory_diagnostics,
             },
         )
-    return kept_evaluations, kept_metrics
+    return kept_evaluations, kept_metrics, kept_trajectory_diagnostics
 
 
 def _validate_or_upgrade_cuda_environment(
@@ -1162,11 +1213,14 @@ def resume_real_search_runner(
         saved["cuda_environment"] = cuda_environment
         _atomic_write_json(config_path, saved)
     _atomic_write_json(metadata_path, trainer.run_metadata())
-    evaluations, metrics = _archive_orphans(
+    evaluations, metrics, trajectory_diagnostics = _archive_orphans(
         directory,
         checkpoint_step=trainer.step,
         evaluations=_read_jsonl(directory / "evaluations.jsonl"),
         metrics=_read_jsonl(directory / "step_metrics.jsonl"),
+        trajectory_diagnostics=_read_jsonl(
+            directory / "trajectory_diagnostics.jsonl"
+        ),
     )
     runner = RealSearchRunner(
         settings=settings,
@@ -1177,6 +1231,7 @@ def resume_real_search_runner(
         cuda_environment=cuda_environment,
         evaluation_records=evaluations,
         step_metrics=metrics,
+        trajectory_diagnostics=trajectory_diagnostics,
     )
     runner._persist_tables()
     runner._write_summary(complete=trainer.step == config.training.max_steps)

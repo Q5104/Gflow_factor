@@ -6,6 +6,7 @@ from pathlib import Path
 
 from factor_gfn.gfn import (
     BalancedNodeCountScheduler,
+    ConditionAssignment,
     ComplexitySchedulerConfig,
     GFNConfig,
     GFNTrainer,
@@ -87,6 +88,100 @@ class _RejectAllProvider(SyntheticRewardProvider):
 
 
 class BalancedNodeCountSchedulerTests(unittest.TestCase):
+    def test_peek_is_stable_and_failure_without_commit_does_not_advance(self):
+        scheduler = BalancedNodeCountScheduler((1, 2, 3, 4), seed=17)
+        before = scheduler.state_dict()
+        pending = scheduler.peek()
+
+        self.assertEqual(scheduler.peek(), pending)
+        self.assertEqual(scheduler.state_dict(), before)
+        self.assertEqual(pending.cycle_index, 0)
+        self.assertEqual(pending.condition_position_in_cycle, 0)
+
+        scheduler.commit(pending)
+        self.assertEqual(scheduler.position, 1)
+        self.assertNotEqual(scheduler.peek(), pending)
+
+    def test_commit_rejects_stale_double_and_foreign_assignments(self):
+        scheduler = BalancedNodeCountScheduler((1, 2, 3), seed=5)
+        pending = scheduler.peek()
+        scheduler.commit(pending)
+
+        with self.assertRaisesRegex(ValueError, "stale"):
+            scheduler.commit(pending)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            scheduler.commit(
+                ConditionAssignment(
+                    cycle_index=scheduler.cycle_index,
+                    condition_position_in_cycle=scheduler.position,
+                    condition_N=999,
+                )
+            )
+        with self.assertRaisesRegex(TypeError, "ConditionAssignment"):
+            scheduler.commit((0, 0, 1))  # type: ignore[arg-type]
+
+    def test_transactional_cycles_cover_each_hybrid_condition_once(self):
+        conditions = tuple(range(1, 16))
+        scheduler = BalancedNodeCountScheduler(conditions, seed=42)
+        assignments = []
+        for _ in range(2 * len(conditions)):
+            assignment = scheduler.peek()
+            assignments.append(assignment)
+            scheduler.commit(assignment)
+
+        for cycle_index in range(2):
+            cycle = [
+                assignment
+                for assignment in assignments
+                if assignment.cycle_index == cycle_index
+            ]
+            self.assertEqual(
+                [assignment.condition_position_in_cycle for assignment in cycle],
+                list(range(15)),
+            )
+            self.assertEqual(
+                {assignment.condition_N for assignment in cycle},
+                set(conditions),
+            )
+
+    def test_transactional_shuffle_is_seed_reproducible(self):
+        left = BalancedNodeCountScheduler(tuple(range(1, 16)), seed=20260816)
+        right = BalancedNodeCountScheduler(tuple(range(1, 16)), seed=20260816)
+        left_assignments = []
+        right_assignments = []
+        for _ in range(40):
+            left_pending = left.peek()
+            right_pending = right.peek()
+            left_assignments.append(left_pending)
+            right_assignments.append(right_pending)
+            left.commit(left_pending)
+            right.commit(right_pending)
+        self.assertEqual(left_assignments, right_assignments)
+
+    def test_state_round_trip_preserves_pending_assignment_and_future(self):
+        source = BalancedNodeCountScheduler((1, 2, 3, 4, 5), seed=31)
+        for _ in range(5):
+            pending = source.peek()
+            source.commit(pending)
+        state_at_cycle_boundary = source.state_dict()
+        pending = source.peek()
+        self.assertEqual(source.state_dict(), state_at_cycle_boundary)
+
+        resumed = BalancedNodeCountScheduler((1, 2, 3, 4, 5), seed=999)
+        resumed.load_state_dict(state_at_cycle_boundary)
+        self.assertEqual(resumed.peek(), pending)
+
+        source_future = []
+        resumed_future = []
+        for _ in range(20):
+            source_pending = source.peek()
+            resumed_pending = resumed.peek()
+            source_future.append(source_pending)
+            resumed_future.append(resumed_pending)
+            source.commit(source_pending)
+            resumed.commit(resumed_pending)
+        self.assertEqual(resumed_future, source_future)
+
     def test_requested_counts_are_strictly_balanced_after_complete_cycles(self):
         strata = (2, 4, 7, 9)
         scheduler = BalancedNodeCountScheduler(strata, seed=17)

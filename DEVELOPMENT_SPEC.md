@@ -2,8 +2,8 @@
 
 > 状态：初版、持续更新  
 > 建立日期：2026-08-04  
-> 最近同步：2026-08-13
-> 当前阶段：阶段 1–4 工程验收及阶段 6 前置防泄露合同已完成；阶段 5 已冻结 `6/20` no-anchor 正式配置并进入 1000-step training-only 正式 run
+> 最近同步：2026-08-18
+> 当前阶段：Raw Daily Conditional Hybrid Baseline 已完整完成。正式 Stage 5 为 `N=1..15` Hybrid Exact-TB/LPV 100-cycle run；Stage 6 已完成 Train/Validation 筛选并冻结完整 1610-factor Baseline Pool；三种 Top100 静态策略、Test scores、OOS evaluation 与 reporting 均已冻结。后续新增日频衍生特征或策略优化必须作为独立实验，不覆盖本 Baseline。
 > 重要说明：本文用于记录开发路线、已确认决策、待确认问题和验收标准，不是不可修改的冻结规格。
 
 ## 1. 项目目标
@@ -50,13 +50,13 @@
 ### 3.1 已存在内容
 
 - 独立 Python 3.12 Conda 环境：项目内 `.venv`；
-- 下载与预处理：`factor_gfn/data/`，根目录 `data_loader.py` 仅保留兼容入口；
+- 下载与预处理：`factor_gfn/data/`，正式下载入口由 Notebook 直接调用包内模块；
 - 表达式文法与部分 AST DAG：`factor_gfn/grammar/`；
 - 因子算子、解释器、截面清洗与指标：`factor_gfn/evaluator/`；
 - 五个手工 Barra 风格因子及独立多空收益：`factor_gfn/barra/`；
 - Transformer 前向策略、轨迹、Reward、TB Loss、Trainer 与检查点：`factor_gfn/gfn/`；
 - 手工下载、处理及阶段 2–4 验证入口：`notebooks/`；
-- 单元与集成测试：`tests/`，当前完整测试为 237 项；
+- 单元与集成测试：`tests/`，覆盖数据、文法、Hybrid Stage 5、Stage 6、冻结、策略与 OOS 合同；测试数量随实现演进，不在本规范冻结；
 - 原始数据、断点和处理结果分别位于 `data/raw/`、`data/download_parts/`、`data/processed/`，均不进入 Git；
 - Git 仓库已初始化并已建立项目基线提交；后续修改仍需分阶段审查后提交。
 
@@ -74,19 +74,23 @@
 
 ### 3.3 当前阶段实现状态
 
-- 阶段 1：核心清洗、VWAP、矩阵化及验证已经完成；
-- 阶段 2：52 个算子、142 个 Token、规范化部分 AST、多路径 DAG、父状态枚举和表达式转换已经完成；
-- 阶段 3：全部 52 个数值算子、解释器、候选截面清洗、行业中性化、5 日指标及 Barra 风格计算已经完成；
-- 阶段 4：路径条件化 Transformer、可微采样、Reward 合同、固定均匀 `P_B`、TB Loss、可学习 `logZ`、Trainer、检查点、合成训练闭环、真实数据上下文、真实 Reward 预检及五步最小真实训练已经完成；
-- 点时行业长表已完成全量构建与 QA，并已通过阶段三行业中性化实跑验证；阶段 1–4 的工程验收已完成，阶段 6 前置输入与防泄露合同已提前冻结，当前进入阶段 5 GPU 真实候选训练。五步最小实验只证明真实训练链路与确定性续跑可用，不等同于正式训练结果。
+- 阶段 1–4：数据、PIT 行业、表达式文法、解释器、截面 cleaning、Reward、GFlowNet 基础训练与检查点合同已完成；
+- 阶段 5：正式 Conditional Hybrid run `hybrid_5_15_k16_seed42_20260816T025559Z` 已完成 100 cycles、1500 optimizer steps、24000 trajectories，产生 21261 个唯一候选；
+- 阶段 5 Reporting：`Raw Daily Baseline / Stage 5 Reporting v1` 已冻结；
+- 阶段 6：单一正式 Hybrid source 已完成 Train prefilter、fresh Validation、six-item hard filter 与 Train long-excess decorrelation，漏斗为 `21261 → 6011 → 2815 → 1610`；
+- D1/E3：完整 1610-factor Baseline Pool 已冻结，三策略统一使用 frozen-order Top100 StrategyInput；Development Matrix 与 Static Strategy Bundle 已冻结；
+- OOS：Test features/labels 按 authority gate 解锁，Test scores 与 OOS evaluation 已冻结；241 个调仓期全部有效；
+- Reporting：Stage 5、Stage 6 与 OOS 的真实报告均已生成，具体路径和 fingerprint 见 `BASELINE_DEVELOPMENT_LOG.md`。
 
 ### 3.4 当前执行边界
 
-- 根目录 `data_loader.py` 继续作为兼容入口，正式实现以 `factor_gfn/data/downloader.py` 为准；
-- `industry_sw_daily.parquet` 已生成并通过 QA；正式 Reward 必须启用点时申万一级行业中性化，不再允许静默降级；
-- 长时间下载、真实数据预处理和正式训练由用户手动启动；
-- 不删除未完成的行业断点，不重写原始 Parquet，不将数据、研报、检查点或本地运行结果提交 Git；
-- 真实训练前必须再次核对数据指纹、行业覆盖、Reward 配置、训练/验证日期和运行元数据。
+- 当前 Baseline 的 Stage 5/Stage 6/Factor Pool/StrategyInput/Strategy Bundle/Test scores/OOS artifact 均不得被后续展示或新实验覆盖；
+- Validation/OOS 不得反向改变 Stage 5 Reward、方向、筛选阈值、排序、Factor Pool 或策略；
+- 下载实现以 `factor_gfn/data/downloader.py` 为准，正式手工入口为 `notebooks/download_data.ipynb`；
+- `industry_sw_daily.parquet` 已生成并通过 QA；正式 cleaning 必须使用 point-in-time 申万一级行业中性化，不允许静默降级；
+- 长时间下载、真实数据预处理、训练和真实 OOS 由用户手动启动；
+- 不删除数据断点，不重写原始 Parquet，不将数据、runs、checkpoints 或 outputs 提交 Git；
+- 新增日频衍生特征、LightGBM 参数实验或执行层简化必须使用新分支/新 artifact，并明确与本 Baseline 分离。
 
 ## 4. 原始数据合同
 
@@ -672,7 +676,9 @@ Trainer 最多采样 `10*batch_size` 个候选以补满有效 batch，未补满�
 - 参数冻结后，按完全相同的模型、搜索空间、Reward 与训练配置执行一个或多个独立 seed，并持续记录吞吐、拒绝率、唯一率、策略熵、耗时、显存、检查点和完整候选清单。
 - 若拒绝率持续超过 80%、出现 NaN/Inf、非法动作、显存不足或候选多样性坍缩，先分析原因，不自动改变 Reward、行业中性化、搜索空间或模型规模。
 
-#### 5.3 Complexity-conditioned GFlowNet 重构合同（2026-08-12 已确认，分阶段实现中）
+#### 5.3 Complexity-conditioned GFlowNet 历史重构合同（已被 Conditional Hybrid Baseline 取代）
+
+> **历史状态说明（2026-08-18）**：本节记录 6/20 no-anchor 路线的设计与诊断过程，不再定义当前正式 Stage 5。当前权威合同是 `docs/stage5_hybrid/STAGE5_HYBRID_VARIANCE_DESIGN.md`：grammar-hierarchical、external condition `N=1..15`、`N=1/2` Exact-TB、`N=3..15` direct LPV、`K=16`、100 cycles。若本节的 no-anchor、`max_nodes=20`、learned per-N logZ、step900 或多 seed 计划与当前 Hybrid 合同冲突，以 Hybrid design、真实 manifest 和 `BASELINE_DEVELOPMENT_LOG.md` 为准。
 
 ##### 5.3.1 问题定义、目标分布与不变合同
 
@@ -918,41 +924,554 @@ batch_size = 8
 
 成功标准只看训练健康：per-N delta mean/std与finite TB loss；learned `logZ_N`轨迹、更新幅度和振荡；policy gradient norm、clipping rate、实际参数更新、entropy和non-finite rate；逐N requested/valid/retry-exhausted/successful/effective-update统计；吞吐、factor/reward耗时、GPU显存与wall time；以及checkpoint恢复后的deterministic continuation。32个logical batches只是初始总预算，不能自动代表每个L层证据充分；每个N必须同时报告valid trajectory count与successful gradient exposure，任一不足都只能判`insufficient_evidence`。每层分别保存initialization/pre-update、early、late TB delta，以及initial/current/net-change logZ，防止短run内learned logZ自行修正后掩盖初值失配。只有证据充分且显示异常的N才进入targeted recalibration候选；重校准完成后必须从全新no-anchor training state启动，禁止原Trainer中途重置。短期Reward/IC P90/P99和高质量Alpha数量不用于选择optimizer参数。
 
-### 阶段 6：因子筛选与回测验证
+##### 5.3.10 formal seed42 step900 诊断基线与 learned-logZ 单变量 A/B（2026-08-14 人工确认）
 
-目标：从阶段 5 搜索结果中得到稳定、低相关的 Alpha 池。
+formal seed42 的冻结配置原计划 `max_steps=1000`，实际由人工在 step900 提前停止，用于训练动力学优化。该 run 的正确状态是“人工在 step900 提前停止用于训练动力学优化”，不是 completed 1000-step run；不得为了形式补齐最后 100 步，不得修改 `run_state.json`、checkpoint、evaluations、step metrics、训练统计或 Notebook 已有输出来伪造完成状态。`checkpoint@900` 及全部既有产物保持原样，只作为本轮完整训练动力学诊断基线。
 
-#### 6.1 冻结输入、时间切分与防泄露合同（2026-08-10 已提前完成）
+诊断显示，TB delta 负偏约在 step400–500 形成，持续到 step801–900 并进入稳定平台。N=1/2 fixed exact Z control 没有足够证据表明存在同等程度的全局偏移；主要异常集中于 learned-logZ 的长轨迹，特别是 N=14–20。该结论只用于训练动力学优化，不使用 Reward、IC、Validation 或 OOS 选择 optimizer 参数。
 
-- 本步只建立阶段 6 数据上下文和候选注册表，不重新计算候选指标、不执行筛选或回测。训练、验证、最终样本外请求区间分别固定为 `2010-01-01` 至 `2018-12-31`、`2019-01-01` 至 `2020-12-31`、`2021-01-01` 至 `2025-12-31`，并同时记录各段在交易日轴上的实际首末日期。
-- 三段共用一条从训练期首个五类 Barra 均可评价日期锚定、此后每 5 个交易日延伸的全局调仓日历。计划调仓日若标签越界或 Barra 截面不足，只排除并记录原因，禁止平移补位或在分段边界重新定相位。
-- 收益标签继续使用 `open[t+6] / open[t+1] - 1`；信号日 `t`、入场日 `t+1`、退出日 `t+6` 必须全部位于同一分段。验证和样本外可使用此前历史作为因果时序算子 warmup，但不得使用未来特征或跨边界标签。最终样本外候选评价默认锁定，第一步必须保持评价次数为 0。
-- 多头方向不继承旧 Reward，在后续步骤只按阶段 6 训练期 RankIC 确定并冻结；验证和最终样本外只能复用冻结方向。
-- 候选以运行目录为来源单元，强制配套读取 `evaluations.jsonl` 和 `run_metadata.json`；逐条以 prefix Token 重建表达式并核对公式、结构哈希、节点数、深度及 Provider 指纹。默认只登记主分支搜索候选，确定性重放记录只参与审计。按结构哈希去重并保留全部来源；旧 valid、Reward 和拆解仅作来源信息，不参与阶段 6 排序。
-- 不同 context/provider/reward 口径默认禁止混合；确需导入时必须显式划分兼容组。`experiment_manifest.json`、`best_candidate.json`、`training_stats.json` 和 `determinism_report.json` 如存在则用于辅助完整性审计，不作为候选导入的强制输入。
-- 本步仅创建 `factor_gfn/backtest/__init__.py`、`context.py` 和 `selection.py` 及自动化测试；不创建空壳回测模块，不新增人工验证 Notebook，不写入或修改历史运行产物。
+从后续新 run 开始，`GFNTrainer.last_discovery_trajectory_diagnostics` 已有的逐轨迹字段必须按 logical step 与 N 写入独立、可恢复的 `trajectory_diagnostics.jsonl`：`target_node_count`、`selected_log_z`、`sum_log_pf`、`sum_log_pb`、`log_reward`、`tb_delta`。记录还必须包含 `logical_step`、`optimizer_step` 和 step 内 `trajectory_index`；它属于只读诊断 artifact，不进入优化器或 checkpoint 状态。恢复时，checkpoint step 之后的孤儿诊断与 evaluations、step metrics 使用相同规则归档。不得向 formal seed42 的既有 900 步目录回填该新 artifact。
 
-#### 6.2 联合硬筛选与贪心去相关合同（2026-08-11 已确认）
+实验 A 必须从 fresh seed42、相同初始 policy 和相同原 per-N initial logZ 启动。相对 formal baseline，唯一训练动力学变化是 learned-logZ Adam learning rate 从 `1e-2` 提高到 `2e-2`；policy 继续使用 Adam `1e-4`，policy/logZ 两组 `max_norm=5`，`batch_size=8`、same-N retry budget 3、Adam betas/eps、Reward、搜索空间、scheduler、确定性设置和数据合同全部不变。A 使用独立 config fingerprint、run schema/output root 和 Notebook，先运行 300 个 logical steps，并要求最终 successful optimizer updates 位于 200–300；不要求把该实验运行至 1000 步。
 
-- 阶段 6 不是“训练期先筛完，再由验证期另筛一次”。候选必须先在统一上下文中分别计算训练期与验证期指标，再一次性应用研报披露的联合硬条件。`test_ic`、`test_long_ir` 在项目字段和文档中统一解释为 2019-2020 验证期指标，不得与 2021-2025 最终样本外混用。
-- 联合硬筛选固定为：训练期 `abs(train_ic) > 0.01`、验证期 `abs(validation_ic) > 0.01`、`train_ic * validation_ic > 0`、训练期 `train_long_ir > 0.25`、验证期 `validation_long_ir > 0.25`，以及训练期 `barra_ts_corr < 0.7`。阶段 6 必须重新计算这些指标，阶段 5 保存的 valid、Reward 或拆解只作来源审计。
-- 因子多头方向只由训练期 RankIC 确定并冻结；验证期 Long IR、验证期多头超额收益和最终样本外指标必须沿用该方向，禁止根据验证期或样本外结果再次翻转。
-- 通过联合硬条件的候选按 `abs(train_ic)` 降序进入贪心去相关。候选之间的多头超额收益率序列相关性使用训练期序列估计；与已保留任一因子的相关性达到或超过 `0.7` 时不保留，全部低于 `0.7` 时才加入 Alpha 池。
-- 训练期同时承担排序、Barra 去暴露和候选池相关结构确定，保持同一信息集。训练期约 386 个有效调仓期，显著多于验证期约 97 期；后者在扣除 warmup、缺失和严格行业中性化失败日期后更容易接近 60 期最低共同样本门槛，不作为第一版相关结构选择样本。
-- 验证期仍须计算候选的 Barra 相关及候选两两多头超额收益相关，作为风格漂移、同质化和跨阶段稳定性诊断并持久化；这些诊断不得在本轮筛选中改变阈值、排序或贪心结果。若未来采用 `max(train_corr, validation_corr)` 或训练与验证拼接相关性，必须登记为新的筛选实验口径，不得覆盖第一版结果。
-- 2021-2025 最终样本外在联合硬筛选、方向、排序、阈值和 Alpha 池全部冻结前保持锁定；样本外只做最终评价，不参与淘汰、补选、翻转方向或调整相关阈值。
+A 的判断只比较逐 N、尤其 N=14–20 的 delta mean/std/RMS、selected logZ 追踪速度与净变化、TB RMS、振荡、非有限值、梯度与裁剪、successful gradient exposure 和数值稳定性，不使用 Reward/IC 选择参数。暂不修改 policy LR、policy clip、batch size，也不得使用 formal step900 logZ 初始化 fresh run。若 A 仍明显追踪不足，才建立独立实验 B：只把 learned-logZ optimizer 改为 plain SGD，保留 `max_norm=5`，并单独校准 SGD learning rate；policy optimizer 仍保持 Adam。A 与 B 不得同时改变其他变量。
 
-上述安排保留研报明确授权的验证用途，即通过 `validation_ic`、方向一致性和 `validation_long_ir` 检验预测能力延续，同时避免在数千候选上反复利用同一短验证期构造相关矩阵并优化池结构。它不宣称训练期相关性优于其他方案，而是第一版复现中可审计、较少额外假设的选择。
+### 阶段 6：候选统一评价、筛选与 Alpha Pool 冻结
 
-#### 6.3 后续工作
+> **完成状态更新（2026-08-18）**：以下合同已由单一正式 Hybrid Stage 5 source 执行完成。当前漏斗为 `21261 → 6011 → 2815 → 1610`；完整 1610-factor Baseline Pool、Top100 StrategyInput、三策略、Test scores 与 OOS evaluation 均已冻结。早期文中关于“provisional 尚未 final”“OOS 仍锁定”或 no-anchor 多来源的描述只用于解释当时的防泄漏设计，不再代表当前运行状态；当前权威 artifact 见 `BASELINE_DEVELOPMENT_LOG.md`。
 
-- 样本内、验证集和最终样本外指标；
-- 研报硬性筛选条件的可配置实现；
-- 表达式结构去重；
-- 截面相关性和多头收益序列相关性分析；
-- 贪心去相关；
-- 分组、多头、多空、换手和交易成本分析；
-- 按年份和市场阶段检查稳定性。
+目标：从阶段 5 及已批准历史来源产生的候选表达式中，构建可重复执行、可增量导入、来源可审计的统一筛选流水线，最终得到稳定且低相关的 Alpha Pool。
+
+Stage 6 的程序允许在 Stage 5 尚未完成全部计划 seed 时提前开发和验证。当前已有候选可以按冻结合同取得 Train/Validation 指标并生成 provisional Alpha Pool；Train 默认由 Stage 6 新算，但允许使用通过严格等价验证的 Stage 5 Train artifact；Validation 默认由 Stage 6 fresh 计算，只有通过当前 Stage 6 context、来源合同、结果指纹、表达式身份和冻结方向完整校验的既有 Stage 6 Validation 才允许作为只读缓存复用。provisional 结果不得表述为最终 Alpha Pool，也不得用于解锁最终样本外。
+
+同一套 Stage 6 程序必须同时支持：
+
+1. 当前不完整候选集合上的 `provisional` 运行；
+2. 全部计划 Stage 5 seed 完成后的 `final` 运行；
+3. final Alpha Pool 冻结后的独立 `oos_evaluation`。
+
+provisional 与 final 必须使用完全相同的表达式兼容性、Train 指标取得、Validation 评价/可信缓存校验、方向、硬筛选、排序和贪心去相关规则。二者的差别只能是候选来源是否完整、运行状态是否获准标记为 final，以及 OOS 是否允许解锁。
+
+#### 6.1 冻结时间切分、标签与全局调仓日历
+
+训练、验证和最终样本外请求区间固定为：
+
+```text
+Train:
+2010-01-01 至 2018-12-31
+
+Validation:
+2019-01-01 至 2020-12-31
+
+OOS:
+2021-01-01 至 2025-12-31
+```
+
+项目字段统一使用 `validation_ic` 和 `validation_long_ir` 表示研报筛选公式中的 `test_ic` 和 `test_long_ir`。`test` 不得用于指代 2021–2025 最终样本外。
+
+三段必须共用同一条固定五交易日调仓日历。日历从训练期首个五类 Barra 均满足评价条件且收益标签完整的日期锚定，此后沿完整交易日轴每五个交易日延伸。不得在 Validation 或 OOS 边界重新确定相位。
+
+收益标签固定为：
+
+```text
+forward_return_5d[t] = open[t+6] / open[t+1] - 1
+```
+
+信号日 `t`、入场日 `t+1` 和退出日 `t+6` 必须全部位于同一分段。若标签跨越分段边界，该调仓期只能排除并记录原因，不得移动、补位或从相邻分段借用标签。
+
+Validation 和 OOS 可以读取其分段开始日期以前的历史特征，用于因果时序算子的 warmup，但不得读取未来数据，不得使用跨边界收益标签。
+
+#### 6.2 候选来源与历史指标边界
+
+Stage 6 候选可以来自：
+
+- N=1/2 exhaustive registry；
+- 当前 no-anchor formal run；
+- 后续使用相同正式合同训练的其他 seed；
+- 经人工确认允许进入 Stage 6 的历史 run。
+
+人工确认针对允许导入的历史 run/source 清单，不要求人工逐个审计全部候选。每个候选仍必须通过自动表达式兼容性审计；只有自动审计无法证明语义兼容的少量候选进入人工检查。
+
+旧模型或旧 checkpoint 能否恢复到当前训练架构，与旧候选表达式能否进入 Stage 6 是两个独立问题。禁止仅因训练架构或 checkpoint schema 不兼容而删除候选表达式。
+
+Stage 6 必须区分：
+
+1. 表达式计算语义是否与当前 Grammar、operator registry 和 Interpreter 兼容；
+2. 来源文件中保存的历史指标是否可作为当前 Stage 6 指标复用。
+
+不同的 generation config、provider、Reward 或 data/context fingerprint，不自动导致表达式被拒绝。只要表达式可以通过当前语义兼容性审计，就允许导入。历史指标默认不得复用；只有某一来源批次通过本节规定的 Train 合同静态等价检查和有限候选数值复核后，才允许复用该批次已保存且定义完全一致的 Train 指标。无法证明等价的来源仍由 Stage 6 重新计算 Train。
+
+Stage 5 保存的下列字段始终只作为来源审计，不得进入 Stage 6 筛选：
+
+- `valid`；
+- Reward；
+- Reward 拆解及拒绝原因。
+
+Stage 5 保存的 `train_ic`、`train_long_ir`、`train_barra_ts_corr`、五个带符号 `barra_correlations`、对应有效期数和中性化诊断默认也只作来源审计。只有来源批次被批准为 `TRAIN_METRICS_REUSABLE` 后，这些 Train 字段才可以进入当前旧候选的已验证 `train_reuse_overlay`，并由独立 hybrid evaluation contract 消费。Stage 5 Reward、`valid`、Reward floor、Reward 排名或其他搜索期派生量即使来自获准批次，也不得进入 Stage 6 硬筛选、排序、方向确定或贪心去相关。
+
+##### 6.2.1 来源批次与第一层静态合同等价检查
+
+Train 复用采用“来源批次整批批准 / 整批拒绝”，不做逐候选语义迁移。一个来源批次必须由稳定的 source/run 清单以及同一套 Train data context、evaluation config、Provider/Interpreter/operator 数值语义和 implementation identity 定义。不同 Train 合同指纹、数据版本、日历、实现版本或无法证明同源的记录不得混成同一复用批次。
+
+每个拟复用批次必须逐项证明下列 Train 语义与当前 Stage 6 Train 合同完全一致：
+
+- Train 请求日期范围及实际交易日边界；
+- 固定五交易日调仓日历、锚点、相位、实际日期清单及日期摘要；
+- `open[t+6] / open[t+1] - 1` 标签、入场/退出边界和跨分段标签排除规则；
+- FactorInterpreter、Token/operator registry 及所有相关数值 kernel 语义；
+- 候选截面清洗顺序、参数和失败处理；
+- 1%/99% winsorize；
+- 申万一级点时行业中性化、未知行业处理和失败日期处理；
+- `ddof=0` z-score；
+- RankIC 的逐期实现、最低截面数、固定日历取值和汇总口径；
+- Long portfolio、基准超额、Long IR 及年化口径；
+- 五个 Barra 风格、候选原始 Long-Short、共同有效期及 `barra_ts_corr=max_k |corr_k|` 实现；
+- 底层行情、股票池、行业、Barra 暴露、日期/股票轴、data/context/evaluation config 指纹；
+- 相关 implementation schema、source hash 或其他可以绑定实际执行代码的 implementation fingerprint。
+
+静态比较必须使用双方规范化后的 **Train-scope contract projection**。不得因为 Stage 5 context 只含 Train、而 Stage 6 全量 context 还包含 Validation，就要求两个全量 context fingerprint 字符串直接相等；但 Train projection 所绑定的底层数据、日期、配置、日历和实现证据必须逐项一致。该 scope 归一化只用于消除 manifest 外层范围差异，不得忽略任何会影响 Train 数值的字段。
+
+只要有一项不一致、缺失、语义版本含糊，或现有 artifact 不能证明实际运行时使用了相应实现，整个来源批次立即标记：
+
+```text
+TRAIN_REUSE_NOT_ALLOWED
+```
+
+该批次不进入数值复核，也不为其开发 Provider 专用转换器、旧版本兼容层或逐候选迁移逻辑；候选表达式仍可正常导入，Train 指标由 Stage 6 新算。
+
+##### 6.2.2 第二层有限候选数值复核
+
+通过静态检查的每个新复用类别，确定性选择 24 个已保存完整有限 Train 指标的代表候选；若合格候选不足 24 个则全部复核。样本选择只使用结构信息，覆盖可用的短/长表达式、unary/binary、TS/CS，以及不同 node count/depth；某类在来源中不存在时按冻结顺序重分配名额，不根据 Reward 或历史指标优劣挑样本。
+
+使用当前 Stage 6 evaluator 在同一 Train contract 下重新计算，并逐项比较：
+
+- `train_ic` 和 `train_ic_valid_periods`；
+- `train_direction`；
+- `train_long_ir` 和 `train_long_valid_periods`；
+- `train_barra_ts_corr`；
+- 五个带符号 `train_barra_correlations`；
+- `train_barra_valid_periods_by_style`；
+- 双方均已保存且定义完全一致的其他 Train 诊断字段。
+
+整数、方向、字段集合、日期集合及失败状态必须完全相同。有限浮点数固定使用：
+
+```text
+abs(stage5 - stage6)
+<= 1e-12 + 1e-10 * max(abs(stage5), abs(stage6))
+```
+
+缺失值或非有限值的类别必须一致，不得把一个有限值与缺失/非有限值判为通过。复核 artifact 必须绑定来源批次、source snapshot/source-set fingerprint、Train contract projection、24 个候选的确定性选择方法和 structural hash、逐字段旧值/新值/误差/结论、数值容差、当前实现与运行环境指纹。
+
+只有全部样本、全部必核字段均通过时，整个来源批次才标记：
+
+```text
+TRAIN_METRICS_REUSABLE
+```
+
+只要出现一个无法解释的差异，整个来源批次标记 `TRAIN_REUSE_NOT_ALLOWED`，不得逐候选选择性复用。批次获准复用只表示其合同可信；若批次内某个候选本身缺少完整 Train 字段，该候选仍按“无 reusable artifact”处理并由 Stage 6 新算，不为缺失字段开发迁移逻辑。
+
+该 24 候选复核主要用于旧 Stage 5 → 当前 Stage 6 的迁移验证。未来 Stage 5 与 Stage 6 若直接共用同一个正式 Train evaluation contract、Train context fingerprint 和 implementation fingerprint，则同一已批准 reuse class 下的新 seed 不必重复执行 24 候选复核；任一相关指纹变化都形成新的 reuse class，默认回到 `TRAIN_REUSE_NOT_ALLOWED`，直到重新通过两道门。
+
+正式 no-anchor seed42 已由人工在 step900 提前停止并冻结为训练动力学诊断基线，不再补跑至原定 1000 步。本次规范修改不得恢复其进程、修改 checkpoint、改变 evaluations schema 或重写历史记录。只有基于该 step900 冻结来源快照，才能按上述两道门判断其已有 Train 指标是否可复用；不得将其标记为 completed 1000-step run。
+
+跨来源候选按 canonical `structural_hash` 去重。每个唯一表达式只评价一次，但必须保留全部 provenance。provenance 数量、seed 数量、run 数量、source type、节点数和复杂度信息均不得进入第一版筛选评分或排序。
+
+#### 6.3 provisional、final 与 oos_evaluation 状态定义
+
+Stage 6 运行状态至少区分：
+
+```text
+provisional
+final
+oos_evaluation
+```
+
+`provisional` 表示：
+
+- Stage 5 当前正式 run 或计划中的其他 seed 尚未全部完成；
+- 当前来源清单只是某一明确截止时点的候选快照；
+- 运行可按冻结的 fresh/reuse 合同取得完整 Train 指标；只有通过三项 Train 必要条件的候选才新算 Validation，随后执行不变的联合硬筛选和贪心去相关；
+- 结果只能命名为 provisional/interim Alpha Pool；
+- 不得声称搜索已完成或 Alpha Pool 已最终冻结；
+- 不得根据 provisional 结果调整冻结阈值、方向、排序或去相关规则；
+- provisional manifest 的指纹不得作为解锁 OOS 的 selection fingerprint。
+
+`final` 表示：
+
+- 计划纳入的 Stage 5 seed 已完成；
+- 所有获准进入正式 Stage 6 的 exhaustive、正式和历史来源均已登记；
+- 来源完整性已经人工确认；
+- 使用与 provisional 完全相同的 Stage 6 合同重新从候选导入开始执行；
+- Alpha Pool、方向、阈值、排序、贪心选择结果和来源 manifest 已全部冻结；
+- 已生成不可歧义的 final selection fingerprint。
+
+provisional 结果不得直接改名或升级为 final。即使候选集合没有变化，也必须以 final 模式重新执行并生成新的 final manifest。
+
+从 `provisional` 转为 `final` 必须经过人工明确批准，程序不得仅根据 Stage 5 step 数、候选数量或文件是否停止变化自动判断来源已经完整。
+
+`oos_evaluation` 只能在 final Alpha Pool 及其 selection fingerprint 已冻结并通过完整性校验后进入；其输出只属于最终样本外评价，不得回写 final 池结构。
+
+当前 Stage 6 只处于 `provisional` 开发与验证阶段。
+
+#### 6.4 Stage 6 指标取得、缓存来源与方向冻结
+
+所有通过表达式兼容性审计的唯一候选都必须在同一个 Stage 6 Train/Validation 语义合同下取得筛选所需指标。Train 默认由 Stage 6 新算，但允许从 `TRAIN_METRICS_REUSABLE` 来源批次读取已验证的 Train 指标；只有通过三项 Train 必要条件的候选才进入 Validation 阶段。Validation 默认由当前 Stage 6 fresh 计算；已经存在的 Validation 结果只有在当前 context、来源 evaluation contract、immutable result fingerprint、表达式身份和冻结 Train direction 全部校验通过时才允许作为只读缓存复用。复用只改变重复计算策略，不改变指标定义、筛选输入或数值口径。
+
+最终至少持久化：
+
+```text
+train_ic
+validation_ic
+
+train_long_ir
+validation_long_ir
+
+train_barra_ts_corr
+validation_barra_ts_corr
+
+train_long_excess_series
+validation_long_excess_series
+
+train_direction
+```
+
+联合硬筛选以前，`train_long_excess_series` 可以暂时缺失，但 `train_ic`、`train_long_ir`、`train_barra_ts_corr`、五个 Train Barra 相关拆解、有效期数和方向来源必须完整可审计。所有 hard-filter survivors 在排序和贪心去相关以前必须具有按同一 Train 合同生成的完整 `train_long_excess_series`；若获准复用的旧 artifact 未保存该序列，只对这些 survivors 补算 Train long-excess，不对未通过硬筛选的候选补算。
+
+Stage 6 的冻结执行顺序为：
+
+```text
+候选
+-> 查找 verified reusable Train artifact
+-> 有：读取获准复用的 Train 指标
+-> 无：Stage 6 新算 Train 指标
+-> 先应用三项 Train 必要条件；必败者标记 train_prefilter_failed
+-> 仅对仍可能通过六项联合条件的候选新算 Validation 指标和 Validation long-excess
+-> 六项联合硬筛选
+-> 对 hard-filter survivors 确保 Train long-excess 完整
+-> abs(train_ic) 排序
+-> 训练期 long-excess 贪心去相关
+```
+
+因子方向只能由训练期 RankIC 确定：
+
+```text
+train_ic > 0  -> train_direction = +1
+train_ic < 0  -> train_direction = -1
+```
+
+`train_ic` 非有限或等于零时，方向不可定义，该候选不得进入有效筛选候选集合。
+
+复用 Train 指标时，`train_direction` 必须由复用的 `train_ic` 按上述规则重新确认，并与 artifact 中保存的方向一致；不一致时不得使用该 artifact。禁止读取 Stage 5 Reward 的正负号、排序或其他派生字段替代方向。
+
+Validation 的 IC 原始符号用于训练/验证方向一致性判断；Validation Long IR、多头超额收益序列以及后续 OOS 指标必须使用训练期冻结方向。禁止根据 Validation 或 OOS 表现重新翻转方向。
+
+六项硬筛选所需的 Train 指标必须已通过 verified Stage 5 reuse 或 Stage 6 fresh evaluation 取得。先统一应用三项 Train 必要条件；失败候选显式记录 `train_prefilter_failed`，由于其不可能通过最终六项联合筛选，不进入 Validation 阶段。Train-pass 候选必须取得经过完整性校验的缓存 Validation 或当前 Stage 6 fresh Validation，之后才能一次性应用原六项联合硬筛选。该提前停止只改变计算顺序，不增加第七项筛选条件，也不得把未评价的 Validation 条件伪报为失败。允许延后到 hard-filter survivors 才补算的只有此前确实缺失的 Train long-excess series；不得延后或跳过 Train-pass 候选六项硬筛选中的任何指标。
+
+##### 6.4.1 当前旧候选的临时 Train reuse overlay
+
+当前 provisional 优化采用独立、不可变的 `train_reuse_overlay`，不为旧候选建设未来正式的 Train artifact 数据库或新的 Train-side cache 命名空间。overlay 以冻结的 source batch、source snapshot、structural hash、Train-scope contract 和复核结果为依据；accepted registry 继续作为不可变的候选与 provenance 注册表，不得因 Train 指标复用而重写、扩列或改变 fingerprint。
+
+只有两道门通过且 verification artifact 完整性校验成功的来源批次才允许进入 overlay。overlay 中只能保存来源实际持久化且已通过验证的 Train 字段；缺失字段不得推断、伪造或从 Reward 等派生量反推。读取旧指标所需的 source locator 必须解析到已冻结的物化 snapshot，不得绕过 source-set fingerprint 读取仍在增长的原始 run。
+
+当前混合评价路径继续使用现有 EvaluationStore，但 Train preparation 与 Validation evaluation 必须使用彼此独立的合同和 store。第二阶段保存的是“frozen verified/fresh Train summary + verified cached/fresh Validation”组成的确定性 Stage 6 结果，不得将 overlay 中只有 Train 指标的记录伪装成完整 Stage 6 evaluation result。cache key、result fingerprint 与下游 selection manifest 必须绑定 overlay fingerprint、Train reuse verification fingerprint、冻结 Train-pass manifest、Stage 6 context/evaluation contract 及确定性结果。
+
+每个合并后的 Stage 6 评价结果至少记录：
+
+```text
+train_metric_origin = stage5_verified_reuse | stage6_fresh_evaluation
+train_source_id
+train_source_snapshot_fingerprint
+train_reuse_verification_fingerprint
+train_evaluation_contract_fingerprint
+
+validation_metric_origin = stage6_fresh_evaluation | verified_prior_stage6_validation_reuse
+stage6_context_fingerprint
+stage6_evaluation_contract_fingerprint
+```
+
+若 Train long-excess 后补，还必须记录其 `stage6_fresh_long_excess` 来源和对应 contract fingerprint。结果 fingerprint 继续排除耗时、创建时间和输出路径。未经批准的历史指标不得进入 overlay 或混合评价结果；批准 artifact 损坏、批次状态被撤销、来源 snapshot 改变或指纹不一致时必须 fail-closed，不得静默回退到旧值。候选可以按明确记录的 fallback 原因改走现有 full-fresh Stage 6 路径，但不得继续使用失效的旧指标。
+
+同一 structural hash 若来自多个获准批次，只有 Train contract fingerprint 一致且重叠字段在冻结容差内一致时才可合并进同一 overlay 记录。出现冲突时不得任意择一或逐候选拼接；相关批次的复用资格进入 fail-closed 审查，该候选可以安全回退为 Stage 6 fresh Train evaluation。
+
+##### 6.4.2 后续 Stage 5 轻量 Train artifact
+
+本小节是 provisional Alpha Pool 跑通后的长期优化方向，不属于当前 9A–9D 临时复用批次，也不得据此恢复或修改已在 step900 人工停止的正式 seed42。
+
+后续新 seed 可以在不改变 Reward、采样、TB、optimizer 或训练数学逻辑的前提下，为每个真正完成 Train 评价的唯一候选额外保存轻量 artifact：
+
+```text
+structural_hash
+train_evaluation_contract_fingerprint
+train_ic
+train_ic_valid_periods
+train_direction
+train_long_ir
+train_long_valid_periods
+train_long_excess_dates
+train_long_excess_values
+train_barra_ts_corr
+train_barra_correlations
+train_barra_valid_periods_by_style
+neutralization_diagnostics
+```
+
+artifact 必须绑定 source run、Provider/context/implementation fingerprint 和稳定 schema，并采用不可变、可增量恢复的持久化方式。不得保存完整 `(date, stock)` factor matrix；Stage 6 需要的是少量 Train 指标及约数百个调仓期的 long-excess 序列，完整矩阵会造成不必要的磁盘与 I/O 开销。
+
+该新输出合同优先从后续新 seed 开始。已在 step900 人工停止的正式 seed42 不得回填或采用新 schema；如存在安全的离线只读导出方式，可以从冻结的 evaluation records 中提取当时已实际保存的字段，但不得恢复或修改训练状态，不得伪造当时未保存的 long-excess，缺失字段按 Stage 6 fresh evaluation 处理。
+
+#### 6.5 冻结的联合硬筛选
+
+第一版 Stage 6 联合硬筛选固定为：
+
+```text
+abs(train_ic) > 0.01
+abs(validation_ic) > 0.01
+train_ic * validation_ic > 0
+train_long_ir > 0.25
+validation_long_ir > 0.25
+train_barra_ts_corr < 0.7
+```
+
+所有比较均为严格不等式：
+
+- `abs(IC) == 0.01` 不通过；
+- Long IR `== 0.25` 不通过；
+- `train_barra_ts_corr == 0.7` 不通过。
+
+任何必需指标为 NaN、Inf 或无法计算时，候选不得通过联合硬筛选，并必须记录评价失败原因。
+
+六项条件必须一次性作用于同一份已经完成 Train 指标取得和可信缓存/fresh Validation 的 Train-pass 候选结果。Train 字段无论来自 verified reuse 还是 Stage 6 fresh evaluation，都必须遵循同一冻结定义。三项 Train 必要条件只用于无损提前停止，不能被解释为单独产生最终入选结论；Validation 完整后仍须对同一候选一次性执行原六项联合条件，不得改写成验证期二次阈值调节或增删条件。
+
+每个候选必须保存：
+
+```text
+hard_filter_pass
+failed_conditions
+```
+
+`failed_conditions` 必须列出全部未通过条件，不得在遇到第一个失败条件后停止记录。
+
+冻结阈值不得因 provisional pool 数量过少、候选通过率过低或某个 seed 表现不佳而调整。第一版冻结筛选条件必须显式配置、写入指纹并在运行时校验一致性。任何不同阈值只能作为未来独立实验口径，必须使用不同 schema/config fingerprint，且不得覆盖第一版结果。
+
+#### 6.6 冻结排序规则
+
+通过联合硬筛选的候选严格按照以下顺序排序：
+
+1. `abs(train_ic)` 降序；
+2. 若 `abs(train_ic)` 完全相同，则按 `structural_hash` 升序作为稳定 tie-break。
+
+不得引入以下排序项：
+
+- Stage 5 Reward；
+- Validation IC 综合评分；
+- Train/Validation 加权分；
+- provenance 次数；
+- seed 或 run 数量；
+- node count、depth 或复杂度惩罚；
+- Barra 综合评分；
+- 自定义质量分。
+
+排序只允许使用训练期 `abs(train_ic)` 和确定性 structural-hash tie-break。
+
+#### 6.7 冻结的贪心去相关规则
+
+候选按照 6.6 的冻结顺序逐个扫描。
+
+相关性只使用按训练期方向构造的训练期多头超额收益序列。对当前候选与所有已保留候选计算共同有效期相关性：
+
+```text
+if common_valid_periods < 60:
+    decorrelation_invalid
+elif corr is NaN or Inf:
+    decorrelation_invalid
+elif abs(corr) >= 0.7:
+    reject
+else:
+    retain
+```
+
+共同有效调仓期少于 60，或相关系数为 NaN/Inf 时，候选判为 `decorrelation_invalid`，不得自动保留。必须保存 `common_valid_periods`、失败原因以及被比较的 retained factor structural hash。该 60 期最低共同有效期是项目第一版工程口径，不标记为研报披露。
+
+相关阈值比较使用绝对值。`abs(corr) == 0.7` 时必须拒绝。
+
+每个因相关阈值被拒绝的候选必须保存：
+
+```text
+greedy_retained = false
+blocked_by_structural_hash
+blocking_corr
+common_valid_periods
+```
+
+每个无法完成有效去相关判断的候选必须保存：
+
+```text
+greedy_retained = false
+decorrelation_invalid = true
+decorrelation_failure_reason
+compared_with_structural_hash
+common_valid_periods
+```
+
+`blocked_by_structural_hash` 指向实际触发相关阈值拒绝的已保留候选。若实现采用 early stop，必须保证 retained 扫描顺序确定，从而使 blocker 和 invalid 记录可以重复得到。
+
+Validation 的 Barra 相关性和候选间多头超额收益相关性只作为稳定性诊断持久化，不得改变硬筛选、排序、保留顺序或 Alpha Pool 结构。
+
+当前版本不使用 clustering、DPP、全局组合优化或完整候选两两相关矩阵替代冻结的贪心算法。
+
+#### 6.8 OOS 锁定与解锁条件
+
+在 final Alpha Pool 完成以前，2021–2025 OOS 必须保持锁定。
+
+provisional 模式下禁止：
+
+- 请求或计算任何候选的 OOS IC、Long IR、Barra 相关或收益序列；
+- 使用 OOS 判断表达式兼容性；
+- 使用 OOS 调整阈值、方向、排序或相关结构；
+- 生成可以被误认为正式 OOS 结果的空壳或预览文件。
+
+只有同时满足以下条件，才能进入独立的 `oos_evaluation` 状态：
+
+1. 当前 Stage 6 运行被人工确认属于 final；
+2. final 来源 manifest 已冻结；
+3. 所有候选的 Train 指标已按 verified reuse/fresh contract 取得；所有通过三项 Train 必要条件、仍可能通过联合筛选的候选，其 Validation 指标均已由 Stage 6 新算；
+4. 六项硬筛选规则及结果已冻结；
+5. 训练期方向和排序已冻结；
+6. 贪心 Alpha Pool 已冻结；
+7. final selection fingerprint 已生成并通过完整性校验。
+
+OOS 只对 final Alpha Pool 中已经冻结的因子做最终评价。OOS 结果无论好坏，均不得：
+
+- 淘汰因子；
+- 补选候选；
+- 翻转方向；
+- 修改阈值；
+- 重新排序；
+- 改变贪心池结构；
+- 替换表现较差的 Alpha。
+
+如需基于 OOS 结果修改方法，只能定义为新的后续研究版本，不能回写或覆盖当前 final Alpha Pool。
+
+#### 6.9 当前执行边界
+
+当前 Stage 5 正式训练及计划中的多 seed 尚未全部完成，因此当前 Stage 6 只能处于 provisional 开发与验证阶段。
+
+当前允许：
+
+- 开发候选导入和 provenance 审计；
+- 开发表达式兼容性审计；
+- 建立统一 Train/Validation evaluation context 和 Train-scope contract projection；
+- 对当前候选执行默认 fresh Train/Validation 评价；
+- 开发来源批次级 Train reuse 静态审计、有限数值复核、独立 overlay 和 hybrid evaluation contract；
+- 执行冻结的联合硬筛选、排序和贪心去相关；
+- 生成明确标记的 provisional Alpha Pool；
+- 使用 provisional 运行发现工程、性能和数据合同问题。
+
+当前禁止：
+
+- 宣告 Stage 5 已完成；
+- 将 provisional pool 改名为 final pool；
+- 根据 provisional 结果调整 `0.01 / 0.25 / 0.7`；
+- 使用 Validation 重新确定方向或相关结构；
+- 计算或查看 2021–2025 OOS 候选表现；
+- 删除旧候选、历史 run、evaluations、registry 或 checkpoint；
+- 因旧训练架构不能恢复而排除语义兼容的历史表达式；
+- 自动进入下一开发阶段或启动长时间真实运行。
+
+现有 full-fresh evaluator 继续作为安全基线且不接受历史字段；9A 已生成独立 verified Train reuse overlay，9B 已通过独立 hybrid contract 接入现有 EvaluationStore。两条路径的 cache key 与 result fingerprint 完全隔离，既有 Stage 6 evaluation cache 和 provisional selection 产物保持原样，不回写、不升级，也不原地改造成新流程结果。当前旧候选临时优化仍必须严格按 9A → 9B → 9C → 9D 分批实施和验收，不得自动跨越人工门禁。9A–9C 已完成独立验收；9D 的可观察入口已实现，Notebook 不设置额外布尔安全锁，但长任务仍只由用户手工运行相应执行单元格。
+
+##### 6.9.1 9A：来源批次复用可行性审计
+
+9A 只回答哪些旧来源可以严格复用、可覆盖多少候选以及实际保存了哪些 Train 字段，不进入全量 Validation、survivor enrichment 或筛选：
+
+- 基于冻结 source-set、snapshot、accepted registry 和 provenance locator 读取来源实际保存的 Train 字段；不得修改 accepted registry，也不得读取 snapshot cutoff 之后新增的 seed42 记录；
+- 对每个来源批次执行 6.2.1 的静态 Train 合同等价检查；implementation identity、data/context identity 或关键评价语义无法证明一致时，整批标记 `TRAIN_REUSE_NOT_ALLOWED`，不为旧 Provider 开发专用迁移器；
+- 对通过静态门的每个来源类别确定性选取 24 个代表候选，按 6.2.2 执行逐字段数值复核；任一无法解释的超容差差异使整个来源批次拒绝复用；
+- 生成独立 `train_reuse_overlay`、verification artifact 和稳定 fingerprint，明确记录每批批准/拒绝状态、reason codes、字段完整性、覆盖候选数及覆盖率；
+- 9A 完成后停止并一次性验收，不自动进入 9B。
+
+##### 6.9.2 9B：hybrid screening evaluator 与收益门槛
+
+9B 在保留现有 full-fresh evaluator 作为安全基线的前提下，实现“verified reusable Train summary + fresh Validation”的混合评价路径。六项硬筛选只消费所需的 Train summary 与 fresh Validation 指标；此时不要求旧候选已经具有 Train long-excess series。硬筛选与后续贪心去相关必须保持为两个可独立执行的阶段。
+
+混合路径继续使用现有 EvaluationStore，并通过新的 hybrid contract 与 overlay fingerprint 隔离缓存。不得把 partial Train overlay 当作完整 evaluation cache，不得覆盖现有 full-fresh 结果；同一候选若不具备合格 overlay 记录，必须明确回退为 full-fresh Train/Validation evaluation。
+
+9B 必须使用确定性选取的真实 mixed smoke，在尽量相同的候选、Stage 6 context、执行环境和缓存状态下比较：
+
+```text
+full fresh total_seconds
+verified Train reuse + fresh Validation total_seconds
+factor_seconds
+Train evaluation seconds saved
+Validation evaluation seconds
+overall speedup ratio
+verified reuse candidate count / coverage ratio
+projected full-run total time / projected hours saved
+```
+
+缓存命中、resume skip、冷启动/热启动和其他一次性开销必须分别报告，不能混入复用本身的收益。由于 Validation 的时序算子 warmup 仍可能要求 FactorInterpreter 计算到 2020 年，不能把“少评价 Train”直接等同于按年份比例缩短总耗时。
+
+9B → 9C 是强制人工 go/no-go 门禁，不设置未经实测批准的自动数值阈值。只有复用覆盖率和真实端到端 speedup 足以证明继续开发 survivor long-excess enrichment 有实际收益，并由用户明确批准后，才允许进入 9C。若 FactorInterpreter 仍占绝大多数时间、总体提速有限或预计全量节省不足以抵偿临时架构复杂度，则在 9B 停止旧候选复用优化，保留审计产物并回到现有 full-fresh Stage 6 路径；这不改变任何筛选定义。
+
+2026-08-14 的 9B 真实 mixed smoke 已在同一 Stage 6 context 下冻结 12 个候选（6 个 overlay 命中、6 个未命中），分别执行 full-fresh 与 hybrid evaluation；12/12 的 fresh Validation 确定性结果完全一致，6/6 复用候选的 Train IC、Train Long IR 和 Train Barra TS corr 均在冻结容差内一致，未命中候选全部明确回退 full-fresh。两条 run 均为 12/12 完成、0 failed；重复执行均记录 12 个 `resume_skipped`、0 普通 cache hit；对一个复用候选和一个 fresh-fallback 候选执行 determinism bypass，result fingerprint 均一致。9A overlay 覆盖 9,328 / 19,513，即 47.804%。
+
+2026-08-15 对静态拒绝的 Provider-v6 批次 `bd9b609cd73000ff007622ec20a15eb18ad1c26f674795f43b47d6218151da15` 完成了独立、只取证的数值复核。该批次有 7,407 条完整历史 Train 记录；排除已由当前 overlay 覆盖的 462 条后，实际待证明总体为 6,945 条。静态投影除旧版未声明 `encoding_schema` / `projection` 以及数值内核从 `rolling_moments.v1`、`numba_ts_loops.v1` 升级为 `numba_cpu_loops.v2` 外，没有发现其他合同差异。按 metric-blind 结构覆盖规则确定性抽取 24 条，并消费当前 Train preparation 中已经以完全相同 Stage 6 context `68473a86353ee806e5c2d04e0474493670776009e73ebf08959f64e3756d0912` 和 evaluation contract `4e9055c8e382c36ec69132450a37a218a77f5ee003460d4418741309834facc4` fresh 完成、且 `validation_evaluation_count=0` 的结果。冻结容差 `atol=1e-12`、`rtol=1e-10` 下仅 14/24 全字段通过，10/24 失败：10 条的 Train IC 和五项 Barra 相关均发生超容差变化，9 条的 Train Long IR 也变化，1 条另有中性化失败日有效股票/行业计数差异；最大绝对差分别约为 Train IC `2.2824e-4`、Train Long IR `0.19170`、Barra 单项相关 `0.03531`。样本内三项 Train 初筛 pass/fail 恰未翻转，但这不能替代字段数值等价要求。最终结论冻结为 `EQUIVALENCE_EVIDENCE_FAILED`，不得批准这 6,945 条 v6 指标整体复用；现有 overlay、Train preparation 缓存和运行状态均未修改。v2 证据 fingerprint 为 `433c909b0f60c8fe3508879e0f3cbb17a82e37170204a4de06fecf332ede1384`，manifest 位于 `runs/stage6/provisional/v6_equivalence_verifications/433c909b0f60c8fe3508879e0f3cbb17a82e37170204a4de06fecf332ede1384/v6_equivalence_manifest.json`。
+
+2026-08-15 按资源受限的 provisional Stage 6 特例冻结本轮 evaluation universe。冻结前确认旧 Train preparation Notebook 单元格已停止，旧 EvaluationStore 主库在观察窗口内无写入；未中断任何额外进程，也未修改或清理旧 SQLite/result。19,513 个 accepted candidates 按 structural hash 去重后，9,328 个 verified Stage 5 Train overlay 与 1,645 个当前统一合同下已有可信 Train 结果交集为 0、并集严格为 10,973；这 10,973 个构成本轮 evaluation-eligible universe。其余 8,540 个候选记录为 `deferred_train_recompute`，其中 5,831 个原因为 `historical_train_contract_not_equivalent`，2,709 个原因为 `no_trusted_train_result_resource_limited`；deferred 不是筛选失败或删除，structural hash、provenance 与来源记录均保留，未来 final Stage 6 可以重新评价后重新生成完整 Alpha Pool。冻结副本仅以 cache-only 方式解析 10,973/10,973 条结果，cache hit 为 10,973、newly evaluated 为 0、Validation evaluation count 为 0；Train 三项初筛得到 2,680 pass、8,293 fail。provisional universe fingerprint 为 `6b40c8825715e4ff03360127183501159628b4a1436105972ad4bb1eb411ccf0`，manifest 位于 `runs/stage6/provisional/resource_limited_evaluation_universes/6b40c8825715e4ff03360127183501159628b4a1436105972ad4bb1eb411ccf0/provisional_evaluation_universe_manifest.json`。本轮后续 Validation、六项联合硬筛、survivor long-excess、排序、greedy decorrelation 与 provisional Alpha Pool 必须只消费该 eligible universe，并在所有下游 manifest 中保留原 accepted、eligible、deferred 计数及 deferred 原因；该限制不扩展为 final Stage 6 合同。
+
+收益门禁不得直接使用 full-fresh 先运行、hybrid 后运行所产生的跨运行 factor/Validation 时间差，因为其中可能混入 OS/Numba 热缓存和候选顺序影响。权威 9B 报告因此采用保守 estimator：只计入复用候选实际省掉的 Train evaluation seconds，完全排除 factor 与 Validation 的跨运行差异。该样本中每个复用候选平均节省约 2.659 秒 Train evaluation；按 47.804% 覆盖率投影，19,513 个候选约节省 24,807 秒（6.89 小时），总体时间约下降 25.82%，保守 speedup 约 1.35x。该结果构成“继续 9C 具有实际收益”的工程建议，但不自动解锁 9C；仍须用户明确作出 go 决策。权威 smoke fingerprint 为 `cf840b12a1b84dab463479346c30376a22d425b7650f2df9024458ff9def48b2`。较早的 `6c2e6732eee9d43511ce9df060937b91c5364453dfbb6b9c64075fb3bc9585cb` 仅保留为已被保守 estimator 取代的顺序敏感审计产物，不得用于 go/no-go 结论。
+
+##### 6.9.3 9C：hard-filter survivor long-excess enrichment
+
+9C 只有在 9B 人工 go 决策后才实施：
+
+- 先以 verified Train summary 与 fresh Validation 完成冻结的六项联合硬筛选；
+- 只对 hard-filter survivors 检查 Train long-excess series 是否存在，缺失者才使用当前 Stage 6 Train 合同补算该序列；
+- enrichment 只补足贪心去相关缺失的输入，不得重算或覆盖已经批准复用的 `train_ic`、`train_long_ir`、`train_barra_ts_corr` 或 Barra correlations；
+- 补算时必须核对 `train_direction` 与复用 Train IC 所确定的方向一致；不一致时 fail-closed 并保留原因，不得静默翻转；
+- survivors 输入完整后，继续按冻结的 `abs(train_ic)` 排序、稳定 tie-break 和训练期 long-excess 贪心去相关规则生成 provisional Alpha Pool。
+
+9C 完成后停止并单独验收，不自动进入全量运行。
+
+2026-08-14 已完成 9C 实现与真实 bounded engineering smoke。单候选 enrichment 使用独立 contract，只执行 current Interpreter、冻结 Train 清洗和 preserved Train direction 下的 long-excess 构造；它不得输出或覆盖 Train IC、Train Long IR、Train Barra 指标或 Train direction。方向必须由 preserved `train_ic` 重新推导并与 preserved direction 完全一致，Train long 有效期数也必须与复用摘要一致；任一不一致均标记 `enrichment_invalid`，即使候选排序第一也不得自动保留。9C 产物绑定 base mixed-evaluation result fingerprint、enrichment result/contract fingerprint、selection contract 和全部输入顺序；耗时不进入确定性结果 fingerprint。已有产物重复读取时必须重新核验 manifest 及各 JSONL 的 size/SHA-256，损坏即 fail-closed。
+
+按用户明确批准的工程覆盖口径，本次只从 verified overlay 中依据 `abs(train_ic)>0.01`、`train_long_ir>0.25`、`train_barra_ts_corr<0.7` 三项 Train 条件筛选，再按 structural hash 升序固定前 24 条；预选过程未读取任何 Validation 信息。全部 24 条随后 fresh 计算 Validation，未作逐候选提前淘汰。联合六项硬筛选得到 8 个 survivors；8/8 均实际执行 Train long-excess enrichment，方向和有效期数全部一致，0 enrichment invalid。冻结排序和 greedy decorrelation 后保留 7 条，1 条因与已保留因子训练期 long-excess 的相关系数约 `0.784429` 而标记 `rejected_by_correlation`，0 `decorrelation_invalid`。该 smoke 的 fingerprint 为 `edacdaf7830d0bbb442ea8d3739cdecfad9f06ca72cdbb46a6626ec26d79125e`，enriched-selection fingerprint 为 `e6ae5c3383d293c27a1f20ba63789fc57c7065f09a0cd67368d47c06745a8e91`。其 scope 固定为 `engineering_branch_coverage_not_provisional_selection`，`provisional_selection_result=false`，不得把 7 条 retained 解释为 provisional Alpha Pool，也不得据此调整任何阈值。9C 当前完成并停止；19,513 条全量评价、可观察 Runner/Notebook 和 provisional selection 仍属于 9D，必须另行人工批准。
+
+##### 6.9.4 9D：全量可观察运行与人工启动
+
+9D 只有在 9C 完成并再次获得人工批准后才开发。日常人工运行只提供一个统一观察入口：
+
+```text
+run_stage6_provisional_pipeline.ipynb
+```
+
+统一 Notebook 只负责编排，不合并或重构 evaluator、EvaluationStore、hard filter、survivor enrichment 和 greedy selection 的底层职责。原 `run_stage6_full_train_validation_evaluation.ipynb` 与 `run_stage6_provisional_selection.ipynb` 已删除；日常和人工调试只保留统一入口，历史结果仍按各自冻结合同只读保留。
+
+用户侧冻结顺序为：取得 verified reuse 或 fresh Train 指标并立即应用三项 Train 必要条件；只对 Train-pass 候选 fresh 计算 Validation，或复用通过当前 Stage 6 context、来源 evaluation contract 和 immutable result fingerprint 完整性校验的旧 Validation；必要评价完整后、正式六项硬筛选之前，对 **Train-prefilter-pass 且已完成必要 Stage 6 评价** 的候选显示 Train `train_ic` 固定宽度直方图及 count、mean、median、`ddof=0` std、min、max；随后执行原六项联合硬筛选、仅对 survivors 补齐 Train long-excess、`abs(train_ic)` 稳定排序、训练期 long-excess greedy decorrelation 和 provisional Alpha Pool。直方图只作观察，不写回结果，不参与任何条件、排序、阈值或贪心决定。
+
+9D 不再采用逐候选融合的“Train → prefilter → Validation”长任务。为优先保证阶段语义、冻结边界和人工可观察性，正式入口必须拆成两个全局、独立、可恢复的阶段；接受 Train-pass fresh 候选因此再次运行一次 FactorInterpreter 的额外成本，不得为了节省该成本重新合并阶段。
+
+**阶段 1：Train preparation + Train prefilter** 必须在第一次执行前一次性冻结完整 accepted registry、候选顺序、Stage 6 context、Train-only evaluation contract 和 verified Stage 5 overlay identity。对全部 19,513 条候选准备 Train 指标：先处理 overlay 命中者，直接读取已批准 Stage 5 Train summary 且不得调用 `FactorInterpreter`；随后处理其余候选并 fresh 计算 Train。每个候选取得或算出 Train 指标后，必须立即应用 `abs(train_ic)>0.01`、`train_long_ir>0.25`、`train_barra_ts_corr<0.7` 三项必要条件，并把 pass/fail、逐条件结果及失败代码随该候选 Train 结果原子持久化；不得等全部 Train 指标完成后才首次统一判定。旧 470 条 Stage 6 完整结果中的 Train 指标明确不得在本阶段复用。该运行的每条结果都必须把 Validation 标记为 `not_evaluated_train_preparation_phase`，`validation_evaluation_seconds=0`，整个阶段的 Validation evaluation count 始终为 0。只有完整 Train run 达到 `complete`、所有 immutable cache 结果及已持久化 Train 初筛决定重新校验且无 determinism conflict 后，才汇总并冻结最终不可变 `train_pass_manifest`；不完整运行不得提前物化或扩展该清单。
+
+**阶段 2：Validation evaluation** 只消费阶段 1 冻结的 `train_pass_manifest`、其中的候选顺序以及对应 Train result fingerprints。该阶段不得重新计算、重新判定或改变 Train 初筛结论，也不得读取旧 Stage 6 Train 指标替换冻结 Train。旧 470 条结果只允许作为 Validation 候选缓存：必须同时通过当前 Stage 6 context、来源 evaluation contract、immutable result fingerprint、structural hash / expression identity 和冻结 Train direction 校验；任一项不符即放弃该条旧 Validation 并 fresh 计算，不得降级复用其 Train。第二阶段完成后才形成六项正式筛选的完整输入。
+
+两个阶段分别使用独立 evaluation contract、run scope、run ID、SQLite、output root 和 entry manifest。阶段 1 scope 固定为 `train_preparation_full_accepted_registry`，阶段 2 scope 固定为 `validation_from_frozen_train_pass_manifest`。`MAX_NEW_EVALUATIONS` 只限制各自单次 invocation 的真实 evaluation attempts，不得把小 run 原地扩成全量 run；恢复时已完成候选须重新通过不可变 cache 完整性校验并单独计为 `resume_skipped`，普通跨 run cache 解析仍计为 `cache_hit`。两个 Notebook 执行单元分别显示独立进度。阶段 1 面板必须拆开显示 verified Stage 5 Train 的总数/已初筛/pass/fail、fresh Train 的待算/已算/pass/fail、当前累计 Train-pass、当前候选、elapsed、ETA、RSS，并持续显示 Validation completed 为 0。
+
+2026-08-14 原 9D 全量路径曾以 `full_accepted_registry_train_validation_evaluation` scope 启动，但实测 FactorInterpreter 主导总耗时，用户在 470 / 19,513 条形成不可变结果后中断。旧 SQLite、entry manifest 和 470 条结果必须原样保留，不删除、不重算、不原地变更合同；新流程只把其中完整且通过缓存完整性核验的结果作为只读 prior full-result seeds。
+
+同日先实现的融合 scope `train_prefilter_then_validation_full_registry` 已被上述两阶段正式入口取代，不再作为日常运行或 provisional selection 输入。其已有 SQLite、entry manifest 和已完成结果继续只读保留，不删除、不改合同；不得把该不完整融合 run 原地迁移为阶段 1 或阶段 2。数学上无损的 Train 必败预淘汰规则保持不变：`abs(train_ic)>0.01`、`train_long_ir>0.25`、`train_barra_ts_corr<0.7` 任一失败即记录真实 Train 失败代码且不进入 Validation；这不是第七项硬筛选，正式 selection 仍应用原六项条件。
+
+当前 overlay 覆盖 9,328 / 19,513 条；其中仅按冻结 Train 三项且完全不读取 Validation，2,544 条通过、6,784 条必败，因此这 6,784 条可以在阶段 1 完成并冻结清单后避免 Validation。其余 10,185 条缺少 verified Stage 5 Train，阶段 1 必须逐条 fresh 计算 Train，并在每条完成时立即判定和持久化。旧 470 条完整结果不减少阶段 1 的 Train 工作量；它们只在阶段 2 作为候选 Validation seed，实际可复用数量必须由新的阶段 2 合同现场校验后报告，不得预先把 470 全部计作命中。
+
+基于旧 470 条完整结果的观测均值，单候选 `factor_seconds≈3.615`、Train evaluation `≈1.785`、Validation evaluation `≈0.993`；旧无 overlay 的 256 条中有 22 条通过 Train 三项，样本通过率约 8.59%。这些数字只保留为历史排期参考。两阶段方案会为 fresh Train-pass 候选额外执行一次 Interpreter，因此旧融合路径的 18.1–20.8 小时估计不再适用；Notebook 必须分别根据阶段 1 和阶段 2 的运行中实测速度更新 ETA，不得把旧估计显示为当前承诺。
+
+`factor_gfn/backtest/stage6_two_phase_pipeline.py` 负责编排两个阶段，并继续复用 EvaluationStore、survivor enrichment 和冻结 selection contract。分布和筛选入口只接受状态为 complete、无 determinism conflict、OOS 未加载、scope 正确且与同一冻结 Train-pass manifest 绑定的阶段 2 运行；不完整阶段 1 不得生成 pass manifest，不完整阶段 2 不得绘制“可用于正式筛选”的分布或进入筛选。统一 Notebook 不设置额外布尔安全锁：配置、两个独立进度函数和两个真正执行单元分别位于独立单元格，用户运行相应单元格即明确启动或恢复。当前代理只完成代码、自动测试和 Notebook 静态验证，不自动启动 Train 全量准备、Validation 全量评价、survivor enrichment、正式 provisional selection 或 OOS。
+
+Notebook 只作为可观察运行入口，长任务必须由用户手工启动。统一 Notebook 必须先确认 evaluation run 为 complete，才允许绘制正式硬筛前分布并进入后续筛选；生成的 Alpha Pool 仍是 provisional，不能据此解锁 2021–2025 OOS。9D 实现完成不等于全量运行完成。
+
+当前正式 seed42 已在 step900 人工停止；其原冻结 Provider、checkpoint schema、Reward、训练状态和全部运行产物继续只读保留，不恢复、不补跑、不回写。未来 Stage 5/Stage 6 共享轻量 Train artifact 的正式接口仍按 6.4.2 记录为后续第二阶段优化，不在本轮临时复用中实现，也不得回写旧运行产物。
+
+上述安排保留研报明确授权的验证用途，即通过 `validation_ic`、方向一致性和 `validation_long_ir` 检验预测能力延续，同时避免在数千候选上反复利用同一短验证期构造相关矩阵并优化池结构。它不宣称训练期相关性优于其他方案，而是第一版复现中可审计、较少额外假设的选择。共同有效调仓期至少 60 的去相关规则属于项目工程口径，不标记为研报披露。
 
 ### 暂缓阶段
 
@@ -1226,7 +1745,7 @@ factor_gfn/
 - `policy_max_norm=5/20`真实同源对照已完成：两组均为17个logical batch、16次成功update和1次skip，采样的128条trajectory结构身份完全相同且TB delta最大绝对差约1.53e-5；median pre-clip norm均约213.97，clip coefficient分别约0.02383/0.09533，但median实际policy参数更新范数分别约0.032632/0.032634，TB、loss、entropy和per-N delta近乎逐值一致。该结果符合Adam对统一梯度尺度近似不变的预期，不能据“裁剪系数更大”声称20更优；按预先约定保留更保守的`policy_max_norm=5`，不再扩展裁剪阈值搜索。Retry=3下skip由旧Step 12的25%降至1/17约5.9%，当前候选固定为3并在最终health确认中复核。
 - 进入正式Stage 5前新增唯一一次独立最终health confirmation：`max_depth=6/max_nodes=20`、batch=8、policy/logZ LR=1e-4/1e-2、policy/logZ max-norm=5/5、retry=3，使用同一verified exact/historical初始化以及N=17/18高方差工程初值，从全新model/optimizer/scheduler运行32个logical batch。逐N必须输出initialization/pre-update、early、late TB delta、initial/current/net-change logZ、valid trajectory与successful gradient exposure；同时输出skip/retry、梯度/裁剪、实际更新、entropy、吞吐、显存和非有限值，并做独立checkpoint确定性恢复。证据不足或异常仅输出`insufficient_evidence/review_required`，不得中途重置logZ、自动改参数或创建正式run。手动入口为`notebooks/run_final_no_anchor_health_confirmation_6_20.ipynb`，默认安全锁关闭，长阶段逐batch输出且每20秒heartbeat。
 - 最终health confirmation已完成并获准进入正式Stage 5：32个logical batch中31次成功update、1次fail-closed skip（3.125%），所有N均有至少11条valid trajectory及11次successful gradient exposure，无证据不足层、无自动targeted-recalibration层、无NaN/Inf，checkpoint恢复逐值确定。全局delta mean均值约-0.138；TB RMS首4/末4均值约4.36/4.65，entropy稳定，median实际policy参数更新范数约0.02777且随训练下降。N=13/15/16/19/20后期delta仍有较大方差或偏移，但learned logZ净移动绝对值均小于0.07，判为尚未收敛而非结构性错误；正式1000步必须持续监控，不因这些短期尾部值重新调参。
-- 正式6/20 no-anchor seed42合同现已冻结：`max_steps=1000`、batch=8、policy/logZ LR=1e-4/1e-2、policy/logZ max-norm=5/5、retry=3、Adam betas=0.9/0.999、eps=1e-8、weight decay=0、sampling multiplier=10、deterministic algorithms启用，N=17/18继续使用已登记的高方差工程初值。冻结配置指纹为`b6453816d90f89609e506e02d6c8c0a9d3eda37571ea64079ecd91c9ad341789`；运行控制的`TARGET_STEP`不进入配置，首次只到10，检查后从同一新schema checkpoint恢复至1000。所有complexity diagnostic、health、A/B、registry与checkpoint保持只读且不作为正式训练状态恢复来源。
+- 正式6/20 no-anchor seed42合同冻结为：配置上限 `max_steps=1000`、batch=8、policy/logZ LR=1e-4/1e-2、policy/logZ max-norm=5/5、retry=3、Adam betas=0.9/0.999、eps=1e-8、weight decay=0、sampling multiplier=10、deterministic algorithms启用，N=17/18继续使用已登记的高方差工程初值。冻结配置指纹为`b6453816d90f89609e506e02d6c8c0a9d3eda37571ea64079ecd91c9ad341789`；该 run 实际由人工在 step900 提前停止用于训练动力学优化，不再恢复至1000，也不得标记为 completed。所有complexity diagnostic、health、A/B、registry与checkpoint保持只读且不作为正式训练状态恢复来源。
 - 正式入口为`notebooks/run_stage5_no_anchor_formal_6_20.ipynb`，新run schema为`factor_gfn.no_anchor_real_search.v1`，旧scalar/anchor/legacy real-search schema均不得进入。Notebook默认安全锁关闭、首次`MODE=new/TARGET_STEP=10`；10步通过后显式填写同一run绝对目录并设`MODE=resume/TARGET_STEP=1000`。控制台仿照既有real candidate search但压缩为每step一行，记录step/target、optimizer、skip、valid/request、retry、loss、Reward、TB、裁剪、实际更新、entropy、learned-logZ范围、wall time、动态ETA与显存；每步原子保存latest checkpoint、每10步保存归档checkpoint，validation/OOS保持未加载。
 - 正式run `c3a1c2747cbb41dbbb3f8f23e6ddddcb` 的首10步检查已通过并获准从同一checkpoint续跑到1000：run状态为`ready`、current/optimizer step为10/9、无active step或last error；100次Reward请求得到71条valid、100个unique structural hash，唯一skip发生在step 2的N=17 retry耗尽，非法动作率始终为0。9次成功update的loss/TB/梯度/参数更新均有限，delta mean均值约-0.202，normalized entropy均值约0.897，实际policy相对更新从约6.73e-4下降到2.21e-4；显存峰值约161.4 MiB。`checkpoint_latest.pt`和step-10归档均存在，正式config/provider/context/初始化来源指纹一致。Notebook现已清空执行输出并固定为`MODE=resume`、`TARGET_STEP=1000`及该run绝对目录；禁止新建替代run或改配置。
 - 2026-08-14完成入口清理：根目录Notebook只保留数据下载/准备、旧输出格式参考和唯一正式no-anchor训练入口；validation、synthetic/real smoke及Barra手工Notebook删除，参数诊断Notebook统一移入`notebooks/archive/diagnostics/`并标记为只读历史证据。该清理不删除任何`runs/`、checkpoint、exhaustive registry、logZ初始化来源、候选表达式或阶段6可导入记录，也不移除no-anchor依赖的legacy只读/拒绝代码路径。
@@ -1248,7 +1767,7 @@ factor_gfn/
 
 ### 首要待优化项：终态数量导致的长结构总质量优势
 
-这是当前 GFlowNet 搜索最重要的底层问题；解决方案已收敛为5.3所述的no-anchor complexity-conditioned GFlowNet。理想收敛时，单个终态表达式 `x` 的采样概率满足 `P(x) ∝ R(x)`；然而某一长度层的总采样概率取决于该层所有终态 Reward 的总和：
+这是 Legacy GFlowNet 搜索曾暴露的重要底层问题。当前正式解决方案已经更新为 grammar-hierarchical Conditional Hybrid GFlowNet：将终态节点数 `N=1..15` 作为外部 condition，并按 N 分配固定训练预算；`N=1/2` 使用 Exact-TB，`N=3..15` 使用 direct LPV。旧 no-anchor 方案只保留为历史开发路径，不再是当前正式入口。理想收敛时，单个终态表达式 `x` 的采样概率满足 `P(x) ∝ R(x)`；然而在未显式条件化的 Legacy 架构中，某一长度层的总采样概率取决于该层所有终态 Reward 的总和：
 
 `P(node_count = n) ∝ Σ_{x: node_count(x)=n} R(x)`。
 
@@ -1256,7 +1775,7 @@ factor_gfn/
 
 当前100步完整文法分层run已经出现直接证据：前50步到后50步，有效候选平均节点数由6.74升至11.16，Reward P90由0.05416降至0.03520；两个半程内节点数与Reward的相关性分别约为-0.32和-0.35。该现象仍可能包含早期训练和logZ校准影响，尚不足以确定最终稳态，但已足以要求独立处理复杂度层覆盖，而不能假设继续训练会自动消失。
 
-已确认方法先解析可达节点数层，并让全部`D=F`通过同一个balanced shuffled cycle参加normal discovery和exact-N conditional TB；小型canonical终态空间额外完成100% exhaustive coverage并固定精确TB partition，但不再创建anchor训练路径。后续必须按N记录候选数量、唯一结构数、Reward/IC尾部、训练侧通过密度、TB、有效更新率和depth分布。任何实现都不得静默修改原始Reward、阶段6筛选指标或验证/OOS隔离合同；复杂度Reward、课程学习、重放和长度归一化仍不在本轮方法中启用。
+当前方法按 `N=1..15` 记录固定 training budget、候选数量、唯一结构数、Reward/IC、Exact-TB/LPV loss、梯度与 clipping。固定 per-N training budget 不等于候选结果自然均衡，报告必须区分 training allocation 与 unique candidate/quality distribution。任何实现都不得静默修改原始 Reward、Stage 6 筛选指标或 Validation/OOS 隔离合同；复杂度 Reward、课程学习、重放和长度归一化未进入本 Baseline。
 
 ### Reward v2：待优化方向
 

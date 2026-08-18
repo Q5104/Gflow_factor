@@ -239,6 +239,20 @@ class RealRewardProvider(RewardProvider):
     def evaluation_records(self) -> tuple[RealRewardEvaluationRecord, ...]:
         return tuple(deepcopy(self._records))
 
+    @property
+    def evaluation_record_count(self) -> int:
+        return len(self._records)
+
+    def evaluation_records_since(
+        self,
+        start: int,
+    ) -> tuple[RealRewardEvaluationRecord, ...]:
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            raise ValueError("evaluation record start must be a non-negative integer")
+        if start > len(self._records):
+            raise ValueError("evaluation record start exceeds current record count")
+        return tuple(deepcopy(self._records[start:]))
+
     def cache_info(self) -> dict[str, Any]:
         return {
             "entries": len(self._cache),

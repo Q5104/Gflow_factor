@@ -42,6 +42,14 @@ FORMAL_STAGE5_NO_ANCHOR_SEED = 42
 FORMAL_STAGE5_NO_ANCHOR_CONFIG_FINGERPRINT = (
     "b6453816d90f89609e506e02d6c8c0a9d3eda37571ea64079ecd91c9ad341789"
 )
+STAGE5_LOGZ_ADAM_LR2E2_AB_EXPERIMENT_ID = "logz_adam_lr2e2_seed42"
+STAGE5_LOGZ_ADAM_LR2E2_AB_CONFIG_FINGERPRINT = (
+    "8435eb605b29b59af02f60d0ee68392f2ecee6303aae9da14464c749cd14fa8a"
+)
+STAGE5_LOGZ_SGD_LR1E1_B1_EXPERIMENT_ID = "logz_sgd_lr1e1_seed42"
+STAGE5_LOGZ_SGD_LR1E1_B1_CONFIG_FINGERPRINT = (
+    "936e4e185b12a827bc584e0bdc6feb3b87a542ce97590e1df5276b6bf93ce5df"
+)
 
 
 def _positive_int(value: int, name: str) -> None:
@@ -333,6 +341,50 @@ def build_frozen_stage5_no_anchor_6_20_config() -> NoAnchorGFNConfig:
     return config
 
 
+def build_stage5_logz_adam_lr2e2_ab_config() -> NoAnchorGFNConfig:
+    """Return experiment A: the formal seed42 contract with only logZ LR changed."""
+
+    baseline = build_frozen_stage5_no_anchor_6_20_config()
+    training_payload = asdict(baseline.training)
+    training_payload["log_z_learning_rate"] = 2e-2
+    config = NoAnchorGFNConfig(
+        search_space=baseline.search_space,
+        model=baseline.model,
+        sampling=baseline.sampling,
+        reward=baseline.reward,
+        training=TrainingConfig(**training_payload),
+        complexity=baseline.complexity,
+        initialization=baseline.initialization,
+        calibration=baseline.calibration,
+        exhaustive_registry_reuse=baseline.exhaustive_registry_reuse,
+    )
+    if config.fingerprint() != STAGE5_LOGZ_ADAM_LR2E2_AB_CONFIG_FINGERPRINT:
+        raise RuntimeError("Stage 5 logZ Adam LR=2e-2 experiment A fingerprint drift")
+    return config
+
+
+def build_stage5_logz_sgd_lr1e1_b1_config() -> NoAnchorGFNConfig:
+    """Return B1 with the frozen baseline parameters and learned-logZ LR=0.1."""
+
+    baseline = build_frozen_stage5_no_anchor_6_20_config()
+    training_payload = asdict(baseline.training)
+    training_payload["log_z_learning_rate"] = 1e-1
+    config = NoAnchorGFNConfig(
+        search_space=baseline.search_space,
+        model=baseline.model,
+        sampling=baseline.sampling,
+        reward=baseline.reward,
+        training=TrainingConfig(**training_payload),
+        complexity=baseline.complexity,
+        initialization=baseline.initialization,
+        calibration=baseline.calibration,
+        exhaustive_registry_reuse=baseline.exhaustive_registry_reuse,
+    )
+    if config.fingerprint() != STAGE5_LOGZ_SGD_LR1E1_B1_CONFIG_FINGERPRINT:
+        raise RuntimeError("Stage 5 logZ SGD LR=0.1 experiment B1 fingerprint drift")
+    return config
+
+
 __all__ = [
     "ExhaustiveRegistryReuseConfig",
     "FORMAL_STAGE5_MAX_DEPTH",
@@ -340,6 +392,10 @@ __all__ = [
     "FORMAL_STAGE5_NO_ANCHOR_MAX_STEPS",
     "FORMAL_STAGE5_NO_ANCHOR_SEED",
     "FORMAL_STAGE5_NO_ANCHOR_CONFIG_FINGERPRINT",
+    "STAGE5_LOGZ_ADAM_LR2E2_AB_EXPERIMENT_ID",
+    "STAGE5_LOGZ_ADAM_LR2E2_AB_CONFIG_FINGERPRINT",
+    "STAGE5_LOGZ_SGD_LR1E1_B1_EXPERIMENT_ID",
+    "STAGE5_LOGZ_SGD_LR1E1_B1_CONFIG_FINGERPRINT",
     "FORMAL_STAGE5_SEARCH_SPACE",
     "NO_ANCHOR_CONFIG_SCHEMA",
     "HistoricalLogZInitializationConfig",
@@ -348,4 +404,6 @@ __all__ = [
     "NoAnchorGFNConfig",
     "build_formal_stage5_no_anchor_6_20_config",
     "build_frozen_stage5_no_anchor_6_20_config",
+    "build_stage5_logz_adam_lr2e2_ab_config",
+    "build_stage5_logz_sgd_lr1e1_b1_config",
 ]

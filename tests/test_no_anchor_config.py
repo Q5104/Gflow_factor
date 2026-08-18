@@ -8,6 +8,10 @@ from factor_gfn.gfn.no_anchor_config import (
     FORMAL_STAGE5_NO_ANCHOR_CONFIG_FINGERPRINT,
     FORMAL_STAGE5_NO_ANCHOR_MAX_STEPS,
     FORMAL_STAGE5_NO_ANCHOR_SEED,
+    STAGE5_LOGZ_ADAM_LR2E2_AB_CONFIG_FINGERPRINT,
+    STAGE5_LOGZ_ADAM_LR2E2_AB_EXPERIMENT_ID,
+    STAGE5_LOGZ_SGD_LR1E1_B1_CONFIG_FINGERPRINT,
+    STAGE5_LOGZ_SGD_LR1E1_B1_EXPERIMENT_ID,
     NO_ANCHOR_CONFIG_SCHEMA,
     ExhaustiveRegistryReuseConfig,
     HistoricalLogZInitializationConfig,
@@ -16,6 +20,8 @@ from factor_gfn.gfn.no_anchor_config import (
     NoAnchorGFNConfig,
     build_formal_stage5_no_anchor_6_20_config,
     build_frozen_stage5_no_anchor_6_20_config,
+    build_stage5_logz_adam_lr2e2_ab_config,
+    build_stage5_logz_sgd_lr1e1_b1_config,
 )
 from factor_gfn.grammar import SearchSpaceConfig
 
@@ -44,6 +50,54 @@ class NoAnchorConfigTests(unittest.TestCase):
         self.assertEqual(config.training.log_z_gradient_clip_norm, 5.0)
         self.assertEqual(config.complexity.exact_node_retry_budget, 3)
         self.assertEqual(config.calibration.target_node_counts, (17, 18))
+
+    def test_logz_adam_lr2e2_ab_changes_only_logz_learning_rate(self):
+        baseline = build_frozen_stage5_no_anchor_6_20_config()
+        experiment = build_stage5_logz_adam_lr2e2_ab_config()
+        self.assertEqual(
+            experiment.fingerprint(),
+            STAGE5_LOGZ_ADAM_LR2E2_AB_CONFIG_FINGERPRINT,
+        )
+        self.assertEqual(STAGE5_LOGZ_ADAM_LR2E2_AB_EXPERIMENT_ID, "logz_adam_lr2e2_seed42")
+        baseline_payload = asdict(baseline)
+        experiment_payload = asdict(experiment)
+        baseline_training = baseline_payload.pop("training")
+        experiment_training = experiment_payload.pop("training")
+        self.assertEqual(experiment_payload, baseline_payload)
+        changed_training_fields = {
+            name
+            for name in baseline_training
+            if baseline_training[name] != experiment_training[name]
+        }
+        self.assertEqual(changed_training_fields, {"log_z_learning_rate"})
+        self.assertEqual(baseline_training["log_z_learning_rate"], 1e-2)
+        self.assertEqual(experiment_training["log_z_learning_rate"], 2e-2)
+
+    def test_logz_sgd_lr1e1_b1_freezes_parameter_contract(self):
+        baseline = build_frozen_stage5_no_anchor_6_20_config()
+        experiment = build_stage5_logz_sgd_lr1e1_b1_config()
+        self.assertEqual(
+            experiment.fingerprint(),
+            STAGE5_LOGZ_SGD_LR1E1_B1_CONFIG_FINGERPRINT,
+        )
+        self.assertEqual(
+            STAGE5_LOGZ_SGD_LR1E1_B1_EXPERIMENT_ID,
+            "logz_sgd_lr1e1_seed42",
+        )
+        baseline_payload = asdict(baseline)
+        experiment_payload = asdict(experiment)
+        baseline_training = baseline_payload.pop("training")
+        experiment_training = experiment_payload.pop("training")
+        self.assertEqual(experiment_payload, baseline_payload)
+        self.assertEqual(
+            {
+                name
+                for name in baseline_training
+                if baseline_training[name] != experiment_training[name]
+            },
+            {"log_z_learning_rate"},
+        )
+        self.assertEqual(experiment_training["log_z_learning_rate"], 1e-1)
 
     def test_formal_factory_freezes_boundary_but_not_training_hyperparameters(self):
         training = TrainingConfig(

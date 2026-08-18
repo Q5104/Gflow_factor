@@ -32,6 +32,7 @@ data/processed/*
 # 临时输出不进入 Git
 tmp/*
 !tmp/.gitkeep
+outputs/
 
 # 模型、检查点和实验运行目录不进入 Git
 checkpoints/

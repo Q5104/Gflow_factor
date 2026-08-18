@@ -307,4 +307,131 @@ class TrajectoryBalanceLoss(nn.Module):
         )
 
 
-__all__ = ["TBLossOutput", "TrajectoryBalanceLoss"]
+class FixedExactTrajectoryBalanceLoss(nn.Module):
+    """Exact-TB objective backed only by fixed per-N logZ buffers."""
+
+    def __init__(
+        self,
+        *,
+        max_nodes: int,
+        exact_node_counts: Iterable[int],
+    ) -> None:
+        super().__init__()
+        self.max_nodes = TrajectoryBalanceLoss._validate_max_nodes(max_nodes)
+        assert self.max_nodes is not None
+        self.exact_node_counts = TrajectoryBalanceLoss._validate_exact_node_counts(
+            self,
+            exact_node_counts,
+        )
+        if not self.exact_node_counts:
+            raise ValueError("fixed exact TB requires at least one exact stratum")
+        self.register_buffer(
+            "exact_tb_log_z_by_node_count",
+            torch.zeros(self.max_nodes, dtype=torch.float64),
+        )
+        self.register_buffer(
+            "exact_log_z_mask",
+            torch.zeros(self.max_nodes, dtype=torch.bool),
+        )
+
+    def _node_count_index(self, node_count: int) -> int:
+        return TrajectoryBalanceLoss._node_count_index(self, node_count)
+
+    def set_exact_log_z(self, node_count: int, value: float) -> None:
+        index = self._node_count_index(node_count)
+        if int(node_count) not in self.exact_node_counts:
+            raise ValueError("exact logZ can only be registered for a declared exact stratum")
+        if not isinstance(value, Real) or isinstance(value, bool) or not math.isfinite(float(value)):
+            raise ValueError("exact logZ must be a finite real number")
+        normalized = torch.tensor(
+            float(value),
+            dtype=self.exact_tb_log_z_by_node_count.dtype,
+        ).item()
+        if bool(self.exact_log_z_mask[index]):
+            current = float(self.exact_tb_log_z_by_node_count[index])
+            if current != normalized:
+                raise ValueError(
+                    f"exact logZ for N={int(node_count)} is already registered"
+                )
+            return
+        with torch.no_grad():
+            self.exact_tb_log_z_by_node_count[index] = normalized
+            self.exact_log_z_mask[index] = True
+
+    def fixed_state_manifest(self) -> dict[str, object]:
+        return {
+            "mode": "fixed_exact_only",
+            "vector_length": self.max_nodes,
+            "exact_node_counts": self.exact_node_counts,
+            "exact_buffer_dtype": "float64",
+            "exact_tb_log_z_by_node_count": (
+                self.exact_tb_log_z_by_node_count.detach().cpu().tolist()
+            ),
+            "exact_log_z_mask": self.exact_log_z_mask.detach().cpu().tolist(),
+        }
+
+    def forward(self, trajectories: Sequence[Trajectory]) -> TBLossOutput:
+        if not trajectories:
+            raise ValueError("TB Loss does not accept an empty batch (空 batch)")
+        device = self.exact_tb_log_z_by_node_count.device
+        sum_log_pf: list[Tensor] = []
+        sum_log_pb: list[float] = []
+        log_rewards: list[float] = []
+        selected_log_z: list[Tensor] = []
+
+        for index, trajectory in enumerate(trajectories):
+            if not isinstance(trajectory, Trajectory):
+                raise TypeError(f"trajectories[{index}] must be a Trajectory")
+            trajectory.validate()
+            trajectory.require_training_eligible()
+            _, log_reward = trajectory.require_valid_reward()
+            node_count = trajectory.target_node_count
+            if node_count not in self.exact_node_counts:
+                raise ValueError("fixed exact TB accepts only declared exact conditions")
+            scalar_index = self._node_count_index(node_count)
+            if not bool(self.exact_log_z_mask[scalar_index]):
+                raise RuntimeError(
+                    f"exact stratum N={node_count} has no registered exact TB logZ"
+                )
+            forward_log_probability = trajectory.sum_log_pf
+            if forward_log_probability.device != device:
+                raise ValueError("trajectory probabilities and normalizer must share a device")
+            if not bool(torch.isfinite(forward_log_probability)):
+                raise ValueError("trajectory sum_log_pf must be finite")
+            backward_log_probability = trajectory.sum_log_pb
+            if not math.isfinite(backward_log_probability):
+                raise ValueError("trajectory sum_log_pb must be finite")
+            sum_log_pf.append(forward_log_probability)
+            sum_log_pb.append(backward_log_probability)
+            log_rewards.append(log_reward)
+            selected_log_z.append(
+                self.exact_tb_log_z_by_node_count[scalar_index]
+            )
+
+        forward = torch.stack(sum_log_pf).to(dtype=torch.float64)
+        backward = torch.tensor(sum_log_pb, dtype=torch.float64, device=device)
+        rewards = torch.tensor(log_rewards, dtype=torch.float64, device=device)
+        log_z = torch.stack(selected_log_z).to(dtype=torch.float64)
+        deltas = log_z + forward - rewards - backward
+        if not bool(torch.isfinite(deltas).all()):
+            raise FloatingPointError("TB delta contains NaN or Inf")
+        loss = torch.mean(torch.square(deltas))
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError("TB Loss contains NaN or Inf")
+        return TBLossOutput(
+            loss=loss,
+            deltas=deltas,
+            delta_mean=deltas.mean(),
+            delta_std=deltas.std(unbiased=False),
+            log_z=log_z,
+            mean_log_pf=forward.mean(),
+            mean_log_pb=backward.mean(),
+            mean_log_reward=rewards.mean(),
+        )
+
+
+__all__ = [
+    "FixedExactTrajectoryBalanceLoss",
+    "TBLossOutput",
+    "TrajectoryBalanceLoss",
+]

@@ -11,9 +11,10 @@ import random
 import warnings
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from numbers import Integral
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Mapping, Protocol
+from typing import Any, Literal, Mapping, Protocol
 from uuid import uuid4
 
 import numpy as np
@@ -24,6 +25,7 @@ from factor_gfn.grammar import (
     Expression,
     action_space_fingerprint,
     get_action,
+    resolve_exact_node_strata,
     state_space_fingerprint,
     transition_space_fingerprint,
 )
@@ -60,6 +62,7 @@ from .loss import TrajectoryBalanceLoss
 from .model import ForwardPolicyNetwork
 from .policy_sampler import sample_trajectories
 from .state_adapter import StateAdapter
+from .trajectory import Trajectory
 
 
 TRAINER_SCHEMA = "factor_gfn.trainer.no_anchor.v1"
@@ -89,6 +92,34 @@ class RewardAssignment:
                 raise ValueError("RewardAssignment 的 log_reward 与 reward 不一致")
         elif self.reward is not None or self.log_reward is not None:
             raise ValueError("无效 RewardAssignment 不得携带 reward 或 log_reward")
+
+
+@dataclass(frozen=True, slots=True)
+class SingleConditionBatchCollection:
+    """Sampling result for one fixed condition and one configured K."""
+
+    condition_N: int
+    requested_count: int
+    trajectories: tuple[Trajectory, ...]
+    sampled_count: int
+    invalid_count: int
+    retry_count: int
+    retry_exhausted_count: int
+    sampling_rounds: int
+    sampling_seconds: float
+    reward_provider_seconds: float
+
+    @property
+    def accepted_count(self) -> int:
+        return len(self.trajectories)
+
+    @property
+    def complete(self) -> bool:
+        return self.accepted_count == self.requested_count
+
+    @property
+    def target_node_counts(self) -> tuple[int, ...]:
+        return (self.condition_N,) * self.requested_count
 
 
 class RewardProvider(Protocol):
@@ -189,6 +220,75 @@ def seed_everything(seed: int, *, deterministic_algorithms: bool) -> None:
         torch.backends.cudnn.benchmark = not deterministic_algorithms
 
 
+class _SplitPolicyAdamNormalizerSgd:
+    """Minimal optimizer facade for the B1 policy-Adam/logZ-SGD contract."""
+
+    schema = "factor_gfn.split_policy_adam_normalizer_sgd.v1"
+
+    def __init__(
+        self,
+        *,
+        policy_parameters: list[torch.nn.Parameter],
+        normalizer_parameters: list[torch.nn.Parameter],
+        policy_learning_rate: float,
+        normalizer_learning_rate: float,
+        policy_weight_decay: float,
+        betas: tuple[float, float],
+        eps: float,
+    ) -> None:
+        self.policy_optimizer = torch.optim.Adam(
+            [{
+                "name": "policy",
+                "params": policy_parameters,
+                "lr": policy_learning_rate,
+                "weight_decay": policy_weight_decay,
+            }],
+            betas=betas,
+            eps=eps,
+        )
+        self.normalizer_optimizer = torch.optim.SGD(
+            [{
+                "name": "normalizer",
+                "params": normalizer_parameters,
+                "lr": normalizer_learning_rate,
+                "momentum": 0.0,
+                "weight_decay": 0.0,
+            }]
+        )
+
+    @property
+    def param_groups(self) -> list[dict[str, Any]]:
+        return self.policy_optimizer.param_groups + self.normalizer_optimizer.param_groups
+
+    @property
+    def state(self) -> dict[Any, Any]:
+        return {
+            **self.policy_optimizer.state,
+            **self.normalizer_optimizer.state,
+        }
+
+    def zero_grad(self, *, set_to_none: bool = True) -> None:
+        self.policy_optimizer.zero_grad(set_to_none=set_to_none)
+        self.normalizer_optimizer.zero_grad(set_to_none=set_to_none)
+
+    def step(self) -> None:
+        self.policy_optimizer.step()
+        self.normalizer_optimizer.step()
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "policy_optimizer": self.policy_optimizer.state_dict(),
+            "normalizer_optimizer": self.normalizer_optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        if state.get("schema") != self.schema:
+            raise ValueError("split policy/logZ optimizer checkpoint schema mismatch")
+        self.policy_optimizer.load_state_dict(state["policy_optimizer"])
+        self.normalizer_optimizer.load_state_dict(state["normalizer_optimizer"])
+
+
 class GFNTrainer:
     """采样、Reward、TB Loss、反传和参数更新的最小训练器。"""
 
@@ -198,6 +298,7 @@ class GFNTrainer:
         reward_provider: RewardProvider,
         *,
         device: str | torch.device = "cpu",
+        normalizer_optimizer: Literal["adam", "sgd"] = "adam",
     ) -> None:
         if not isinstance(config, (GFNConfig, NoAnchorGFNConfig)):
             raise TypeError("config must be GFNConfig or NoAnchorGFNConfig")
@@ -261,25 +362,39 @@ class GFNTrainer:
                     "resolved_exhaustive_node_counts"
                 ],
             ).to(self.device)
-        self.optimizer = torch.optim.Adam(
-            [
-                {
-                    "name": "policy",
-                    "params": self.model.parameters(),
-                    "lr": training.learning_rate,
-                    "weight_decay": training.weight_decay,
-                },
-                {
-                    "name": "normalizer",
-                    "params": self.tb_loss.parameters(),
-                    "lr": training.log_z_learning_rate,
-                    # Per-N sparsity requires absent scalars to remain unchanged.
-                    "weight_decay": 0.0,
-                },
-            ],
-            betas=(training.optimizer_beta1, training.optimizer_beta2),
-            eps=training.optimizer_eps,
-        )
+        if normalizer_optimizer not in {"adam", "sgd"}:
+            raise ValueError("normalizer_optimizer must be 'adam' or 'sgd'")
+        self.normalizer_optimizer_kind = normalizer_optimizer
+        if normalizer_optimizer == "adam":
+            self.optimizer = torch.optim.Adam(
+                [
+                    {
+                        "name": "policy",
+                        "params": self.model.parameters(),
+                        "lr": training.learning_rate,
+                        "weight_decay": training.weight_decay,
+                    },
+                    {
+                        "name": "normalizer",
+                        "params": self.tb_loss.parameters(),
+                        "lr": training.log_z_learning_rate,
+                        # Per-N sparsity requires absent scalars to remain unchanged.
+                        "weight_decay": 0.0,
+                    },
+                ],
+                betas=(training.optimizer_beta1, training.optimizer_beta2),
+                eps=training.optimizer_eps,
+            )
+        else:
+            self.optimizer = _SplitPolicyAdamNormalizerSgd(
+                policy_parameters=list(self.model.parameters()),
+                normalizer_parameters=list(self.tb_loss.parameters()),
+                policy_learning_rate=training.learning_rate,
+                normalizer_learning_rate=training.log_z_learning_rate,
+                policy_weight_decay=training.weight_decay,
+                betas=(training.optimizer_beta1, training.optimizer_beta2),
+                eps=training.optimizer_eps,
+            )
         self.step = 0
         self.optimizer_step = 0
         self.history: list[TrainingStats] = []
@@ -421,6 +536,22 @@ class GFNTrainer:
             total = total + torch.sum(torch.square(difference))
         return float(torch.sqrt(total))
 
+    def optimizer_contract(self) -> dict[str, Any]:
+        return {
+            "schema": "factor_gfn.optimizer_contract.v1",
+            "policy_optimizer": "adam",
+            "normalizer_optimizer": self.normalizer_optimizer_kind,
+            "policy_learning_rate": self.config.training.learning_rate,
+            "normalizer_learning_rate": self.config.training.log_z_learning_rate,
+            "normalizer_momentum": (
+                0.0 if self.normalizer_optimizer_kind == "sgd" else None
+            ),
+            "normalizer_weight_decay": 0.0,
+            "normalizer_active_indices_only": (
+                self.normalizer_optimizer_kind == "sgd"
+            ),
+        }
+
     def run_metadata(self) -> dict[str, Any]:
         metadata = {
             "schema": TRAINER_SCHEMA if self.no_anchor_mode else LEGACY_TRAINER_SCHEMA,
@@ -440,6 +571,9 @@ class GFNTrainer:
             },
             "parameter_semantics": {
                 "normalizer": self.tb_loss.normalizer_state_manifest(),
+                "optimizers": {
+                    **self.optimizer_contract(),
+                },
                 "initial_log_z": {
                     "value": self.config.training.initial_log_z,
                     "meaning": "TB 全局归一化常数 logZ 的工程初值",
@@ -985,6 +1119,99 @@ class GFNTrainer:
             None,
         )
 
+    def collect_single_condition_batch(
+        self,
+        *,
+        condition_N: int,
+        trajectories_per_batch: int,
+    ) -> SingleConditionBatchCollection:
+        """Collect one fixed-N batch without advancing training state."""
+
+        if (
+            isinstance(condition_N, bool)
+            or not isinstance(condition_N, Integral)
+        ):
+            raise ValueError("condition_N must be a feasible integer node count")
+        condition_N = int(condition_N)
+        feasible = resolve_exact_node_strata(
+            self.config.search_space
+        ).resolved_feasible_node_counts
+        if condition_N not in feasible:
+            raise ValueError("condition_N must be feasible under the search space")
+        if (
+            isinstance(trajectories_per_batch, bool)
+            or not isinstance(trajectories_per_batch, Integral)
+            or int(trajectories_per_batch) < 2
+        ):
+            raise ValueError("trajectories_per_batch must be an integer >= 2")
+        trajectories_per_batch = int(trajectories_per_batch)
+        if self.config.model.token_policy_mode != "grammar_hierarchical":
+            raise RuntimeError(
+                "single-condition collection requires grammar_hierarchical policy"
+            )
+
+        target_node_counts = (condition_N,) * trajectories_per_batch
+        accepted: list[Trajectory | None] = [None] * trajectories_per_batch
+        pending = list(range(trajectories_per_batch))
+        sampled_count = 0
+        invalid_count = 0
+        retry_count = 0
+        rounds = 0
+        sampling_seconds = 0.0
+        reward_provider_seconds = 0.0
+        maximum_attempts = 1 + self._exact_node_retry_budget()
+
+        for attempt_index in range(maximum_attempts):
+            if not pending:
+                break
+            rounds += 1
+            if attempt_index > 0:
+                retry_count += len(pending)
+            pending_targets = tuple(
+                target_node_counts[slot_index] for slot_index in pending
+            )
+            sampling_started = perf_counter()
+            candidates = sample_trajectories(
+                self.model,
+                self.adapter,
+                num_trajectories=len(pending),
+                sampling_config=self.config.sampling,
+                target_node_counts=pending_targets,
+                batched_policy_diagnostics=True,
+            )
+            sampling_seconds += perf_counter() - sampling_started
+            sampled_count += len(candidates)
+
+            next_pending: list[int] = []
+            for slot_index, trajectory in zip(pending, candidates, strict=True):
+                reward_started = perf_counter()
+                assignment = self._evaluate_reward(
+                    trajectory.terminal_expression
+                )
+                reward_provider_seconds += perf_counter() - reward_started
+                if not assignment.valid:
+                    invalid_count += 1
+                    next_pending.append(slot_index)
+                    continue
+                trajectory.attach_reward(assignment.reward, assignment.log_reward)
+                accepted[slot_index] = trajectory
+            pending = next_pending
+
+        return SingleConditionBatchCollection(
+            condition_N=condition_N,
+            requested_count=trajectories_per_batch,
+            trajectories=tuple(
+                trajectory for trajectory in accepted if trajectory is not None
+            ),
+            sampled_count=sampled_count,
+            invalid_count=invalid_count,
+            retry_count=retry_count,
+            retry_exhausted_count=len(pending),
+            sampling_rounds=rounds,
+            sampling_seconds=sampling_seconds,
+            reward_provider_seconds=reward_provider_seconds,
+        )
+
     def _collect_conditioned_training_batch(self):
         if self.complexity_scheduler is None:
             raise RuntimeError("conditioned batch collection requires scheduler")
@@ -1279,6 +1506,19 @@ class GFNTrainer:
         model_parameters = list(self.model.parameters())
         model_gradient_norm = self._gradient_l2_norm(model_parameters)
         normalizer_parameters = list(self.tb_loss.parameters())
+        active_learned_indices = self.tb_loss.active_learned_indices(trajectories)
+        if (
+            self.normalizer_optimizer_kind == "sgd"
+            and self.tb_loss.normalizer_mode == "conditional_vector"
+        ):
+            gradient = normalizer_parameters[0].grad
+            if gradient is None:
+                raise RuntimeError("TB Loss backward produced no learned-logZ gradient")
+            active = set(active_learned_indices)
+            with torch.no_grad():
+                for index in range(gradient.numel()):
+                    if index not in active:
+                        gradient[index] = 0.0
         log_z_gradient_tensor = normalizer_parameters[0].grad
         if (
             log_z_gradient_tensor is None
@@ -1291,7 +1531,6 @@ class GFNTrainer:
         normalizer_before = [
             parameter.detach().clone() for parameter in normalizer_parameters
         ]
-        active_learned_indices = self.tb_loss.active_learned_indices(trajectories)
         model_gradient_norm_tensor = torch.nn.utils.clip_grad_norm_(
             model_parameters,
             max_norm=self.config.training.model_gradient_clip_norm,
@@ -1327,9 +1566,17 @@ class GFNTrainer:
             with torch.no_grad():
                 for index in range(self.tb_loss.log_z_by_node_count.numel()):
                     if index not in active:
-                        self.tb_loss.log_z_by_node_count[index].copy_(
-                            normalizer_before[0][index]
-                        )
+                        if self.normalizer_optimizer_kind == "adam":
+                            self.tb_loss.log_z_by_node_count[index].copy_(
+                                normalizer_before[0][index]
+                            )
+                        elif not torch.equal(
+                            self.tb_loss.log_z_by_node_count[index],
+                            normalizer_before[0][index],
+                        ):
+                            raise RuntimeError(
+                                "inactive learned-logZ scalar changed during SGD step"
+                            )
         if use_cuda_events:
             optimizer_end_event.record()
         model_parameter_update_norm = self._parameter_update_l2_norm(
@@ -1345,6 +1592,16 @@ class GFNTrainer:
             normalizer_parameters,
             normalizer_before,
         )
+        log_z_update_by_N = None
+        if self.tb_loss.normalizer_mode == "conditional_vector":
+            assert self.tb_loss.log_z_by_node_count is not None
+            differences = (
+                self.tb_loss.log_z_by_node_count.detach() - normalizer_before[0]
+            )
+            log_z_update_by_N = {
+                index + 1: float(differences[index].detach().cpu())
+                for index in active_learned_indices
+            }
         log_z_after = self._normalizer_monitor_value()
         if use_cuda_events:
             optimizer_end_event.synchronize()
@@ -1511,6 +1768,7 @@ class GFNTrainer:
                 if self.tb_loss.normalizer_mode == "legacy_scalar"
                 else normalizer_update_norm
             ),
+            log_z_update_by_N=log_z_update_by_N,
             sampled_count=sampled_count,
             effective_batch_size=effective,
             invalid_reward_count=invalid_count,

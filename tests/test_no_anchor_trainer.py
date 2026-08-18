@@ -202,8 +202,13 @@ class NoAnchorTrainerTests(unittest.TestCase):
         self.registry.close()
         self.temporary.cleanup()
 
-    def _configured_trainer(self) -> GFNTrainer:
-        trainer = GFNTrainer(_config(), self.provider, device="cpu")
+    def _configured_trainer(self, *, normalizer_optimizer: str = "adam") -> GFNTrainer:
+        trainer = GFNTrainer(
+            _config(),
+            self.provider,
+            device="cpu",
+            normalizer_optimizer=normalizer_optimizer,
+        )
         semantics = trainer.target_exhaustive_reuse_semantics()
         proofs = trainer.configure_no_anchor_exhaustive_registry(
             self.registry,
@@ -670,6 +675,43 @@ class NoAnchorTrainerTests(unittest.TestCase):
             resumed.last_discovery_trajectory_diagnostics,
             expected_diagnostics,
         )
+        self.assertTrue(torch.equal(resumed.tb_loss.log_z_by_node_count, expected_log_z))
+        for key, expected in expected_model.items():
+            self.assertTrue(torch.equal(resumed.model.state_dict()[key], expected), key)
+
+    def test_plain_sgd_checkpoint_round_trip_is_deterministic(self):
+        trainer = self._configured_trainer(normalizer_optimizer="sgd")
+        self._complete_constant_calibration(trainer)
+        trainer.train_step()
+        path = Path(self.temporary.name) / "no_anchor_sgd.pt"
+        trainer.save_checkpoint(path)
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        self.assertEqual(payload["optimizer_contract"]["normalizer_optimizer"], "sgd")
+        self.assertEqual(
+            payload["optimizer_state"]["schema"],
+            "factor_gfn.split_policy_adam_normalizer_sgd.v1",
+        )
+        expected_stats = trainer.train_step()
+        expected_model = {
+            key: value.detach().clone()
+            for key, value in trainer.model.state_dict().items()
+        }
+        expected_log_z = trainer.tb_loss.log_z_by_node_count.detach().clone()
+
+        resumed = GFNTrainer(
+            _config(),
+            self.provider,
+            device="cpu",
+            normalizer_optimizer="sgd",
+        )
+        semantics = resumed.target_exhaustive_reuse_semantics()
+        resumed.configure_no_anchor_exhaustive_registry(
+            self.registry,
+            source_semantics_by_N={1: semantics},
+        )
+        resumed.load_checkpoint(path)
+        actual_stats = resumed.train_step()
+        self.assertEqual(actual_stats, expected_stats)
         self.assertTrue(torch.equal(resumed.tb_loss.log_z_by_node_count, expected_log_z))
         for key, expected in expected_model.items():
             self.assertTrue(torch.equal(resumed.model.state_dict()[key], expected), key)
