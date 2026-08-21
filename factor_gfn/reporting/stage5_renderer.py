@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import textwrap
 from typing import Callable
 
 import matplotlib
@@ -18,7 +19,7 @@ import pandas as pd
 from .stage5_data import Stage5ReportDataBundle
 
 
-STAGE5_REPORT_SCHEMA = "factor_gfn.reporting.stage5_report.v1"
+STAGE5_REPORT_SCHEMA = "factor_gfn.reporting.stage5_report.v2"
 
 
 class Stage5ReportRenderer:
@@ -55,11 +56,14 @@ class Stage5ReportRenderer:
         "train_long_ir_distribution": "04_train_long_ir_distribution.png",
         "train_barra_corr_distribution": "04_train_barra_corr_distribution.png",
         "ic_long_ir_scatter": "04_ic_long_ir_scatter.png",
-        "long_excess_corr": "05_train_long_excess_corr_top30.png",
+        "candidate_quality_table": "04_candidate_quality_summary.png",
+        "long_excess_corr": "05_train_long_excess_corr_top20.png",
         "depth_distribution": "06_depth_distribution.png",
+        "complexity_table": "06_complexity_summary.png",
         "operator_usage": "06_operator_usage.png",
         "field_usage": "06_field_usage.png",
         "window_usage": "06_window_usage.png",
+        "top_candidate_examples_table": "07_top_candidate_examples.png",
     }
 
     def __init__(self, bundle: Stage5ReportDataBundle, output_dir: str | Path) -> None:
@@ -149,12 +153,31 @@ class Stage5ReportRenderer:
         figure, axes = plt.subplots(4, 4, figsize=(15, 12), sharex=True)
         for axis, node_count in zip(axes.flat, range(3, 16)):
             group = data[data["condition_N"] == node_count].sort_values("cycle_index")
-            axis.plot(group["cycle_index"], group["variance_loss"], marker="o", markersize=2.5)
+            axis.plot(
+                group["cycle_index"],
+                group["variance_loss"],
+                color="#4c78a8",
+                alpha=0.30,
+                linewidth=1.0,
+                marker="o",
+                markersize=2.0,
+            )
+            if len(group) >= 5:
+                rolling = group["variance_loss"].rolling(5, min_periods=3).median()
+                axis.plot(
+                    group["cycle_index"],
+                    rolling,
+                    color="#1f4e79",
+                    linewidth=2.2,
+                )
             axis.set_title(f"N={node_count}")
             axis.grid(alpha=0.25)
         for axis in axes.flat[13:]:
             axis.set_visible(False)
-        figure.suptitle("LPV Loss by Cycle and N (N=3..15)")
+        figure.suptitle(
+            "LPV Loss by Cycle and N (N=3..15)\n"
+            "Faint line: raw batch loss; bold line: rolling median (5 cycles)"
+        )
         figure.supxlabel("Cycle index")
         figure.supylabel("Variance loss")
         return self._finish(figure, "lpv_loss", save)
@@ -182,10 +205,29 @@ class Stage5ReportRenderer:
         figure, axes = plt.subplots(5, 3, figsize=(14, 14), sharex=True)
         for axis, node_count in zip(axes.flat, range(1, 16)):
             group = data[data["condition_N"] == node_count].sort_values("cycle_index")
-            axis.plot(group["cycle_index"], group["reward_mean"], marker="o", markersize=2.5)
+            axis.plot(
+                group["cycle_index"],
+                group["reward_mean"],
+                color="#4c78a8",
+                alpha=0.30,
+                linewidth=1.0,
+                marker="o",
+                markersize=2.0,
+            )
+            if len(group) >= 5:
+                rolling = group["reward_mean"].rolling(5, min_periods=3).median()
+                axis.plot(
+                    group["cycle_index"],
+                    rolling,
+                    color="#1f4e79",
+                    linewidth=2.2,
+                )
             axis.set_title(f"N={node_count}")
             axis.grid(alpha=0.25)
-        figure.suptitle("Batch Mean Reward by Cycle and N")
+        figure.suptitle(
+            "Batch Mean Reward by Cycle and N\n"
+            "Faint line: raw batch mean; bold line: rolling median (5 cycles)"
+        )
         figure.supxlabel("Cycle index")
         figure.supylabel("Batch reward_mean")
         return self._finish(figure, "reward_mean", save)
@@ -259,21 +301,114 @@ class Stage5ReportRenderer:
         self._decorate(axis, xlabel="abs(train_ic)", ylabel="train_long_ir")
         return self._finish(figure, "ic_long_ir_scatter", save)
 
+    @staticmethod
+    def _compact_formula(formula: str, *, width: int = 42) -> str:
+        compact = formula.replace(" ", "")
+        if len(compact) <= width:
+            return compact
+        left = max(1, width - 14)
+        return f"{compact[:left]}…{compact[-13:]}"
+
+    @staticmethod
+    def _style_table(
+        axis,
+        frame: pd.DataFrame,
+        *,
+        column_widths: list[float],
+        font_size: float,
+        row_scale: float,
+        highlighted_columns: set[int] | None = None,
+    ):
+        table = axis.table(
+            cellText=frame.to_numpy(),
+            colLabels=list(frame.columns),
+            cellLoc="center",
+            colLoc="center",
+            colWidths=column_widths,
+            loc="center",
+        )
+        table.auto_set_font_size(False)
+        table.set_fontsize(font_size)
+        table.scale(1.0, row_scale)
+        highlighted = highlighted_columns or set()
+        for (row, column), cell in table.get_celld().items():
+            cell.set_edgecolor("#d7dee8")
+            cell.set_linewidth(0.7)
+            if row == 0:
+                cell.set_facecolor("#244a73")
+                cell.set_text_props(color="white", weight="bold")
+            else:
+                cell.set_facecolor("#f4f7fb" if row % 2 == 0 else "white")
+                if column in highlighted:
+                    cell.set_facecolor("#dceaf7")
+                    cell.set_text_props(weight="bold", color="#173a5e")
+        return table
+
+    def figure_candidate_quality_table(self, *, save: bool = False) -> Figure:
+        source = self.bundle.candidate_quality_summary.copy()
+        metric_labels = {
+            "abs_train_ic": "Train |IC|",
+            "train_long_ir": "Train Long IR",
+            "train_barra_ts_corr": "Train Barra Corr",
+        }
+        rows: list[dict[str, str]] = []
+        for _, record in source.iterrows():
+            metric = str(record["metric"])
+            formatter = (lambda value: f"{float(value):.2%}") if metric == "abs_train_ic" else (lambda value: f"{float(value):.3f}")
+            rows.append(
+                {
+                    "Metric": metric_labels[metric],
+                    "Min": formatter(record["min"]),
+                    "P25": formatter(record["25%"]),
+                    "Median": formatter(record["50%"]),
+                    "P75": formatter(record["75%"]),
+                    "Max": formatter(record["max"]),
+                    "Mean": formatter(record["mean"]),
+                }
+            )
+        display_frame = pd.DataFrame(rows)
+        figure, axis = plt.subplots(figsize=(12.5, 4.2))
+        axis.set_axis_off()
+        axis.set_title("Train Candidate Quality Summary", fontsize=17, weight="bold", pad=18)
+        self._style_table(
+            axis,
+            display_frame,
+            column_widths=[0.22, 0.12, 0.12, 0.13, 0.12, 0.12, 0.12],
+            font_size=11,
+            row_scale=1.9,
+            highlighted_columns={3, 4},
+        )
+        figure.text(
+            0.5,
+            0.04,
+            f"{len(self.bundle.candidate_summary):,} unique candidates; one structural hash = one vote",
+            ha="center",
+            color="#4b5563",
+            fontsize=10,
+        )
+        return self._finish(figure, "candidate_quality_table", save)
+
     def figure_long_excess_correlation(self, *, save: bool = False) -> Figure:
         matrix = self.bundle.long_excess_correlation_matrix
-        size = max(7.0, min(15.0, 0.38 * max(len(matrix), 1) + 4.0))
+        factor_codes = [f"F{rank:02d}" for rank in range(1, len(matrix) + 1)]
+        size = max(9.0, min(14.0, 0.35 * max(len(matrix), 1) + 6.0))
         figure, axis = plt.subplots(figsize=(size, size))
         if matrix.empty:
             axis.text(0.5, 0.5, "No eligible candidates", ha="center", va="center")
             axis.set_axis_off()
         else:
             image = axis.imshow(matrix.to_numpy(dtype=float), vmin=-1, vmax=1, cmap="coolwarm")
-            labels = [str(value)[:8] for value in matrix.index]
-            axis.set_xticks(range(len(labels)), labels=labels, rotation=90, fontsize=7)
-            axis.set_yticks(range(len(labels)), labels=labels, fontsize=7)
+            axis.set_xticks(range(len(factor_codes)), labels=factor_codes, rotation=90, fontsize=8)
+            axis.set_yticks(range(len(factor_codes)), labels=factor_codes, fontsize=8)
             figure.colorbar(image, ax=axis, fraction=0.046, pad=0.04, label="Pearson correlation")
         axis.set_title("Train Directional Long-Excess Correlation — Stage 5 diagnostic only")
-        figure.text(0.5, 0.01, "Top-30 by Train |IC|; >=60 finite common dates; no Stage 6 filtering", ha="center", fontsize=9)
+        figure.text(
+            0.5,
+            0.01,
+            "Top-20 by Train |IC|; F01-F20 follow matrix order; >=60 finite common dates; no Stage 6 filtering",
+            ha="center",
+            fontsize=9,
+        )
         return self._finish(figure, "long_excess_corr", save)
 
     def figure_depth_distribution(self, *, save: bool = False) -> Figure:
@@ -283,6 +418,48 @@ class Stage5ReportRenderer:
         axis.set_title("Expression Depth Distribution")
         self._decorate(axis, xlabel="Depth", ylabel="Unique candidate count")
         return self._finish(figure, "depth_distribution", save)
+
+    def figure_complexity_table(self, *, save: bool = False) -> Figure:
+        source = self.bundle.complexity_summary.copy()
+        metric_labels = {
+            "node_count": "Node count",
+            "depth": "Depth",
+            "operator_count": "Operator count",
+            "leaf_count": "Leaf count",
+        }
+        rows = []
+        for _, record in source.iterrows():
+            rows.append(
+                {
+                    "Metric": metric_labels[str(record["metric"])],
+                    "Min": f"{float(record['min']):.1f}",
+                    "Median": f"{float(record['median']):.1f}",
+                    "Mean": f"{float(record['mean']):.2f}",
+                    "P95": f"{float(record['p95']):.1f}",
+                    "Max": f"{float(record['max']):.1f}",
+                }
+            )
+        display_frame = pd.DataFrame(rows)
+        figure, axis = plt.subplots(figsize=(10.5, 5.0))
+        axis.set_axis_off()
+        axis.set_title("Expression Complexity Summary", fontsize=17, weight="bold", pad=18)
+        self._style_table(
+            axis,
+            display_frame,
+            column_widths=[0.27, 0.13, 0.15, 0.14, 0.13, 0.13],
+            font_size=11,
+            row_scale=1.8,
+            highlighted_columns={2, 4},
+        )
+        figure.text(
+            0.5,
+            0.04,
+            "Search contract: max_nodes = 15; max_depth = 5. Boundary use is descriptive, not a failure flag.",
+            ha="center",
+            color="#4b5563",
+            fontsize=10,
+        )
+        return self._finish(figure, "complexity_table", save)
 
     def figure_operator_usage(self, *, save: bool = False) -> Figure:
         data = self.bundle.operator_usage
@@ -313,6 +490,82 @@ class Stage5ReportRenderer:
         self._decorate(axis, xlabel="Window", ylabel="Share of unique candidates")
         return self._finish(figure, "window_usage", save)
 
+    def figure_top_candidate_examples_table(self, *, save: bool = False) -> Figure:
+        source = self.bundle.top_candidate_examples
+        figure, axes = plt.subplots(2, 1, figsize=(15.5, 10.0))
+        figure.suptitle(
+            "Representative Train Candidate Examples",
+            fontsize=21,
+            weight="bold",
+            y=0.975,
+        )
+        figure.text(
+            0.5,
+            0.935,
+            "Two complementary rankings; the highlighted column defines each panel. Nodes / Depth = expression size / tree depth.",
+            ha="center",
+            color="#4b5563",
+            fontsize=11.5,
+        )
+
+        panels = (
+            (axes[0], source.iloc[:5], "Top 5 by Train |IC|", "#244a73", 3),
+            (axes[1], source.iloc[5:10], "Top 5 by Train Long IR", "#28766e", 4),
+        )
+        for axis, panel_source, title, header_color, highlighted_column in panels:
+            axis.set_axis_off()
+            axis.set_title(title, loc="left", fontsize=15, weight="bold", pad=9, color=header_color)
+            rows = []
+            for rank, (_, record) in enumerate(panel_source.iterrows(), start=1):
+                formula = "\n".join(textwrap.wrap(str(record["formula"]), width=72))
+                rows.append(
+                    {
+                        "#": str(rank),
+                        "Formula": formula,
+                        "Nodes / Depth": f"{int(record['node_count'])} / {int(record['depth'])}",
+                        "Train IC": f"{float(record['train_ic']):+.2%}",
+                        "Long IR": f"{float(record['train_long_ir']):.3f}",
+                        "Barra Corr": f"{float(record['train_barra_ts_corr']):.3f}",
+                    }
+                )
+            display_frame = pd.DataFrame(rows)
+            if display_frame.empty:
+                axis.text(
+                    0.5,
+                    0.42,
+                    "No additional eligible candidates",
+                    ha="center",
+                    va="center",
+                    color="#6b7280",
+                    fontsize=12,
+                )
+                continue
+            table = axis.table(
+                cellText=display_frame.to_numpy(),
+                colLabels=list(display_frame.columns),
+                cellLoc="center",
+                colLoc="center",
+                colWidths=[0.055, 0.545, 0.115, 0.10, 0.085, 0.10],
+                bbox=[0.0, 0.0, 1.0, 0.88],
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(11.5)
+            for (row, column), cell in table.get_celld().items():
+                cell.set_edgecolor("#d7dee8")
+                cell.set_linewidth(0.8)
+                if row == 0:
+                    cell.set_facecolor(header_color)
+                    cell.set_text_props(color="white", weight="bold")
+                else:
+                    cell.set_facecolor("#f4f7fb" if row % 2 == 0 else "white")
+                    if column == 1:
+                        cell.set_text_props(ha="left", family="monospace", fontsize=11.0)
+                    if column == highlighted_column:
+                        cell.set_facecolor("#dceaf7" if highlighted_column == 3 else "#d9eee9")
+                        cell.set_text_props(weight="bold", color="#173a5e")
+        figure.subplots_adjust(left=0.035, right=0.965, top=0.90, bottom=0.035, hspace=0.22)
+        return self._finish(figure, "top_candidate_examples_table", save)
+
     def render_all_figures(self) -> list[Path]:
         methods: tuple[tuple[str, Callable[..., Figure]], ...] = (
             ("exact_tb_loss", self.figure_exact_tb_loss),
@@ -325,11 +578,14 @@ class Stage5ReportRenderer:
             ("train_long_ir_distribution", self.figure_train_long_ir_distribution),
             ("train_barra_corr_distribution", self.figure_train_barra_corr_distribution),
             ("ic_long_ir_scatter", self.figure_ic_long_ir_scatter),
+            ("candidate_quality_table", self.figure_candidate_quality_table),
             ("long_excess_corr", self.figure_long_excess_correlation),
             ("depth_distribution", self.figure_depth_distribution),
+            ("complexity_table", self.figure_complexity_table),
             ("operator_usage", self.figure_operator_usage),
             ("field_usage", self.figure_field_usage),
             ("window_usage", self.figure_window_usage),
+            ("top_candidate_examples_table", self.figure_top_candidate_examples_table),
         )
         paths = []
         for key, method in methods:
@@ -347,8 +603,8 @@ class Stage5ReportRenderer:
         snapshot = self.bundle.snapshot_manifest
         payload = {
             "report_schema": STAGE5_REPORT_SCHEMA,
-            "report_version": 1,
-            "version_label": "Stage 5 Reporting v1",
+            "report_version": 2,
+            "version_label": "Stage 5 Reporting v2",
             "version_status": "frozen",
             "baseline_name": "Raw Daily Baseline",
             "source_description": "completed 100-cycle Raw Daily Baseline run",

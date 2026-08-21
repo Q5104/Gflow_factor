@@ -20,8 +20,13 @@ from factor_gfn.backtest.stage6_evaluation import (
     build_stage6_evaluation_context_from_arrays,
 )
 from factor_gfn.barra import STYLE_NAMES, BarraConfig
+from factor_gfn.data import DAILY_DERIVED_FEATURE_NAMES
 from factor_gfn.evaluator import EvaluationConfig
-from factor_gfn.grammar import Expression, get_action_id
+from factor_gfn.grammar import (
+    DAILY_DERIVED_ACTION_REGISTRY,
+    Expression,
+    get_action_id,
+)
 
 
 class Stage6EvaluationTests(unittest.TestCase):
@@ -146,6 +151,109 @@ class Stage6EvaluationTests(unittest.TestCase):
             with self.assertRaises(IndexError):
                 _ = prefix[6]
             prefix._mmap.close()
+
+    def test_derived_expression_tensor_uses_explicit_raw_open_for_labels(self):
+        derived = np.full(
+            (self.dates.size, len(DAILY_DERIVED_FEATURE_NAMES), self.stocks.size),
+            -999.0,
+        )
+        context = build_stage6_evaluation_context_from_arrays(
+            dates=self.dates,
+            stocks=self.stocks,
+            factor_tensor=derived,
+            raw_open=self.tensor[:, 0, :],
+            ordered_feature_names=DAILY_DERIVED_FEATURE_NAMES,
+            universe_mask=self.universe,
+            industry_labels=self.industry,
+            barra_exposures=self.exposures,
+            config=self.stage6_config,
+        )
+
+        for split in ("train", "validation"):
+            np.testing.assert_array_equal(
+                context.get_split_data(split).forward_returns,
+                self.context.get_split_data(split).forward_returns,
+            )
+        self.assertEqual(context.ordered_feature_names, DAILY_DERIVED_FEATURE_NAMES)
+        with self.assertRaisesRegex(ValueError, "explicit raw_open"):
+            build_stage6_evaluation_context_from_arrays(
+                dates=self.dates,
+                stocks=self.stocks,
+                factor_tensor=derived,
+                ordered_feature_names=DAILY_DERIVED_FEATURE_NAMES,
+                universe_mask=self.universe,
+                industry_labels=self.industry,
+                barra_exposures=self.exposures,
+                config=self.stage6_config,
+            )
+
+    def test_derived_candidate_uses_derived_tensor_and_raw_labels(self):
+        registry = DAILY_DERIVED_ACTION_REGISTRY
+        derived = np.zeros(
+            (self.dates.size, len(DAILY_DERIVED_FEATURE_NAMES), self.stocks.size),
+            dtype=np.float64,
+        )
+        ret_cc1_index = DAILY_DERIVED_FEATURE_NAMES.index("ret_cc1")
+        derived[:, ret_cc1_index, :] = (
+            np.arange(self.dates.size, dtype=np.float64)[:, None]
+            + np.arange(self.stocks.size, dtype=np.float64)[None, :] / 10.0
+        )
+        context = build_stage6_evaluation_context_from_arrays(
+            dates=self.dates,
+            stocks=self.stocks,
+            factor_tensor=derived,
+            raw_open=self.tensor[:, 0, :],
+            ordered_feature_names=DAILY_DERIVED_FEATURE_NAMES,
+            universe_mask=self.universe,
+            industry_labels=self.industry,
+            barra_exposures=self.exposures,
+            config=self.stage6_config,
+        )
+        expression = Expression.from_prefix(
+            [registry.get_action_id("ret_cc1")],
+            action_registry=registry,
+        )
+        vocabulary = {
+            "feature_space_id": registry.feature_space.feature_space_id,
+            "feature_space_fingerprint": registry.feature_space_fingerprint,
+            "action_space_fingerprint": registry.fingerprint(),
+        }
+        candidate = {
+            "schema": ACCEPTED_REGISTRY_SCHEMA,
+            "current_structural_hash": expression.structural_hash(),
+            "source_claimed_structural_hash": expression.structural_hash(),
+            "formula": expression.to_formula(),
+            "prefix_token_ids": list(expression.to_prefix()),
+            "node_count": expression.stats.node_count,
+            "depth": expression.stats.depth,
+            "origin_ids": ["derived-origin"],
+            "source_ids": ["derived-source"],
+            "compatibility_record_fingerprint": "d" * 64,
+            "historical_metric_reuse": "forbidden",
+            "stage6_metric_recompute_required": True,
+            "vocabulary": vocabulary,
+        }
+        evaluator = Stage6CandidateEvaluator(context)
+        np.testing.assert_array_equal(
+            evaluator._interpreter.evaluate(expression),
+            derived[: context.dates.size, ret_cc1_index, :],
+        )
+        result = evaluator.evaluate(candidate)
+        self.assertIn(result.status, {"completed", "completed_invalid"})
+        for split in ("train", "validation"):
+            np.testing.assert_array_equal(
+                context.get_split_data(split).forward_returns,
+                self.context.get_split_data(split).forward_returns,
+            )
+
+        bad_vocabulary = {
+            **vocabulary,
+            "action_space_fingerprint": "0" * 64,
+        }
+        with self.assertRaisesRegex(ValueError, "vocabulary is invalid"):
+            evaluator.evaluate({**candidate, "vocabulary": bad_vocabulary})
+        with self.assertRaisesRegex(ValueError, "feature schema"):
+            Stage6CandidateEvaluator(self.context).evaluate(candidate)
 
     def test_requested_end_and_actual_latest_trade_date_are_distinct(self):
         config = Stage6EvaluationConfig(

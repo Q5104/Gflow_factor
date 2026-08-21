@@ -108,7 +108,8 @@ class RealRewardProvider(RewardProvider):
         self.cache_max_entries = cache_max_entries
         self.subexpression_cache_max_bytes = subexpression_cache_max_bytes
         self._interpreter = FactorInterpreter(
-            context.factor_tensor,
+            context.expression_feature_tensor,
+            ordered_feature_names=context.ordered_feature_names,
             subexpression_cache_max_bytes=subexpression_cache_max_bytes,
         )
         self._numba_warmup_seconds = warm_numba_kernels()

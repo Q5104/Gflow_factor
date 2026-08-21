@@ -13,7 +13,7 @@ from numpy.typing import NDArray
 from .config import SearchSpaceConfig
 from .grammar_state import DAGAction, GrammarSnapshot, GrammarState, OpenSlot
 from .partial_ast import SlotPath, open_hole_paths
-from .tokens import ACTIONS, TOTAL_ACTIONS, get_action
+from .tokens import ActionRegistry, RAW_ACTION_REGISTRY
 
 
 ConditionedStateKey = tuple[str, int, str]
@@ -81,20 +81,25 @@ class ExactNodeReachability:
     """Exact completion engine for a fixed runtime search space."""
 
     search_space: SearchSpaceConfig
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY
 
     def __post_init__(self) -> None:
         if not isinstance(self.search_space, SearchSpaceConfig):
             raise TypeError("search_space must be SearchSpaceConfig")
+        if not isinstance(self.action_registry, ActionRegistry):
+            raise TypeError("action_registry must be ActionRegistry")
 
     @property
     def _arities(self) -> tuple[int, ...]:
-        return tuple(sorted({action.arity for action in ACTIONS}))
+        return tuple(sorted({action.arity for action in self.action_registry.actions}))
 
     def _validate_state(self, state: GrammarState) -> None:
         if not isinstance(state, GrammarState):
             raise TypeError("state must be GrammarState")
         if state.search_space != self.search_space:
             raise ValueError("state and reachability engine must share search_space")
+        if state.action_registry != self.action_registry:
+            raise ValueError("state and reachability engine must share ActionRegistry")
 
     def reachable_terminal_node_counts(self, state: GrammarState) -> tuple[int, ...]:
         """Return all exact terminal sizes reachable from ``state``."""
@@ -158,7 +163,7 @@ class ExactNodeReachability:
         target_node_count = _validate_target_node_count(
             target_node_count, self.search_space
         )
-        mask = np.zeros(TOTAL_ACTIONS, dtype=np.bool_)
+        mask = np.zeros(self.action_registry.action_count, dtype=np.bool_)
         if state.done:
             return mask
         legacy_mask = state.get_legal_token_mask(slot)
@@ -166,17 +171,22 @@ class ExactNodeReachability:
         arity_is_feasible: dict[int, bool] = {}
         for token_id in np.flatnonzero(legacy_mask):
             token_id = int(token_id)
-            arity = get_action(token_id).arity
+            arity = self.action_registry.get_action(token_id).arity
             feasible = arity_is_feasible.get(arity)
             if feasible is None:
-                successor = state._step_unchecked(DAGAction(slot_path, token_id))
+                successor = state._step_unchecked(
+                    DAGAction(slot_path, token_id, self.action_registry)
+                )
                 feasible = self.can_complete_exactly(successor, target_node_count)
                 arity_is_feasible[arity] = feasible
             mask[token_id] = feasible
         return mask
 
     def resolve_strata(self) -> ExactNodeStrata:
-        source = GrammarState(search_space=self.search_space)
+        source = GrammarState(
+            search_space=self.search_space,
+            action_registry=self.action_registry,
+        )
         reachable = set(self.reachable_terminal_node_counts(source))
         candidates = range(1, self.search_space.max_nodes + 1)
         return ExactNodeStrata(
@@ -221,15 +231,22 @@ class ExactNodeGrammarState:
         *,
         target_node_count: int,
         search_space: SearchSpaceConfig,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
     ) -> "ExactNodeGrammarState":
         return cls(
-            GrammarState(search_space=search_space),
+            GrammarState(
+                search_space=search_space,
+                action_registry=action_registry,
+            ),
             target_node_count=target_node_count,
         )
 
     @property
     def reachability(self) -> ExactNodeReachability:
-        return ExactNodeReachability(self.state.search_space)
+        return ExactNodeReachability(
+            self.state.search_space,
+            self.state.action_registry,
+        )
 
     @property
     def search_space(self) -> SearchSpaceConfig:
@@ -286,7 +303,11 @@ class ExactNodeGrammarState:
         successor_keys: set[str] = set()
         for slot in self.open_slots():
             for token_id in self.legal_token_ids(slot):
-                action = DAGAction(slot.path, int(token_id))
+                action = DAGAction(
+                    slot.path,
+                    int(token_id),
+                    self.state.action_registry,
+                )
                 successor = self.state._step_unchecked(action)
                 if successor.state_key in successor_keys:
                     continue
@@ -301,6 +322,8 @@ class ExactNodeGrammarState:
             raise RuntimeError("terminal exact-node state cannot take another action")
         if not isinstance(action, DAGAction):
             raise TypeError("step requires DAGAction(slot_path, token_id)")
+        if action.action_registry != self.state.action_registry:
+            raise ValueError("DAGAction and ExactNodeGrammarState must share ActionRegistry")
         slot = self.state._resolve_slot(action.slot_path)
         if not bool(self.get_legal_token_mask(slot)[action.token_id]):
             raise ValueError(
@@ -350,8 +373,11 @@ class ExactNodeGrammarState:
         return -math.log(n_parents)
 
 
-def resolve_exact_node_strata(search_space: SearchSpaceConfig) -> ExactNodeStrata:
-    return ExactNodeReachability(search_space).resolve_strata()
+def resolve_exact_node_strata(
+    search_space: SearchSpaceConfig,
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+) -> ExactNodeStrata:
+    return ExactNodeReachability(search_space, action_registry).resolve_strata()
 
 
 __all__ = [

@@ -8,6 +8,7 @@ from pathlib import Path
 from factor_gfn.gfn import (
     ExhaustivePlanningConfig,
     ExhaustiveRegistry,
+    HybridVarianceTrainer,
     SyntheticRewardProvider,
     TrajectoryBalanceLoss,
     build_stage5_hybrid_variance_5_15_config,
@@ -20,6 +21,8 @@ from factor_gfn.gfn.exhaustive_registry_reuse import (
     prove_exhaustive_stratum_reuse,
 )
 from factor_gfn.grammar import (
+    DAILY_DERIVED_ACTION_REGISTRY,
+    DAILY_DERIVED_V1_FEATURE_SPACE,
     Expression,
     SearchSpaceConfig,
     action_space_fingerprint,
@@ -226,6 +229,72 @@ class HybridExactZCompatibilityTests(unittest.TestCase):
 
         for name, value in objective.named_buffers():
             self.assertTrue(value.equal(before[name]), name)
+
+    def test_derived_registry_proves_and_loads_without_raw_fallback(self):
+        provider = _CountingSyntheticRewardProvider()
+        config = build_stage5_hybrid_variance_5_15_config(
+            max_cycles=1,
+            feature_space=DAILY_DERIVED_V1_FEATURE_SPACE,
+        )
+        plan = resolve_exhaustive_plan(
+            SearchSpaceConfig(max_depth=2, max_nodes=2),
+            ExhaustivePlanningConfig(
+                explicit_include_node_counts=(1, 2),
+                approve_explicit_include_over_budget=True,
+            ),
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        )
+        path = Path(self.temporary.name) / "derived_registry.sqlite3"
+        with ExhaustiveRegistry(
+            path,
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        ) as registry:
+            registry.register_plan(
+                plan,
+                provider_fingerprint=provider.fingerprint(),
+                context_fingerprint=provider.manifest()["context_fingerprint"],
+            )
+            for candidate in registry.pending_candidates():
+                expression = Expression.from_prefix(
+                    candidate.prefix_token_ids,
+                    action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+                )
+                assignment = provider.evaluate(expression)
+                registry.record_evaluation(
+                    candidate.structural_hash,
+                    valid=True,
+                    reward_details={
+                        "reward_result": {
+                            "raw_reward": assignment.reward,
+                            "reward": assignment.reward,
+                            "log_reward": assignment.log_reward,
+                        }
+                    },
+                    target_mass=assignment.reward,
+                )
+            for node_count in (1, 2):
+                registry.compute_exact_masses(
+                    node_count,
+                    reward_floor=config.reward.reward_floor,
+                )
+
+        trainer = HybridVarianceTrainer(config, provider, device="cpu")
+        semantics = trainer.target_exhaustive_reuse_semantics()
+        with ExhaustiveRegistry(
+            path,
+            read_only=True,
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        ) as registry:
+            proofs = trainer.configure_hybrid_exhaustive_registry(
+                registry,
+                source_semantics_by_N={1: semantics, 2: semantics},
+            )
+        self.assertEqual(set(proofs), {1, 2})
+        self.assertEqual(set(trainer.registered_exact_masses_by_N), {1, 2})
+        self.assertEqual(
+            trainer.action_registry.fingerprint(),
+            DAILY_DERIVED_ACTION_REGISTRY.fingerprint(),
+        )
 
 
 if __name__ == "__main__":

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence, TYPE_CHECKING
 
 from factor_gfn.barra import STYLE_NAMES
-from factor_gfn.grammar import Expression
+from factor_gfn.grammar import RAW_ACTION_REGISTRY, ActionRegistry, Expression
 
 from .real_reward import REAL_REWARD_PROVIDER_SCHEMA, RealRewardEvaluationRecord
 
@@ -37,6 +37,20 @@ def _stable_json(value: Any) -> str:
 
 def _stable_hash(value: Any) -> str:
     return hashlib.sha256(_stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _vocabulary_identity(
+    action_registry: ActionRegistry,
+) -> dict[str, Any] | None:
+    if action_registry == RAW_ACTION_REGISTRY:
+        return None
+    return {
+        "feature_space_id": action_registry.feature_space.feature_space_id,
+        "feature_space_fingerprint": (
+            action_registry.feature_space_fingerprint
+        ),
+        "action_space_fingerprint": action_registry.fingerprint(),
+    }
 
 
 def _sha256_file(path: Path) -> str:
@@ -201,7 +215,7 @@ def _candidate_record(
         "condition_position_in_cycle": condition_position,
         "condition_N": expression.stats.node_count,
     }
-    return {
+    record = {
         "schema": TRAIN_CANDIDATE_RECORD_SCHEMA,
         "structural_hash": structural_hash,
         "formula": canonical.to_formula(),
@@ -248,6 +262,10 @@ def _candidate_record(
         "last_seen": seen,
         "visit_count": 1,
     }
+    vocabulary = _vocabulary_identity(canonical.action_registry)
+    if vocabulary is not None:
+        record["vocabulary"] = vocabulary
+    return record
 
 
 def _metric_identity(record: Mapping[str, Any]) -> dict[str, Any]:
@@ -292,12 +310,17 @@ class TrainCandidateArtifactWriter:
         provider: Any,
         expected_optimizer_step: int,
         create: bool,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
     ) -> None:
         if not supports_train_candidate_artifact(provider):
             raise TypeError("provider does not expose formal Train evaluation records")
         self.run_dir = run_dir.resolve()
         self.path = self.run_dir / TRAIN_CANDIDATE_ARTIFACT_FILENAME
         self.provider = provider
+        if not isinstance(action_registry, ActionRegistry):
+            raise TypeError("action_registry must be an ActionRegistry")
+        self.action_registry = action_registry
+        self.vocabulary_identity = _vocabulary_identity(action_registry)
         self.contract, self.contract_fingerprint = _contract(provider)
         self._provider_record_cursor = 0
         run_config_path = self.run_dir / "hybrid_run_config.json"
@@ -333,6 +356,11 @@ class TrainCandidateArtifactWriter:
             raise ValueError("Train candidate artifact identities are not unique and sorted")
         if payload.get("candidate_count") != len(records):
             raise ValueError("Train candidate artifact candidate count mismatch")
+        if payload.get("vocabulary") != self.vocabulary_identity:
+            raise ValueError("Train candidate artifact vocabulary mismatch")
+        for record in records:
+            if record.get("vocabulary") != self.vocabulary_identity:
+                raise ValueError("Train candidate record vocabulary mismatch")
         return payload
 
     def _write(self, records: Sequence[Mapping[str, Any]], optimizer_step: int) -> None:
@@ -346,6 +374,8 @@ class TrainCandidateArtifactWriter:
             "candidate_count": len(ordered),
             "records": ordered,
         }
+        if self.vocabulary_identity is not None:
+            payload["vocabulary"] = self.vocabulary_identity
         _atomic_write_json(self.path, payload)
 
     @property
@@ -375,6 +405,10 @@ class TrainCandidateArtifactWriter:
         diagnostics = output.diagnostics
         for trajectory in output.collection.trajectories:
             expression = trajectory.terminal_expression.canonicalize()
+            if expression.action_registry != self.action_registry:
+                raise ValueError(
+                    "Train candidate expression 与 writer ActionRegistry 不一致"
+                )
             structural_hash = expression.structural_hash()
             existing = by_hash.get(structural_hash)
             if existing is None:

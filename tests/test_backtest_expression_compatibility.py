@@ -12,11 +12,16 @@ from factor_gfn.backtest.expression_compatibility import (
     _find_grammar_path,
     _group_status,
     _synthetic_fixture,
+    action_registry_for_vocabulary,
     audit_expression_compatibility,
 )
 from factor_gfn.backtest.sources import CandidateSourceSpec, materialize_source_set
 from factor_gfn.evaluator import FactorInterpreter
-from factor_gfn.grammar import Expression, get_action_id
+from factor_gfn.grammar import (
+    DAILY_DERIVED_ACTION_REGISTRY,
+    Expression,
+    get_action_id,
+)
 from factor_gfn.grammar.tokens import action_space_fingerprint
 
 
@@ -117,6 +122,48 @@ class ExpressionCompatibilityTests(unittest.TestCase):
         self.assertEqual(result["status"], AUTO_REJECT)
         self.assertIn("prefix_parse_invalid", result["reason_codes"])
         self.assertIsNone(rebuilt)
+
+    def test_derived_prefix_round_trip_uses_derived_registry(self) -> None:
+        registry = DAILY_DERIVED_ACTION_REGISTRY
+        expression = Expression.from_prefix(
+            [
+                registry.get_action_id("ts_mean", 5),
+                registry.get_action_id("ret_cc1"),
+            ],
+            action_registry=registry,
+        )
+        vocabulary = {
+            "feature_space_id": registry.feature_space.feature_space_id,
+            "feature_space_fingerprint": registry.feature_space_fingerprint,
+            "action_space_fingerprint": registry.fingerprint(),
+        }
+        representation = self._representation(expression)
+        representation["vocabulary"] = vocabulary
+        result, rebuilt = self._audit(
+            representation,
+            claimed_hash=expression.structural_hash(),
+        )
+        self.assertEqual(result["status"], AUTO_ACCEPT)
+        self.assertEqual(result["vocabulary"], vocabulary)
+        self.assertIsNotNone(rebuilt)
+        assert rebuilt is not None
+        self.assertEqual(rebuilt.action_registry, registry)
+        self.assertEqual(rebuilt.to_formula(), expression.to_formula())
+
+    def test_unknown_vocabulary_fails_closed(self) -> None:
+        vocabulary = {
+            "feature_space_id": "daily_derived_v1",
+            "feature_space_fingerprint": "0" * 64,
+            "action_space_fingerprint": "1" * 64,
+        }
+        representation = self._representation()
+        representation["vocabulary"] = vocabulary
+        result, rebuilt = self._audit(representation)
+        self.assertEqual(result["status"], AUTO_REJECT)
+        self.assertIn("vocabulary_invalid", result["reason_codes"])
+        self.assertIsNone(rebuilt)
+        with self.assertRaisesRegex(ValueError, "未知|不匹配"):
+            action_registry_for_vocabulary(vocabulary)
 
     def test_grammar_path_is_early_exit_and_respects_depth_boundary(self) -> None:
         expression = self._expression()

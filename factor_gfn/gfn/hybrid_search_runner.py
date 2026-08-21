@@ -224,6 +224,7 @@ def create_hybrid_variance_runner(
             provider=trainer.reward_provider,
             expected_optimizer_step=trainer.optimizer_step,
             create=True,
+            action_registry=trainer.action_registry,
         )
         if train_artifact_enabled
         else None
@@ -289,6 +290,7 @@ def resume_hybrid_variance_runner(
             provider=trainer.reward_provider,
             expected_optimizer_step=trainer.optimizer_step,
             create=False,
+            action_registry=trainer.action_registry,
         )
     checkpoint_history = runner._history_manifest()
     persisted_history = _read_jsonl(runner.diagnostics_path)

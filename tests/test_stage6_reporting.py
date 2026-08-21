@@ -200,7 +200,7 @@ def _formal_fixture(root: Path) -> dict[str, Path]:
 class Stage6ReportingDataTests(unittest.TestCase):
     def test_universe_contract_and_validation_missing_are_preserved(self):
         bundle = _bundle()
-        self.assertEqual(bundle.funnel_summary["remaining_count"].tolist(), [4, 3, 3, 2, 2, 1])
+        self.assertEqual(bundle.funnel_summary["remaining_count"].tolist(), [4, 3, 3, 2, 2, 1, 1])
         validation_condition = bundle.hard_filter_condition_summary.set_index("condition").loc["validation_abs_ic_gt_0_01"]
         self.assertEqual(int(validation_condition["observed_count"]), 3)
         self.assertEqual(int(validation_condition["not_evaluated_count"]), 1)
@@ -213,6 +213,16 @@ class Stage6ReportingDataTests(unittest.TestCase):
         self.assertEqual(metrics.loc[_hash(1), "abs_train_ic"], abs(.03))
         self.assertEqual(set(bundle.decorrelation_input["structural_hash"]), {_hash(1), _hash(2)})
         self.assertEqual(set(bundle.provisional_factor_pool["structural_hash"]), {_hash(1)})
+        self.assertEqual(bundle.top100_candidate_metrics["provisional_rank"].tolist(), [1])
+        self.assertEqual(bundle.top_candidate_examples["structural_hash"].tolist(), [_hash(1)])
+        self.assertEqual(
+            bundle.complexity_summary["metric"].tolist(),
+            ["node_count", "depth", "operator_count", "leaf_count"],
+        )
+        self.assertEqual(set(bundle.complexity_summary["universe"]), {"frozen_order_top100"})
+        self.assertIn("operator_count", bundle.top100_candidate_metrics.columns)
+        self.assertIn("leaf_count", bundle.top100_candidate_metrics.columns)
+        self.assertEqual(bundle.after_top20_correlation.shape, (1, 1))
 
     def test_universe_mismatch_fails_closed(self):
         bundle = _bundle()
@@ -293,7 +303,7 @@ class Stage6ReportingFormalGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             paths = _formal_fixture(Path(temporary))
             bundle = load_stage6_report_data(**paths)
-            self.assertEqual(bundle.funnel_summary["remaining_count"].tolist(), [1, 1, 1, 1, 1, 1])
+            self.assertEqual(bundle.funnel_summary["remaining_count"].tolist(), [1, 1, 1, 1, 1, 1, 1])
 
     def test_selection_oos_smoke_and_scope_fail_closed(self):
         for field, value, message in (
@@ -350,14 +360,26 @@ class Stage6ReportingRendererTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             renderer = Stage6ReportRenderer(bundle, Path(temporary) / "report")
             outputs = renderer.render_all()
-            self.assertEqual(len(outputs["figures"]), 15)
-            self.assertEqual(len(outputs["tables"]), 15)
+            self.assertEqual(len(outputs["figures"]), 21)
+            self.assertEqual(len(outputs["tables"]), 19)
             self.assertTrue(all(path.is_file() and path.stat().st_size > 0 for path in outputs["figures"] + outputs["tables"]))
             manifest = json.loads(outputs["manifest"].read_text(encoding="utf-8"))
-            self.assertEqual(manifest["report_schema"], "factor_gfn.reporting.stage6_report.v1")
+            self.assertEqual(manifest["report_schema"], "factor_gfn.reporting.stage6_report.v2")
+            self.assertEqual(manifest["report_version"], 2)
             self.assertEqual(manifest["candidate_universe_counts"]["provisional_pool"], 1)
+            self.assertEqual(manifest["candidate_universe_counts"]["frozen_order_top100"], 1)
+            self.assertIn("05_train_long_excess_corr_after_top20.png", [path.name for path in outputs["figures"]])
+            self.assertNotIn("04_candidate_quality_summary.png", [path.name for path in outputs["figures"]])
+            self.assertIn("06_top100_quality_summary.png", [path.name for path in outputs["figures"]])
+            self.assertIn("06_top100_ic_distribution.png", [path.name for path in outputs["figures"]])
+            self.assertIn("06_top100_long_ir_distribution.png", [path.name for path in outputs["figures"]])
+            self.assertIn("06_top100_barra_corr_distribution.png", [path.name for path in outputs["figures"]])
+            self.assertIn("06_complexity_summary.png", [path.name for path in outputs["figures"]])
+            self.assertIn("07_top_candidate_examples.png", [path.name for path in outputs["figures"]])
+            self.assertIn("05_after_top20_correlation_matrix.csv", [path.name for path in outputs["tables"]])
+            self.assertIn("06_top100_candidate_metrics.csv", [path.name for path in outputs["tables"]])
             funnel = renderer.figure_candidate_screening_funnel()
-            self.assertGreaterEqual(len(funnel.axes[0].patches), 6)
+            self.assertGreaterEqual(len(funnel.axes[0].patches), 7)
             plt.close(funnel)
 
     def test_notebook_is_unexecuted_and_has_required_sections(self):
@@ -365,7 +387,7 @@ class Stage6ReportingRendererTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "notebooks" / "stage6_reporting.ipynb"
         notebook = nbformat.read(path, as_version=4)
         headings = ["".join(cell.source) for cell in notebook.cells if cell.cell_type == "markdown"]
-        required = ["00 Parameters and Source Validation", "01 Screening Funnel", "02 Hard Filter Diagnostics", "03 Train → Validation Stability", "04 Quality Before / After", "05 Decorrelation", "06 Provisional Factor Pool", "07 Expression Structure Shift", "08 Export"]
+        required = ["00 Parameters and Source Validation", "01 Screening Funnel", "02 Hard Filter Diagnostics", "03 Train → Validation Stability", "04 Quality Before / After", "05 Decorrelation", "06 Provisional Factor Pool and Frozen-order Top100", "07 Ranked Candidate Examples and Expression Structure Shift", "08 Export"]
         positions = [next(index for index, text in enumerate(headings) if heading in text) for heading in required]
         self.assertEqual(positions, sorted(positions))
         for cell in notebook.cells:
@@ -375,6 +397,14 @@ class Stage6ReportingRendererTests(unittest.TestCase):
         code = "\n".join(cell.source for cell in notebook.cells if cell.cell_type == "code")
         self.assertNotIn("EvaluationStore", code)
         self.assertNotIn("pair_correlation", code)
+        self.assertIn("stage6_reporting_v2", code)
+        self.assertIn("figure_train_long_excess_corr_after_top20", code)
+        self.assertNotIn("figure_candidate_quality_summary", code)
+        self.assertIn("figure_top100_quality_summary", code)
+        self.assertIn("figure_top100_ic_distribution", code)
+        self.assertIn("figure_top100_long_ir_distribution", code)
+        self.assertIn("figure_top100_barra_corr_distribution", code)
+        self.assertIn("figure_top_candidate_examples", code)
 
 
 if __name__ == "__main__":

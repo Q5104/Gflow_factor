@@ -281,7 +281,7 @@ class FullSyntheticOOSBaselineE2ETests(unittest.TestCase):
         deciles = self.report.decile_return_table.set_index("Strategy")
         nav = self.verified_evaluation.payloads["nav_series"]
         for strategy_id, display_name in zip(
-            STRATEGY_IDS, ("Equal Weight", "Fixed ICIR", "LightGBM")
+            STRATEGY_IDS, ("Equal Weight", "Rolling ICIR", "LightGBM")
         ):
             self.assertGreater(performance[strategy_id]["mean_rank_ic"], 0.0)
             self.assertGreater(deciles.loc[display_name, "G10"], deciles.loc[display_name, "G1"])
@@ -321,10 +321,41 @@ class FullSyntheticOOSBaselineE2ETests(unittest.TestCase):
         report_manifest = json.loads(
             self.report_manifest_path.read_text(encoding="utf-8")
         )
-        self.assertEqual(len(report_manifest["figures"]), 10)
-        self.assertEqual(len(report_manifest["tables"]), 6)
-        self.assertEqual(len(list((self.output_dir / "figures").glob("*.png"))), 10)
-        self.assertEqual(len(list((self.output_dir / "tables").glob("*.csv"))), 6)
+        self.assertEqual(len(report_manifest["figures"]), 20)
+        self.assertEqual(len(report_manifest["tables"]), 8)
+        self.assertEqual(len(list((self.output_dir / "figures").glob("*.png"))), 20)
+        self.assertEqual(len(list((self.output_dir / "tables").glob("*.csv"))), 8)
+        self.assertIn(
+            "01_oos_strategy_performance_comparison.png",
+            report_manifest["figures"],
+        )
+        self.assertIn(
+            "16_rolling_icir_excess_nav_drawdown.png",
+            report_manifest["figures"],
+        )
+        self.assertIn(
+            "05_rolling_icir_test_strategy_score_rankic.png",
+            report_manifest["figures"],
+        )
+        renderer = OOSReportRenderer(self.report, self.output_dir)
+        annual_figure = renderer.figure_annual_returns("fixed_icir")
+        annual_year_count = self.report.portfolio_returns.loc[
+            self.report.portfolio_returns["strategy_id"] == "fixed_icir", "date"
+        ].dt.year.nunique()
+        self.assertEqual(len(annual_figure.axes[0].patches), annual_year_count)
+        self.assertIn("滚动 ICIR", annual_figure.axes[0].get_title())
+        excess_figure = renderer.figure_excess_nav_drawdown("fixed_icir")
+        self.assertEqual(len(excess_figure.axes), 2)
+        self.assertEqual(excess_figure.axes[1].get_xlabel(), "调仓日期")
+        rank_ic_figure = renderer.figure_rank_ic("fixed_icir")
+        self.assertEqual(len(rank_ic_figure.axes), 2)
+        self.assertIn("滚动 ICIR", rank_ic_figure.axes[0].get_title())
+        self.assertEqual(
+            len(rank_ic_figure.axes[0].patches),
+            len(self.report.strategy_rank_ic_by_date.loc[
+                self.report.strategy_rank_ic_by_date["strategy_id"] == "fixed_icir"
+            ]),
+        )
 
         notebook_path = Path(__file__).parents[1] / "notebooks" / "oos_baseline_evaluation.ipynb"
         notebook = nbformat.read(notebook_path, as_version=4)
@@ -334,26 +365,15 @@ class FullSyntheticOOSBaselineE2ETests(unittest.TestCase):
             if cell.cell_type == "code" and cell.get("id") == "e1b-00-load"
         )
         loader_source = re.sub(
-            r"EVALUATION_MANIFEST = Path\([\s\S]*?\)\nFACTOR_POOL_FINGERPRINT",
-            f"EVALUATION_MANIFEST = Path(r{str(self.verified_evaluation.manifest_path)!r})\nFACTOR_POOL_FINGERPRINT",
-            loader_source,
-            count=1,
-        )
-        loader_source = re.sub(
-            r"FACTOR_POOL_FINGERPRINT = \([\s\S]*?\)\nSTRATEGY_BUNDLE_FINGERPRINT",
-            f"FACTOR_POOL_FINGERPRINT = {self.pool.baseline_factor_pool_fingerprint!r}\nSTRATEGY_BUNDLE_FINGERPRINT",
-            loader_source,
-            count=1,
-        )
-        loader_source = re.sub(
-            r"STRATEGY_BUNDLE_FINGERPRINT = \([\s\S]*?\)\nTEST_SCORE_ARTIFACT_FINGERPRINT",
-            f"STRATEGY_BUNDLE_FINGERPRINT = {self.bundle.bundle_fingerprint!r}\nTEST_SCORE_ARTIFACT_FINGERPRINT",
-            loader_source,
-            count=1,
-        )
-        loader_source = re.sub(
-            r"TEST_SCORE_ARTIFACT_FINGERPRINT = \([\s\S]*?\)\nOUTPUT_ROOT",
-            f"TEST_SCORE_ARTIFACT_FINGERPRINT = {self.test_scores.fingerprint!r}\nOUTPUT_ROOT",
+            r"LATEST_POINTER = [\s\S]*?TEST_SCORE_ARTIFACT_FINGERPRINT = manifest_identity\['test_score_artifact_fingerprint'\]",
+            "\n".join(
+                (
+                    f"EVALUATION_MANIFEST = Path(r{str(self.verified_evaluation.manifest_path)!r})",
+                    f"FACTOR_POOL_FINGERPRINT = {self.pool.baseline_factor_pool_fingerprint!r}",
+                    f"STRATEGY_BUNDLE_FINGERPRINT = {self.bundle.bundle_fingerprint!r}",
+                    f"TEST_SCORE_ARTIFACT_FINGERPRINT = {self.test_scores.fingerprint!r}",
+                )
+            ),
             loader_source,
             count=1,
         )

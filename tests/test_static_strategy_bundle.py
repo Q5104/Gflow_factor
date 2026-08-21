@@ -34,6 +34,7 @@ from factor_gfn.backtest.stage6_evaluation import (
     _stable_hash,
     build_stage6_evaluation_context_from_arrays,
 )
+from factor_gfn.backtest.rolling_icir import RollingICIRConfig
 from factor_gfn.backtest.static_strategy_bundle import (
     FIXED_ICIR_FILENAME,
     LIGHTGBM_MODEL_FILENAME,
@@ -422,10 +423,18 @@ class LinearStrategyTests(unittest.TestCase):
         np.testing.assert_allclose(scores.strategy_scores, 0.0)
         self.assertFalse(score_api_accepts_labels())
 
-    def test_fixed_icir_ddof1_positive_clipping_and_frozen_score(self):
+    def test_rolling_icir_seed_ddof1_positive_clipping_and_initial_score(self):
         matrices = _manual_matrices()
         strategy = build_fixed_icir_strategy(
-            matrices, min_cross_section_count=2
+            matrices,
+            min_cross_section_count=2,
+            rolling_config=RollingICIRConfig(
+                window_observations=4,
+                min_observations=2,
+                shrinkage_to_equal=0.0,
+                max_weight=1.0,
+                min_cross_section_count=2,
+            ),
         )
         self.assertFalse(strategy.metadata["fallback_status"])
         np.testing.assert_allclose(strategy.weights, [1.0, 0.0])
@@ -433,13 +442,14 @@ class LinearStrategyTests(unittest.TestCase):
         self.assertGreater(per_factor[0]["icir"], 0)
         self.assertLess(per_factor[1]["icir"], 0)
         self.assertEqual(per_factor[0]["observation_count"], 4)
+        self.assertEqual(strategy.metadata["strategy_semantics"], "causal_rolling_icir_replaces_fixed_icir")
         scores = score_frozen_strategy(strategy, matrices.splits["train"].features)
         np.testing.assert_allclose(
             scores.strategy_scores,
             matrices.splits["train"].features.values[:, 0],
         )
 
-    def test_fixed_icir_all_nonpositive_falls_back_to_equal(self):
+    def test_rolling_icir_seed_all_nonpositive_falls_back_to_equal(self):
         matrices = _manual_matrices()
         swapped = {}
         for name, split in matrices.splits.items():

@@ -20,9 +20,10 @@ class Stage5ContextTests(unittest.TestCase):
         stocks = np.array(["000001", "000002", "600000"])
         day = np.arange(dates.size, dtype=np.float64)[:, None]
         stock = np.arange(stocks.size, dtype=np.float64)[None, :]
-        tensor = np.empty((dates.size, 2, stocks.size), dtype=np.float64)
+        tensor = np.empty((dates.size, 6, stocks.size), dtype=np.float64)
         tensor[:, 0, :] = 10.0 + day + stock
-        tensor[:, 1, :] = 20.0 + day + stock
+        for feature_index in range(1, 6):
+            tensor[:, feature_index, :] = 20.0 + feature_index + day + stock
         universe = np.ones((dates.size, stocks.size), dtype=bool)
         industry = np.tile(np.array([1, 1, 2], dtype=np.int32), (dates.size, 1))
         exposures = {
@@ -101,6 +102,46 @@ class Stage5ContextTests(unittest.TestCase):
         )
         self.assertEqual(oos.boundary.name, "oos")
         self.assertEqual(context.manifest["oos"]["candidate_evaluation_count"], 0)
+
+    def test_derived_expression_tensor_keeps_raw_open_labels(self) -> None:
+        raw = self._build_context()
+        derived = np.empty((raw.dates.size, 16, raw.stocks.size), dtype=np.float64)
+        for feature_index in range(16):
+            derived[:, feature_index, :] = feature_index + np.arange(
+                raw.dates.size, dtype=np.float64
+            )[:, None]
+        rebuilt = build_stage5_context_from_arrays(
+            dates=raw.dates,
+            stocks=raw.stocks,
+            factor_tensor=derived,
+            raw_open=raw._factor_tensor[:, 0, :],
+            ordered_feature_names=tuple(f"derived_{index}" for index in range(16)),
+            universe_mask=raw._universe_mask,
+            industry_labels=raw._industry_labels,
+            barra_exposures=raw._barra_exposures,
+            config=raw.config,
+        )
+
+        self.assertIs(rebuilt.expression_feature_tensor, rebuilt._factor_tensor)
+        self.assertEqual(rebuilt.expression_feature_tensor.shape[1], 16)
+        np.testing.assert_array_equal(rebuilt._forward_returns, raw._forward_returns)
+
+        changed = derived.copy()
+        changed[:, 0, :] += 10000.0
+        changed_context = build_stage5_context_from_arrays(
+            dates=raw.dates,
+            stocks=raw.stocks,
+            factor_tensor=changed,
+            raw_open=raw._factor_tensor[:, 0, :],
+            ordered_feature_names=rebuilt.ordered_feature_names,
+            universe_mask=raw._universe_mask,
+            industry_labels=raw._industry_labels,
+            barra_exposures=raw._barra_exposures,
+            config=raw.config,
+        )
+        np.testing.assert_array_equal(
+            changed_context._forward_returns, raw._forward_returns
+        )
 
     def test_config_rejects_overlapping_splits(self) -> None:
         with self.assertRaisesRegex(ValueError, "互不重叠"):

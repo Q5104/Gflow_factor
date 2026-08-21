@@ -13,6 +13,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from factor_gfn.grammar import (
+    RAW_ACTION_REGISTRY,
+    ActionRegistry,
     ExactNodeGrammarState,
     Expression,
     SearchSpaceConfig,
@@ -123,9 +125,21 @@ class CanonicalCountResult:
     expressions: tuple[Expression, ...] = field(repr=False, compare=False)
 
     def manifest(self) -> dict[str, Any]:
-        payload = asdict(self)
-        payload.pop("expressions")
-        return payload
+        # Do not recurse into Expression: it carries an immutable ActionRegistry
+        # whose mapping proxies are intentionally not deepcopy/pickle objects.
+        return {
+            "node_count": self.node_count,
+            "canonical_terminal_count": self.canonical_terminal_count,
+            "canonical_count_exact": self.canonical_count_exact,
+            "count_cap_reached": self.count_cap_reached,
+            "count_relation": self.count_relation,
+            "depth_distribution": dict(self.depth_distribution),
+            "depth_distribution_exact": self.depth_distribution_exact,
+            "estimated_evaluation_seconds": self.estimated_evaluation_seconds,
+            "estimated_evaluation_seconds_is_lower_bound": (
+                self.estimated_evaluation_seconds_is_lower_bound
+            ),
+        }
 
 
 def count_canonical_terminals(
@@ -134,13 +148,19 @@ def count_canonical_terminals(
     target_node_count: int,
     canonical_count_cap: int | None = 10_000,
     estimated_seconds_per_candidate: float = 0.75,
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
 ) -> CanonicalCountResult:
     """Enumerate unique canonical terminals, stopping at cap + 1 when bounded."""
 
     if not isinstance(search_space, SearchSpaceConfig):
         raise TypeError("search_space must be SearchSpaceConfig")
+    if not isinstance(action_registry, ActionRegistry):
+        raise TypeError("action_registry must be ActionRegistry")
     target_node_count = _positive_int(target_node_count, "target_node_count")
-    feasible = resolve_exact_node_strata(search_space).resolved_feasible_node_counts
+    feasible = resolve_exact_node_strata(
+        search_space,
+        action_registry,
+    ).resolved_feasible_node_counts
     if target_node_count not in feasible:
         raise ValueError(f"target_node_count={target_node_count} is infeasible")
     if canonical_count_cap is not None:
@@ -153,6 +173,7 @@ def count_canonical_terminals(
     source = ExactNodeGrammarState.source(
         target_node_count=target_node_count,
         search_space=search_space,
+        action_registry=action_registry,
     )
     pending = [source]
     visited_states = {source.conditioned_key}
@@ -213,6 +234,11 @@ class ExhaustivePlan:
     resolved_estimated_evaluation_seconds: float
     explicit_over_budget_approval_used: bool
     planning_config: ExhaustivePlanningConfig
+    action_registry: ActionRegistry = field(
+        default=RAW_ACTION_REGISTRY,
+        repr=False,
+        compare=False,
+    )
 
     def count_result(self, node_count: int) -> CanonicalCountResult:
         for result in self.count_results:
@@ -221,7 +247,7 @@ class ExhaustivePlan:
         raise KeyError(node_count)
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        manifest = {
             "schema": EXHAUSTIVE_PLANNING_SCHEMA,
             "search_space_fingerprint": self.search_space_fingerprint,
             "resolved_feasible_node_counts": self.resolved_feasible_node_counts,
@@ -236,6 +262,9 @@ class ExhaustivePlan:
             "explicit_over_budget_approval_used": self.explicit_over_budget_approval_used,
             "planning_config": self.planning_config.manifest(),
         }
+        if self.action_registry.fingerprint() != RAW_ACTION_REGISTRY.fingerprint():
+            manifest["vocabulary"] = _vocabulary_identity(self.action_registry)
+        return manifest
 
     def fingerprint(self) -> str:
         payload = json.dumps(
@@ -247,6 +276,8 @@ class ExhaustivePlan:
 def resolve_exhaustive_plan(
     search_space: SearchSpaceConfig,
     config: ExhaustivePlanningConfig = ExhaustivePlanningConfig(),
+    *,
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
 ) -> ExhaustivePlan:
     """Count feasible strata and resolve E/S under one cumulative cost budget."""
 
@@ -254,7 +285,12 @@ def resolve_exhaustive_plan(
         raise TypeError("search_space must be SearchSpaceConfig")
     if not isinstance(config, ExhaustivePlanningConfig):
         raise TypeError("config must be ExhaustivePlanningConfig")
-    feasible = resolve_exact_node_strata(search_space).resolved_feasible_node_counts
+    if not isinstance(action_registry, ActionRegistry):
+        raise TypeError("action_registry must be ActionRegistry")
+    feasible = resolve_exact_node_strata(
+        search_space,
+        action_registry,
+    ).resolved_feasible_node_counts
     feasible_set = set(feasible)
     configured = set(config.explicit_include_node_counts) | set(
         config.explicit_exclude_node_counts
@@ -293,6 +329,7 @@ def resolve_exhaustive_plan(
             target_node_count=node_count,
             canonical_count_cap=cap,
             estimated_seconds_per_candidate=seconds_per_candidate,
+            action_registry=action_registry,
         )
         if node_count in include:
             if not result.canonical_count_exact:
@@ -340,6 +377,7 @@ def resolve_exhaustive_plan(
         resolved_estimated_evaluation_seconds=running_cost,
         explicit_over_budget_approval_used=approval_used,
         planning_config=config,
+        action_registry=action_registry,
     )
 
 
@@ -374,12 +412,31 @@ class ExactMassResult:
     aggregation_fingerprint: str
 
 
+def _vocabulary_identity(action_registry: ActionRegistry) -> dict[str, Any]:
+    return {
+        "feature_space_id": action_registry.feature_space.feature_space_id,
+        "feature_space_fingerprint": action_registry.feature_space_fingerprint,
+        "action_space_fingerprint": action_registry.fingerprint(),
+        "action_count": action_registry.action_count,
+    }
+
+
 class ExhaustiveRegistry:
     """SQLite-backed authoritative pool, separate from discovery evaluations."""
 
-    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        read_only: bool = False,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+    ) -> None:
+        if not isinstance(action_registry, ActionRegistry):
+            raise TypeError("action_registry must be ActionRegistry")
         self.path = Path(path)
         self.read_only = bool(read_only)
+        self.action_registry = action_registry
+        existed_before_open = self.path.is_file()
         if self.read_only:
             if not self.path.is_file():
                 raise FileNotFoundError(self.path)
@@ -392,14 +449,12 @@ class ExhaustiveRegistry:
         self._connection.execute("PRAGMA foreign_keys = ON")
         if self.read_only:
             self._connection.execute("PRAGMA query_only = ON")
-            row = self._connection.execute(
-                "SELECT value_json FROM metadata WHERE key = 'schema'"
-            ).fetchone()
-            if row is None or json.loads(row["value_json"]) != EXHAUSTIVE_REGISTRY_SCHEMA:
-                self._connection.close()
-                raise ValueError("read-only exhaustive registry schema is incompatible")
+            self._validate_schema()
+        elif existed_before_open:
+            self._validate_schema()
         else:
             self._create_schema()
+        self._validate_existing_vocabulary_identity()
 
     def close(self) -> None:
         self._connection.close()
@@ -460,6 +515,18 @@ class ExhaustiveRegistry:
             )
             self._set_metadata("schema", EXHAUSTIVE_REGISTRY_SCHEMA)
 
+    def _validate_schema(self) -> None:
+        try:
+            row = self._connection.execute(
+                "SELECT value_json FROM metadata WHERE key = 'schema'"
+            ).fetchone()
+        except sqlite3.DatabaseError as exc:
+            self._connection.close()
+            raise ValueError("exhaustive registry schema is incompatible") from exc
+        if row is None or json.loads(row["value_json"]) != EXHAUSTIVE_REGISTRY_SCHEMA:
+            self._connection.close()
+            raise ValueError("exhaustive registry schema is incompatible")
+
     def _set_metadata(self, key: str, value: Any) -> None:
         encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
         row = self._connection.execute(
@@ -471,6 +538,50 @@ class ExhaustiveRegistry:
             "INSERT OR IGNORE INTO metadata(key, value_json) VALUES (?, ?)",
             (key, encoded),
         )
+
+    def _metadata_value(self, key: str) -> Any | None:
+        row = self._connection.execute(
+            "SELECT value_json FROM metadata WHERE key = ?",
+            (key,),
+        ).fetchone()
+        return None if row is None else json.loads(row["value_json"])
+
+    def _validate_existing_vocabulary_identity(self) -> None:
+        expected = _vocabulary_identity(self.action_registry)
+        stored = {
+            key: self._metadata_value(key)
+            for key in expected
+            if self._metadata_value(key) is not None
+        }
+        if stored:
+            missing = sorted(set(expected) - set(stored))
+            differing = sorted(
+                key for key in stored if stored[key] != expected[key]
+            )
+            if missing or differing:
+                self._connection.close()
+                raise ValueError(
+                    "exhaustive registry vocabulary identity mismatch: "
+                    f"missing={missing}, differing={differing}"
+                )
+            return
+
+        has_plan = self._metadata_value("plan_fingerprint") is not None
+        if (
+            has_plan
+            and self.action_registry.fingerprint()
+            != RAW_ACTION_REGISTRY.fingerprint()
+        ):
+            self._connection.close()
+            raise ValueError(
+                "legacy exhaustive registry without vocabulary identity is Raw-only"
+            )
+
+    def _bind_vocabulary_identity(self) -> None:
+        if self.action_registry.fingerprint() == RAW_ACTION_REGISTRY.fingerprint():
+            return
+        for key, value in _vocabulary_identity(self.action_registry).items():
+            self._set_metadata(key, value)
 
     def _require_writable(self) -> None:
         if self.read_only:
@@ -486,7 +597,10 @@ class ExhaustiveRegistry:
         self._require_writable()
         if not provider_fingerprint or not context_fingerprint:
             raise ValueError("provider/context fingerprints must be non-empty")
+        if plan.action_registry.fingerprint() != self.action_registry.fingerprint():
+            raise ValueError("plan and exhaustive registry ActionRegistry mismatch")
         with self._connection:
+            self._bind_vocabulary_identity()
             self._set_metadata("plan_fingerprint", plan.fingerprint())
             self._set_metadata("plan_manifest", plan.manifest())
             for node_count in plan.resolved_exhaustive_node_counts:

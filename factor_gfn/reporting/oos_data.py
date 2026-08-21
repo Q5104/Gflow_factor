@@ -12,10 +12,10 @@ from factor_gfn.backtest.oos_evaluation import VerifiedOOSBaselineEvaluation
 from factor_gfn.backtest.static_strategy_bundle import STRATEGY_IDS
 
 
-OOS_REPORT_DATA_SCHEMA = "factor_gfn.reporting.oos_baseline_data.v1"
+OOS_REPORT_DATA_SCHEMA = "factor_gfn.reporting.oos_baseline_data.v2"
 DISPLAY_NAMES = {
     "equal_weight": "Equal Weight",
-    "fixed_icir": "Fixed ICIR",
+    "fixed_icir": "Rolling ICIR",
     "lightgbm": "LightGBM",
 }
 
@@ -30,6 +30,8 @@ class OOSReportDataBundle:
     portfolio_returns: pd.DataFrame
     turnover_by_date: pd.DataFrame
     nav_series: pd.DataFrame
+    rolling_icir_weights_by_update: pd.DataFrame
+    rolling_icir_diagnostics_by_update: pd.DataFrame
     strategy_score_correlation: pd.DataFrame
     main_strategy_performance_summary: pd.DataFrame
     decile_return_table: pd.DataFrame
@@ -128,8 +130,11 @@ def build_oos_report_data(
         {"Field": "Test Score Artifact fingerprint", "Value": freeze["test_score_artifact_fingerprint"]},
         {"Field": "Equal K", "Value": freeze["equal_weight"]["K"]},
         {"Field": "Equal weights identity", "Value": freeze["equal_weight"]["weights_identity"]},
-        {"Field": "Fixed ICIR weights fingerprint", "Value": freeze["fixed_icir"]["weights_fingerprint"]},
-        {"Field": "Fixed ICIR development IC contract", "Value": json.dumps(freeze["fixed_icir"]["development_ic_contract"], ensure_ascii=True, sort_keys=True)},
+        {"Field": "Rolling ICIR initial weights fingerprint", "Value": freeze["fixed_icir"]["initial_weights_fingerprint"]},
+        {"Field": "Rolling ICIR weight path fingerprint", "Value": freeze["fixed_icir"]["weight_path_fingerprint"]},
+        {"Field": "Rolling ICIR update count", "Value": freeze["fixed_icir"]["update_count"]},
+        {"Field": "Rolling ICIR config", "Value": json.dumps(freeze["fixed_icir"]["rolling_config"], ensure_ascii=True, sort_keys=True)},
+        {"Field": "Rolling ICIR development IC contract", "Value": json.dumps(freeze["fixed_icir"]["development_ic_contract"], ensure_ascii=True, sort_keys=True)},
         {"Field": "LightGBM parameter fingerprint", "Value": freeze["lightgbm"]["parameter_fingerprint"]},
         {"Field": "LightGBM best_iteration", "Value": freeze["lightgbm"]["best_iteration"]},
         {"Field": "LightGBM selection model fingerprint", "Value": freeze["lightgbm"]["selection_model_fingerprint"]},
@@ -154,6 +159,12 @@ def build_oos_report_data(
         portfolio_returns=payloads["portfolio_returns"].copy(),
         turnover_by_date=payloads["turnover_by_date"].copy(),
         nav_series=payloads["nav_series"].copy(),
+        rolling_icir_weights_by_update=payloads[
+            "rolling_icir_weights_by_update"
+        ].copy(),
+        rolling_icir_diagnostics_by_update=payloads[
+            "rolling_icir_diagnostics_by_update"
+        ].copy(),
         strategy_score_correlation=correlation_frame,
         main_strategy_performance_summary=pd.DataFrame(main_rows),
         decile_return_table=pd.DataFrame(decile_rows),

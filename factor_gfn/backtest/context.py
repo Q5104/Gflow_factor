@@ -14,8 +14,16 @@ import numpy.typing as npt
 
 from factor_gfn.barra import STYLE_NAMES, BarraConfig
 from factor_gfn.data.industry import load_sw_industry_panel
-from factor_gfn.evaluator import EvaluationConfig, build_forward_returns
-from factor_gfn.gfn.real_data import RealRewardDataPaths
+from factor_gfn.evaluator import (
+    FEATURE_NAMES,
+    EvaluationConfig,
+    build_forward_returns,
+)
+from factor_gfn.gfn.real_data import (
+    RAW_DAILY_FEATURE_SPACE_ID,
+    RealRewardDataPaths,
+    validate_expression_feature_artifact,
+)
 
 
 STAGE5_CONTEXT_SCHEMA = "factor_gfn.stage5_context.v1"
@@ -151,6 +159,11 @@ class Stage5DataContext:
     _universe_mask: npt.NDArray[np.bool_] = field(repr=False)
     _industry_labels: npt.NDArray[np.int32] = field(repr=False)
     _barra_exposures: Mapping[str, npt.NDArray[np.floating]] = field(repr=False)
+    ordered_feature_names: tuple[str, ...] = FEATURE_NAMES
+
+    @property
+    def expression_feature_tensor(self) -> npt.NDArray[np.floating]:
+        return self._factor_tensor
 
     def get_split_data(
         self,
@@ -218,6 +231,8 @@ def build_stage5_context_from_arrays(
     dates: npt.ArrayLike,
     stocks: npt.ArrayLike,
     factor_tensor: npt.ArrayLike,
+    raw_open: npt.ArrayLike | None = None,
+    ordered_feature_names: tuple[str, ...] = FEATURE_NAMES,
     universe_mask: npt.ArrayLike,
     industry_labels: npt.ArrayLike,
     barra_exposures: Mapping[str, npt.ArrayLike],
@@ -229,6 +244,7 @@ def build_stage5_context_from_arrays(
     date_values = np.asarray(dates).astype("datetime64[D]")
     stock_values = np.asarray(stocks).astype(str)
     tensor = np.asarray(factor_tensor)
+    feature_names = tuple(ordered_feature_names)
     universe = np.asarray(universe_mask, dtype=bool)
     industry = np.asarray(industry_labels, dtype=np.int32)
     if date_values.ndim != 1 or stock_values.ndim != 1:
@@ -244,8 +260,22 @@ def build_stage5_context_from_arrays(
     expected = (date_values.size, stock_values.size)
     if tensor.ndim != 3 or tensor.shape[0] != expected[0] or tensor.shape[2] != expected[1]:
         raise ValueError("factor_tensor 必须使用 (date, feature, stock) 轴")
-    if tensor.shape[1] < 1:
-        raise ValueError("factor_tensor 至少需要 open 特征")
+    if (
+        not feature_names
+        or len(set(feature_names)) != len(feature_names)
+        or any(not isinstance(name, str) or not name for name in feature_names)
+    ):
+        raise ValueError("ordered_feature_names 必须是唯一的非空字符串")
+    if tensor.shape[1] != len(feature_names):
+        raise ValueError("factor_tensor feature count 必须匹配 ordered_feature_names")
+    if raw_open is None:
+        if feature_names != FEATURE_NAMES:
+            raise ValueError("非 Raw expression tensor 必须显式提供 raw_open labels")
+        raw_open_values = tensor[:, 0, :]
+    else:
+        raw_open_values = np.asarray(raw_open)
+        if raw_open_values.shape != expected:
+            raise ValueError("raw_open 必须与 Raw date/stock 轴对齐")
     if universe.shape != expected or industry.shape != expected:
         raise ValueError("universe、industry 与 date/stock 轴不一致")
     if set(barra_exposures) != set(STYLE_NAMES):
@@ -268,7 +298,9 @@ def build_stage5_context_from_arrays(
     }
     rows_by_split = _split_rows(date_values, config)
 
-    forward_returns = build_forward_returns(tensor[:, 0, :], config.evaluation)
+    forward_returns = build_forward_returns(
+        raw_open_values[: oos_end_row + 1], config.evaluation
+    )
     split_by_row: dict[int, SplitName] = {}
     for name, rows in rows_by_split.items():
         split_by_row.update({int(row): name for row in rows})
@@ -375,6 +407,11 @@ def build_stage5_context_from_arrays(
         },
         "sources": dict(source_manifest or {}),
     }
+    if feature_names != FEATURE_NAMES:
+        manifest["expression_features"] = {
+            "ordered_feature_names": list(feature_names),
+            "label_source": "explicit_raw_open",
+        }
     fingerprint = _stable_hash(manifest)
     return Stage5DataContext(
         config=config,
@@ -389,6 +426,7 @@ def build_stage5_context_from_arrays(
         _universe_mask=universe,
         _industry_labels=industry,
         _barra_exposures=MappingProxyType(exposures),
+        ordered_feature_names=feature_names,
     )
 
 
@@ -401,6 +439,8 @@ def build_stage5_data_context(
     barra_paths = paths.barra_paths
     required = [
         paths.tensor_path,
+        paths.expression_tensor_path,
+        paths.expression_metadata_path,
         paths.universe_mask_path,
         paths.date_list_path,
         paths.stock_list_path,
@@ -416,7 +456,21 @@ def build_stage5_data_context(
 
     dates = np.load(paths.date_list_path, allow_pickle=False).astype("datetime64[D]")
     stocks = np.load(paths.stock_list_path, allow_pickle=False).astype(str)
-    tensor = np.load(paths.tensor_path, mmap_mode="r", allow_pickle=False)
+    raw_tensor = np.load(paths.tensor_path, mmap_mode="r", allow_pickle=False)
+    expression_tensor = np.load(
+        paths.expression_tensor_path, mmap_mode="r", allow_pickle=False
+    )
+    validate_expression_feature_artifact(paths, expression_tensor)
+    if (
+        expression_tensor.shape[0] != dates.size
+        or expression_tensor.shape[2] != stocks.size
+    ):
+        raise ValueError("expression tensor 与 Raw date/stock 轴不一致")
+    tensor = (
+        raw_tensor
+        if paths.expression_tensor_path == paths.tensor_path
+        else expression_tensor
+    )
     universe = np.load(paths.universe_mask_path, mmap_mode="r", allow_pickle=False)
     industry = load_sw_industry_panel(dates, stocks, level=1, path=paths.industry_path)
     exposures = {
@@ -434,10 +488,27 @@ def build_stage5_data_context(
         "data_tensor_bytes": paths.tensor_path.stat().st_size,
         "universe_mask_bytes": paths.universe_mask_path.stat().st_size,
     }
+    spec = paths.expression_features
+    assert spec is not None
+    if spec.feature_space_id != RAW_DAILY_FEATURE_SPACE_ID:
+        sources.update(
+            {
+                "expression_metadata_sha256": _sha256_file(
+                    paths.expression_metadata_path
+                ),
+                "expression_feature_space_id": spec.feature_space_id,
+                "expression_schema_fingerprint": spec.expected_schema_fingerprint,
+                "expression_data_tensor_bytes": (
+                    paths.expression_tensor_path.stat().st_size
+                ),
+            }
+        )
     return build_stage5_context_from_arrays(
         dates=dates,
         stocks=stocks,
         factor_tensor=tensor,
+        raw_open=raw_tensor[:, 0, :],
+        ordered_feature_names=spec.ordered_feature_names,
         universe_mask=universe,
         industry_labels=industry,
         barra_exposures=exposures,

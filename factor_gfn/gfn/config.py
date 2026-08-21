@@ -10,6 +10,8 @@ from numbers import Real
 from typing import Any, Literal
 
 from factor_gfn.grammar import (
+    RAW_ACTION_REGISTRY,
+    ActionRegistry,
     SearchSpaceConfig,
     action_space_fingerprint,
     resolve_exact_node_strata,
@@ -26,10 +28,12 @@ LEGACY_TOKEN_POLICY_MODES = ("flat", "arity_hierarchical")
 STAGE5_TOKEN_POLICY_MODE: TokenPolicyMode = "grammar_hierarchical"
 
 
-def state_adapter_manifest() -> dict[str, Any]:
+def state_adapter_manifest(
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+) -> dict[str, Any]:
     """锁定模型状态输入语义，防止检查点跨口径误用。"""
 
-    return {
+    manifest = {
         "schema": STATE_ADAPTER_SCHEMA,
         "state_source": "canonical_partial_ast_not_action_history",
         "node_embeddings": ["category", "operator_or_feature", "window"],
@@ -49,6 +53,15 @@ def state_adapter_manifest() -> dict[str, Any]:
             "exact_node": "ExactNodeGrammarState.legal_transitions",
         },
     }
+    if action_registry != RAW_ACTION_REGISTRY:
+        manifest["vocabulary"] = {
+            "feature_space_fingerprint": action_registry.feature_space_fingerprint,
+            "action_space_fingerprint": action_registry.fingerprint(),
+            "action_count": action_registry.action_count,
+            "hole_token_id": action_registry.action_count,
+            "pad_token_id": action_registry.action_count + 1,
+        }
+    return manifest
 
 
 def _positive_int(value: int, name: str) -> None:

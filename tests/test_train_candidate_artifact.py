@@ -22,7 +22,12 @@ from factor_gfn.gfn import (
     combine_reward_components,
     create_hybrid_variance_runner,
 )
-from factor_gfn.grammar import Expression, get_action_id
+from factor_gfn.gfn.train_candidate_artifact import _candidate_record
+from factor_gfn.grammar import (
+    DAILY_DERIVED_ACTION_REGISTRY,
+    Expression,
+    get_action_id,
+)
 
 from tests.test_gfn_real_reward import _context
 from tests.test_hybrid_variance_trainer import _trajectory
@@ -131,7 +136,9 @@ class TrainCandidateArtifactTests(unittest.TestCase):
         self.assertEqual(payload["schema"], TRAIN_CANDIDATE_ARTIFACT_SCHEMA)
         self.assertEqual(payload["committed_optimizer_step"], 1)
         self.assertEqual(payload["candidate_count"], 1)
+        self.assertNotIn("vocabulary", payload)
         record = payload["records"][0]
+        self.assertNotIn("vocabulary", record)
         self.assertEqual(record["schema"], TRAIN_CANDIDATE_RECORD_SCHEMA)
         self.assertEqual(record["structural_hash"], expression.structural_hash())
         self.assertEqual(record["train_ic"], result_before["train_ic"])
@@ -187,6 +194,53 @@ class TrainCandidateArtifactTests(unittest.TestCase):
         self.assertNotIn("reward", record)
         self.assertNotIn("valid", record)
         self.assertNotIn("floor_applied", record)
+
+    def test_derived_artifact_adds_vocabulary_identity_without_raw_schema_change(self):
+        provider = _provider()
+        derived_dir = Path(self.temporary.name) / "derived_hybrid_run"
+        derived_dir.mkdir()
+        _write_run_config(derived_dir)
+        writer = TrainCandidateArtifactWriter(
+            run_dir=derived_dir,
+            provider=provider,
+            expected_optimizer_step=0,
+            create=True,
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        )
+        payload = json.loads(writer.path.read_text(encoding="utf-8"))
+        expected_vocabulary = {
+            "feature_space_id": "daily_derived_v1",
+            "feature_space_fingerprint": (
+                DAILY_DERIVED_ACTION_REGISTRY.feature_space_fingerprint
+            ),
+            "action_space_fingerprint": (
+                DAILY_DERIVED_ACTION_REGISTRY.fingerprint()
+            ),
+        }
+        self.assertEqual(payload["schema"], TRAIN_CANDIDATE_ARTIFACT_SCHEMA)
+        self.assertEqual(payload["vocabulary"], expected_vocabulary)
+
+        raw_expression = _expression()
+        raw_assignment = provider.evaluate(raw_expression)
+        reward_result = dict(raw_assignment.metadata["reward_result"])
+        derived_expression = Expression.from_prefix(
+            (
+                DAILY_DERIVED_ACTION_REGISTRY.get_action_id("add"),
+                DAILY_DERIVED_ACTION_REGISTRY.get_action_id("ret_cc1"),
+                DAILY_DERIVED_ACTION_REGISTRY.get_action_id("ret_gap"),
+            ),
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        )
+        reward_result["expression_hash"] = derived_expression.structural_hash()
+        record = _candidate_record(
+            derived_expression,
+            reward_result,
+            contract_fingerprint="c" * 64,
+            optimizer_step=1,
+            cycle_index=0,
+            condition_position=0,
+        )
+        self.assertEqual(record["vocabulary"], expected_vocabulary)
 
     def test_canonical_duplicate_is_one_record_with_visit_provenance(self):
         provider = _provider()

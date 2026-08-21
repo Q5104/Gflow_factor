@@ -1,4 +1,4 @@
-"""Three static baseline strategies and immutable Strategy Bundle freeze.
+"""Baseline strategy definitions and immutable Strategy Bundle freeze.
 
 Only Train/Validation development matrices are accepted while fitting.  The
 unified scoring API consumes a verified frozen strategy plus a features-only
@@ -37,13 +37,18 @@ from .development_factor_matrix import (
     load_verified_development_factor_matrices,
 )
 from .strategy_input import load_verified_strategy_input
+from .rolling_icir import (
+    RollingICIRConfig,
+    estimate_rolling_weights,
+    periodic_ic_matrix,
+)
 from .stage6_evaluation import STAGE6_SPLIT_NAMES, _stable_hash
 
 
 STRATEGY_IDS = ("equal_weight", "fixed_icir", "lightgbm")
 StrategyId = Literal["equal_weight", "fixed_icir", "lightgbm"]
 STRATEGY_BUNDLE_MANIFEST_SCHEMA = "factor_gfn.frozen_strategy_bundle_manifest.v1"
-STRATEGY_BUNDLE_VERSION = "static-three-strategy-bundle-v1"
+STRATEGY_BUNDLE_VERSION = "three-strategy-bundle-rolling-icir-v2"
 STRATEGY_BUNDLE_MANIFEST_FILENAME = "strategy_bundle_manifest.json"
 EQUAL_WEIGHT_FILENAME = "equal_weight.json"
 FIXED_ICIR_FILENAME = "fixed_icir.json"
@@ -163,10 +168,12 @@ def _array_digest(values: npt.NDArray[Any]) -> str:
 def _implementation_identity() -> dict[str, Any]:
     strategy_path = Path(__file__).resolve()
     matrix_path = strategy_path.with_name("development_factor_matrix.py")
+    rolling_path = strategy_path.with_name("rolling_icir.py")
     return {
-        "schema": "factor_gfn.static_strategy_implementation.v1",
+        "schema": "factor_gfn.strategy_implementation.v2",
         "static_strategy_bundle_sha256": _sha256_file(strategy_path),
         "development_factor_matrix_sha256": _sha256_file(matrix_path),
+        "rolling_icir_sha256": _sha256_file(rolling_path),
     }
 
 
@@ -371,7 +378,15 @@ def build_fixed_icir_strategy(
     *,
     min_cross_section_count: int | None = None,
     epsilon: float = ICIR_EPSILON,
+    rolling_config: RollingICIRConfig | None = None,
 ) -> FrozenLinearStrategy:
+    """Build the causal rolling-ICIR seed stored under the legacy strategy id.
+
+    ``fixed_icir`` remains the technical id so existing three-strategy artifact
+    readers keep their key contract.  Its weights are only the first OOS
+    weights; subsequent weights are updated causally by the OOS evaluator.
+    """
+
     aliases, hashes, _ = _common_identity(matrices)
     if min_cross_section_count is None:
         min_cross_section_count = int(
@@ -381,25 +396,46 @@ def build_fixed_icir_strategy(
         )
     if min_cross_section_count < 2 or not math.isfinite(epsilon) or epsilon <= 0:
         raise ValueError("ICIR minimum count and epsilon are invalid")
+    if rolling_config is not None and (
+        rolling_config.min_cross_section_count != min_cross_section_count
+        or rolling_config.epsilon != epsilon
+    ):
+        raise ValueError("rolling configuration conflicts with ICIR arguments")
 
-    diagnostics: list[dict[str, Any]] = []
-    candidates = np.zeros(len(aliases), dtype=np.float64)
-    for factor_index, alias in enumerate(aliases):
-        ic_values = _periodic_factor_ic(
-            matrices,
-            factor_index,
+    development_dates = np.concatenate(
+        [matrices.splits[name].features.dates for name in STAGE6_SPLIT_NAMES]
+    )
+    development_values = np.vstack(
+        [matrices.splits[name].features.values for name in STAGE6_SPLIT_NAMES]
+    )
+    development_labels = np.concatenate(
+        [matrices.splits[name].forward_returns for name in STAGE6_SPLIT_NAMES]
+    )
+    ic_dates, ic_values = periodic_ic_matrix(
+        development_dates,
+        development_values,
+        development_labels,
+        min_cross_section_count=min_cross_section_count,
+        epsilon=epsilon,
+    )
+    if rolling_config is None:
+        rolling_config = RollingICIRConfig(
+            min_observations=min(100, max(2, int(ic_dates.size))),
             min_cross_section_count=min_cross_section_count,
+            epsilon=epsilon,
         )
-        finite = ic_values[np.isfinite(ic_values)]
+    seed_dates = ic_dates[-rolling_config.window_observations :]
+    seed_ic = ic_values[-rolling_config.window_observations :]
+    weights_array, rolling_diagnostics = estimate_rolling_weights(
+        seed_ic,
+        rolling_config,
+    )
+    raw_icir = np.asarray(rolling_diagnostics.pop("raw_icir"), dtype=np.float64)
+    diagnostics: list[dict[str, Any]] = []
+    for factor_index, alias in enumerate(aliases):
+        finite = seed_ic[np.isfinite(seed_ic[:, factor_index]), factor_index]
         mean_ic = float(finite.mean()) if finite.size else np.nan
         std_ic = float(finite.std(ddof=1)) if finite.size >= 2 else np.nan
-        icir = (
-            mean_ic / std_ic
-            if finite.size >= 2 and math.isfinite(std_ic) and std_ic > epsilon
-            else np.nan
-        )
-        candidate = max(float(icir), 0.0) if math.isfinite(float(icir)) else 0.0
-        candidates[factor_index] = candidate
         diagnostics.append(
             {
                 "alias": alias,
@@ -407,21 +443,16 @@ def build_fixed_icir_strategy(
                 "observation_count": int(finite.size),
                 "mean_ic": _finite_or_none(mean_ic),
                 "std_ic_ddof1": _finite_or_none(std_ic),
-                "icir": _finite_or_none(icir),
-                "clipped_candidate": candidate,
+                "icir": _finite_or_none(raw_icir[factor_index]),
+                "initial_weight": float(weights_array[factor_index]),
             }
         )
-    total = float(candidates.sum())
-    if math.isfinite(total) and total > epsilon:
-        weights_array = candidates / total
-        fallback_status = False
-        fallback_reason = None
-    else:
-        weights_array = np.full(len(aliases), 1.0 / len(aliases), dtype=np.float64)
-        fallback_status = True
-        fallback_reason = "all_nonpositive_or_invalid_icir"
     weights = tuple(float(value) for value in weights_array)
     metadata = {
+        "strategy_semantics": "causal_rolling_icir_replaces_fixed_icir",
+        "technical_strategy_id": "fixed_icir",
+        "display_name": "Rolling ICIR",
+        "weight_contract": "initial_seed_then_causal_oos_updates",
         "development_splits": list(STAGE6_SPLIT_NAMES),
         "development_feature_fingerprints": {
             name: matrices.splits[name].features.fingerprint for name in STAGE6_SPLIT_NAMES
@@ -431,14 +462,21 @@ def build_fixed_icir_strategy(
         },
         "calendar_fingerprint": matrices.calendar_fingerprint,
         "rank_ic": "periodic_cross_sectional_spearman",
-        "split_observations": "Train_and_Validation_dates_equal_weight",
+        "split_observations": "latest_rolling_window_of_Train_and_Validation_dates",
         "min_cross_section_count": min_cross_section_count,
         "std_ddof": 1,
         "epsilon": epsilon,
         "positive_clipping": True,
+        "rolling_config": rolling_config.to_dict(),
+        "seed_ic_dates": seed_dates.astype(str).tolist(),
+        "seed_ic_values": [
+            [_finite_or_none(value) for value in row]
+            for row in seed_ic
+        ],
+        "initial_weight_diagnostics": rolling_diagnostics,
         "per_factor": diagnostics,
-        "fallback_status": fallback_status,
-        "fallback_reason": fallback_reason,
+        "fallback_status": bool(rolling_diagnostics["fallback_status"]),
+        "fallback_reason": rolling_diagnostics["fallback_reason"],
     }
     payload = _linear_payload("fixed_icir", matrices, weights, metadata)
     return FrozenLinearStrategy(

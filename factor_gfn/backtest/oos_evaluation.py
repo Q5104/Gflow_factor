@@ -29,6 +29,7 @@ from .oos_authority import (
     VerifiedTestScoreArtifact,
 )
 from .stage6_evaluation import _stable_hash
+from .rolling_icir import RollingICIRConfig, generate_causal_rolling_scores
 from .static_strategy_bundle import (
     LIGHTGBM_TRAIN_SCORES_FILENAME,
     LIGHTGBM_VALIDATION_SCORES_FILENAME,
@@ -38,7 +39,7 @@ from .static_strategy_bundle import (
 
 
 OOS_EVALUATION_SCHEMA = "factor_gfn.oos_baseline_evaluation.v1"
-OOS_EVALUATION_VERSION = "static-three-strategy-oos-evaluation-v1"
+OOS_EVALUATION_VERSION = "three-strategy-oos-rolling-icir-v2"
 OOS_EVALUATION_MANIFEST_FILENAME = "evaluation_manifest.json"
 PERIODS_PER_YEAR = 50.4
 MIN_DECILE_STOCK_COUNT = 20
@@ -53,6 +54,8 @@ PARQUET_FILES = {
     "portfolio_returns": "portfolio_returns.parquet",
     "turnover_by_date": "turnover_by_date.parquet",
     "nav_series": "nav_series.parquet",
+    "rolling_icir_weights_by_update": "rolling_icir_weights_by_update.parquet",
+    "rolling_icir_diagnostics_by_update": "rolling_icir_diagnostics_by_update.parquet",
 }
 JSON_FILES = {
     "performance_summary": "performance_summary.json",
@@ -263,6 +266,8 @@ class OOSBaselineEvaluation:
     portfolio_returns: pd.DataFrame
     turnover_by_date: pd.DataFrame
     nav_series: pd.DataFrame
+    rolling_icir_weights_by_update: pd.DataFrame
+    rolling_icir_diagnostics_by_update: pd.DataFrame
     performance_summary: Mapping[str, Any]
     lightgbm_split_effectiveness: Mapping[str, Any]
     strategy_score_correlation: Mapping[str, Any]
@@ -391,6 +396,36 @@ def evaluate_oos_baselines(
     )
     score_frame = scores.scores.copy()
     score_frame["date"] = pd.to_datetime(score_frame["date"])
+    rolling_weights = pd.DataFrame(
+        columns=["update_date", "factor_alias", "weight"]
+    )
+    rolling_diagnostics = pd.DataFrame(
+        columns=["update_date", "history_start", "history_end"]
+    )
+    rolling_strategy = bundle.strategies["fixed_icir"]
+    rolling_config_payload = rolling_strategy.metadata.get("rolling_config")
+    if isinstance(rolling_config_payload, Mapping):
+        rolling_result = generate_causal_rolling_scores(
+            matrix.features.dates,
+            matrix.features.values,
+            labels.forward_returns,
+            aliases=bundle.feature_aliases,
+            seed_dates=rolling_strategy.metadata["seed_ic_dates"],
+            seed_ic_values=rolling_strategy.metadata["seed_ic_values"],
+            config=RollingICIRConfig.from_mapping(rolling_config_payload),
+        )
+        rolling_frame = key_frame[["date", "symbol"]].copy()
+        rolling_frame["strategy_id"] = "fixed_icir"
+        rolling_frame["strategy_score"] = rolling_result.scores
+        score_frame = pd.concat(
+            [
+                score_frame.loc[score_frame["strategy_id"] != "fixed_icir"],
+                rolling_frame,
+            ],
+            ignore_index=True,
+        ).sort_values(["date", "symbol", "strategy_id"], kind="mergesort")
+        rolling_weights = rolling_result.weights_by_update
+        rolling_diagnostics = rolling_result.diagnostics_by_update
     wide = score_frame.pivot(index=["date", "symbol"], columns="strategy_id", values="strategy_score")
     wide = wide.reset_index().merge(key_frame, on=["date", "symbol"], how="left", validate="one_to_one")
     if wide[list(STRATEGY_IDS)].isna().any().any():
@@ -634,7 +669,7 @@ def evaluate_oos_baselines(
     lgb_test_spreads = deciles.loc[deciles["strategy_id"] == "lightgbm", "G10_G1"].tolist()
     lgb_effectiveness = _lightgbm_split_effectiveness(bundle, lgb_test_ic, lgb_test_spreads)
     equal = bundle.strategies["equal_weight"]
-    fixed = bundle.strategies["fixed_icir"]
+    rolling = bundle.strategies["fixed_icir"]
     lightgbm = bundle.strategies["lightgbm"]
     freeze_summary = {
         "factor_pool_fingerprint": pool.baseline_factor_pool_fingerprint,
@@ -645,9 +680,23 @@ def evaluate_oos_baselines(
             "weights_identity": _stable_hash({"weights": list(equal.weights)}),
         },
         "fixed_icir": {
-            "weights_fingerprint": _stable_hash({"weights": list(fixed.weights)}),
+            "strategy_semantics": rolling.metadata.get(
+                "strategy_semantics", "legacy_static_fixed_icir"
+            ),
+            "technical_strategy_id": "fixed_icir",
+            "display_name": rolling.metadata.get("display_name", "Rolling ICIR"),
+            "initial_weights_fingerprint": _stable_hash(
+                {"weights": list(rolling.weights)}
+            ),
+            "rolling_config": _deep_thaw(rolling.metadata.get("rolling_config", {})),
+            "update_count": int(len(rolling_diagnostics)),
+            "weight_path_fingerprint": _stable_hash(
+                rolling_weights.assign(
+                    update_date=lambda frame: frame["update_date"].astype(str)
+                ).to_dict("records")
+            ),
             "development_ic_contract": {
-                key: _deep_thaw(fixed.metadata.get(key))
+                key: _deep_thaw(rolling.metadata.get(key))
                 for key in (
                     "development_splits",
                     "rank_ic",
@@ -690,6 +739,10 @@ def evaluate_oos_baselines(
         "turnover": "drift_adjusted_one_way_union_holdings",
         "cost_rate": cost_rate,
         "headline_performance": "gross",
+        "fixed_icir_slot_semantics": "causal_rolling_icir",
+        "rolling_icir_score_timing": (
+            "weights_update_every_4_periods_using_only_labels_matured_by_2_periods"
+        ),
     }
     split_fingerprint = _stable_hash(
         {"requested": list(matrix.requested_boundary), "actual": list(matrix.actual_boundary)}
@@ -713,6 +766,10 @@ def evaluate_oos_baselines(
             "deciles": _sha256_bytes(_parquet_bytes(deciles)),
             "portfolio": _sha256_bytes(_parquet_bytes(portfolio)),
             "turnover": _sha256_bytes(_parquet_bytes(turnover)),
+            "rolling_icir_weights": _sha256_bytes(_parquet_bytes(rolling_weights)),
+            "rolling_icir_diagnostics": _sha256_bytes(
+                _parquet_bytes(rolling_diagnostics)
+            ),
             "performance": _sha256_bytes(_json_bytes(performance)),
         },
     }
@@ -733,6 +790,8 @@ def evaluate_oos_baselines(
         portfolio_returns=portfolio,
         turnover_by_date=turnover,
         nav_series=nav,
+        rolling_icir_weights_by_update=rolling_weights,
+        rolling_icir_diagnostics_by_update=rolling_diagnostics,
         performance_summary=MappingProxyType(performance),
         lightgbm_split_effectiveness=MappingProxyType(lgb_effectiveness),
         strategy_score_correlation=MappingProxyType(score_correlation),

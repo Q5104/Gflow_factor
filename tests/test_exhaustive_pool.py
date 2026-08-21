@@ -1,15 +1,24 @@
 import tempfile
 import unittest
+import json
+import sqlite3
 from pathlib import Path
 
 from factor_gfn.gfn import (
     EXHAUSTIVE_SOURCE,
     ExhaustivePlanningConfig,
     ExhaustiveRegistry,
+    SyntheticRewardProvider,
     count_canonical_terminals,
     resolve_exhaustive_plan,
 )
-from factor_gfn.grammar import Expression, SearchSpaceConfig
+from factor_gfn.gfn.diagnostic_support import build_or_resume_n1_n2_registry
+from factor_gfn.grammar import (
+    DAILY_DERIVED_ACTION_REGISTRY,
+    RAW_ACTION_REGISTRY,
+    Expression,
+    SearchSpaceConfig,
+)
 
 
 class BoundedCanonicalCountingTests(unittest.TestCase):
@@ -36,6 +45,53 @@ class BoundedCanonicalCountingTests(unittest.TestCase):
             for expression in result.expressions:
                 rebuilt = Expression.from_prefix(expression.to_prefix())
                 self.assertEqual(rebuilt.structural_hash(), expression.structural_hash())
+
+    def test_derived_n1_n2_counts_and_prefix_roundtrip_use_derived_registry(self):
+        search_space = SearchSpaceConfig(max_depth=2, max_nodes=2)
+        results = tuple(
+            count_canonical_terminals(
+                search_space=search_space,
+                target_node_count=node_count,
+                canonical_count_cap=None,
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+            )
+            for node_count in (1, 2)
+        )
+        self.assertEqual(
+            tuple(result.canonical_terminal_count for result in results),
+            (16, 1_696),
+        )
+        self.assertEqual(
+            tuple(result.depth_distribution for result in results),
+            ({0: 16}, {1: 1_696}),
+        )
+        for result in results:
+            hashes = [expression.structural_hash() for expression in result.expressions]
+            self.assertEqual(len(hashes), len(set(hashes)))
+            for expression in result.expressions:
+                rebuilt = Expression.from_prefix(
+                    expression.to_prefix(),
+                    action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+                )
+                self.assertEqual(rebuilt.structural_hash(), expression.structural_hash())
+                self.assertEqual(
+                    rebuilt.action_registry.fingerprint(),
+                    DAILY_DERIVED_ACTION_REGISTRY.fingerprint(),
+                )
+
+    def test_raw_plan_manifest_and_fingerprint_remain_historical(self):
+        search_space = SearchSpaceConfig(max_depth=2, max_nodes=2)
+        default = resolve_exhaustive_plan(search_space)
+        explicit_raw = resolve_exhaustive_plan(
+            search_space,
+            action_registry=RAW_ACTION_REGISTRY,
+        )
+        self.assertEqual(default.manifest(), explicit_raw.manifest())
+        self.assertNotIn("vocabulary", default.manifest())
+        self.assertEqual(
+            default.fingerprint(),
+            "f3a7f13de5464d6ef7b30fdf75a868f0c52305a39db4a6f0b4f8b6607ca56dc9",
+        )
 
     def test_cap_stops_at_cap_plus_one_and_reports_strict_lower_bound(self):
         result = count_canonical_terminals(
@@ -235,6 +291,111 @@ class ExhaustiveRegistryTests(unittest.TestCase):
                 self.assertEqual(coverage["evaluated_count"], 6)
                 self.assertEqual(coverage["invalid_count"], 1)
                 self.assertEqual(coverage["valid_count"], 5)
+
+    def test_derived_registry_binds_vocabulary_and_rejects_cross_open(self):
+        plan = resolve_exhaustive_plan(
+            SearchSpaceConfig(max_depth=2, max_nodes=2),
+            ExhaustivePlanningConfig(
+                explicit_include_node_counts=(1, 2),
+                approve_explicit_include_over_budget=True,
+            ),
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "derived.sqlite3"
+            with ExhaustiveRegistry(
+                path,
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+            ) as registry:
+                registry.register_plan(
+                    plan,
+                    provider_fingerprint="derived-provider",
+                    context_fingerprint="derived-context",
+                )
+                self.assertEqual(registry.coverage(1)["registered_count"], 16)
+                self.assertEqual(registry.coverage(2)["registered_count"], 1_696)
+
+            connection = sqlite3.connect(path)
+            try:
+                metadata = {
+                    key: json.loads(value)
+                    for key, value in connection.execute(
+                        "SELECT key, value_json FROM metadata"
+                    )
+                }
+            finally:
+                connection.close()
+            self.assertEqual(metadata["feature_space_id"], "daily_derived_v1")
+            self.assertEqual(metadata["action_count"], 152)
+            self.assertEqual(
+                metadata["action_space_fingerprint"],
+                DAILY_DERIVED_ACTION_REGISTRY.fingerprint(),
+            )
+            with self.assertRaisesRegex(ValueError, "vocabulary identity mismatch"):
+                ExhaustiveRegistry(path, read_only=True)
+            with ExhaustiveRegistry(
+                path,
+                read_only=True,
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+            ) as read_only:
+                self.assertEqual(read_only.coverage(2)["registered_count"], 1_696)
+
+    def test_legacy_raw_registry_rejects_derived_before_metadata_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "raw.sqlite3"
+            with ExhaustiveRegistry(path) as registry:
+                registry.register_plan(
+                    self._plan(),
+                    provider_fingerprint="raw-provider",
+                    context_fingerprint="raw-context",
+                )
+            before = path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "Raw-only"):
+                ExhaustiveRegistry(
+                    path,
+                    action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+                )
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_derived_builder_is_complete_resumable_and_reports_dynamic_progress(self):
+        provider = SyntheticRewardProvider()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "derived.sqlite3"
+            first_progress: list[str] = []
+            registry = build_or_resume_n1_n2_registry(
+                path,
+                provider,
+                reward_floor=1e-8,
+                progress_every=2_000,
+                progress=first_progress.append,
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+                approve_explicit_include_over_budget=True,
+            )
+            try:
+                self.assertTrue(registry.coverage(1)["coverage_complete"])
+                self.assertTrue(registry.coverage(2)["coverage_complete"])
+                self.assertEqual(len(registry.pending_candidates()), 0)
+                self.assertEqual(
+                    set(registry.exact_mass_result(n).node_count for n in (1, 2)),
+                    {1, 2},
+                )
+            finally:
+                registry.close()
+
+            resumed_progress: list[str] = []
+            resumed = build_or_resume_n1_n2_registry(
+                path,
+                provider,
+                reward_floor=1e-8,
+                progress=resumed_progress.append,
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+                approve_explicit_include_over_budget=True,
+            )
+            resumed.close()
+            self.assertIn(
+                "[exhaustive] pending=0, completed_before=1712",
+                resumed_progress,
+            )
 
 
 if __name__ == "__main__":

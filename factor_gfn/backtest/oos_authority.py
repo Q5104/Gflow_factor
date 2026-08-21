@@ -19,7 +19,7 @@ import numpy as np
 import numpy.typing as npt
 import pandas as pd
 
-from factor_gfn.evaluator import FactorInterpreter
+from factor_gfn.evaluator import FEATURE_NAMES, FactorInterpreter
 from factor_gfn.evaluator.cross_section import (
     DEFAULT_CLEANING_CONFIG,
     clean_candidate_factor_cross_sections,
@@ -36,6 +36,7 @@ from .development_factor_matrix import (
     strategy_matrix_base_eligibility,
     strategy_matrix_cleaning_contract,
 )
+from .expression_compatibility import action_registry_for_vocabulary
 from .stage6_evaluation import _stable_hash
 from .static_strategy_bundle import (
     STRATEGY_IDS,
@@ -50,7 +51,7 @@ from .strategy_input import load_verified_strategy_input
 TEST_FEATURE_CONTEXT_SCHEMA = "factor_gfn.verified_test_feature_context.v1"
 TEST_FACTOR_MATRIX_SCHEMA = "factor_gfn.test_factor_matrix.v1"
 TEST_SCORE_ARTIFACT_SCHEMA = "factor_gfn.test_score_artifact.v1"
-TEST_SCORE_ARTIFACT_VERSION = "three-static-strategy-test-scores-v1"
+TEST_SCORE_ARTIFACT_VERSION = "prelabel-static-scores-with-rolling-seed-v2"
 TEST_SCORE_MANIFEST_FILENAME = "test_score_manifest.json"
 TEST_SCORE_FILENAME = "strategy_scores_test.parquet"
 TEST_LABEL_SCHEMA = "factor_gfn.verified_test_labels.v1"
@@ -182,6 +183,7 @@ class VerifiedTestFeatureContext:
     universe_mask: npt.NDArray[np.bool_] = field(repr=False)
     industry_labels: npt.NDArray[np.int32] = field(repr=False)
     fingerprint: str
+    ordered_feature_names: tuple[str, ...] = FEATURE_NAMES
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +270,10 @@ def unlock_verified_test_features(
         "signal_dates": context.dates[signal_rows].astype(str).tolist(),
         "access": "features_only_no_forward_returns",
     }
+    if context.ordered_feature_names != FEATURE_NAMES:
+        deterministic["expression_features"] = {
+            "ordered_feature_names": list(context.ordered_feature_names),
+        }
     return VerifiedTestFeatureContext(
         factor_pool_fingerprint=pool.baseline_factor_pool_fingerprint,
         strategy_bundle_fingerprint=bundle.bundle_fingerprint,
@@ -277,12 +283,13 @@ def unlock_verified_test_features(
         actual_boundary=(boundary.actual_start, boundary.actual_end),
         history_dates=_readonly(np.asarray(context.dates).copy()),
         stocks=_readonly(np.asarray(context.stocks).copy()),
-        factor_tensor=context._factor_tensor,
+        factor_tensor=context.expression_feature_tensor,
         signal_rows=_readonly(signal_rows),
         signal_dates=_readonly(np.asarray(context.dates[signal_rows]).copy()),
         universe_mask=_readonly(np.asarray(context._universe_mask[signal_rows]).copy()),
         industry_labels=_readonly(np.asarray(context._industry_labels[signal_rows]).copy()),
         fingerprint=_stable_hash(deterministic),
+        ordered_feature_names=context.ordered_feature_names,
     )
 
 
@@ -321,9 +328,25 @@ def build_test_factor_matrix(
         feature_context.universe_mask,
         encoded,
     )
-    interpreter = FactorInterpreter(feature_context.factor_tensor)
+    try:
+        action_registry = action_registry_for_vocabulary(
+            pool.manifest.get("vocabulary")
+        )
+    except ValueError as error:
+        raise OOSAuthorityError("frozen factor pool vocabulary is invalid") from error
+    if action_registry.leaf_names != feature_context.ordered_feature_names:
+        raise OOSAuthorityError(
+            "frozen factor pool vocabulary does not match expression feature schema"
+        )
+    interpreter = FactorInterpreter(
+        feature_context.factor_tensor,
+        ordered_feature_names=feature_context.ordered_feature_names,
+    )
     for index, record in enumerate(strategy_records):
-        expression = Expression.from_prefix(record.prefix_token_ids)
+        expression = Expression.from_prefix(
+            record.prefix_token_ids,
+            action_registry=action_registry,
+        )
         if (
             expression.to_formula() != record.formula
             or expression.structural_hash() != record.structural_hash
@@ -476,6 +499,7 @@ def _score_manifest_fingerprint_payload(manifest: Mapping[str, Any]) -> dict[str
             "strategy_ids",
             "common_key_fingerprint",
             "score_payload_digest",
+            "score_usage_contract",
             "artifacts",
             "oos_access_state",
             "generation_identity",
@@ -534,6 +558,13 @@ def freeze_test_score_artifact(
         },
         "artifacts": artifacts,
         "oos_access_state": "scores_frozen_labels_not_accessed",
+        "score_usage_contract": {
+            "equal_weight": "final_prelabeled_score",
+            "lightgbm": "final_prelabeled_score",
+            "fixed_icir": (
+                "initial_seed_score_only_replaced_by_causal_rolling_icir_after_label_gate"
+            ),
+        },
         "generation_identity": {
             "implementation_fingerprint": _implementation_fingerprint(),
             "score_api_label_parameters": [

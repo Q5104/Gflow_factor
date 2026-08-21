@@ -756,7 +756,7 @@ def load_stage5_report_data(
     *,
     expected_config: HybridVarianceGFNConfig,
     allow_incomplete: bool = False,
-    correlation_top_k: int = 30,
+    correlation_top_k: int = 20,
     correlation_min_common_periods: int = 60,
 ) -> Stage5ReportDataBundle:
     """Load and standardize one consistent Hybrid Stage 5 snapshot."""

@@ -13,7 +13,12 @@ from typing import Any, Callable
 
 import torch
 
-from factor_gfn.grammar import Expression, SearchSpaceConfig
+from factor_gfn.grammar import (
+    RAW_ACTION_REGISTRY,
+    ActionRegistry,
+    Expression,
+    SearchSpaceConfig,
+)
 
 from .exhaustive import ExhaustivePlanningConfig, ExhaustiveRegistry, resolve_exhaustive_plan
 from .targeted_calibration import save_targeted_calibration_progress
@@ -125,66 +130,91 @@ def build_or_resume_n1_n2_registry(
     reward_floor: float,
     progress_every: int = 25,
     progress: Progress = _default_progress,
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+    approve_explicit_include_over_budget: bool = False,
 ) -> ExhaustiveRegistry:
     """Build only the previously approved N=1/2 registry, with resumable progress."""
 
     if progress_every < 1:
         raise ValueError("progress_every must be positive")
-    registry = ExhaustiveRegistry(path)
+    if not isinstance(action_registry, ActionRegistry):
+        raise TypeError("action_registry must be ActionRegistry")
     plan = resolve_exhaustive_plan(
         SearchSpaceConfig(max_depth=2, max_nodes=2),
-        ExhaustivePlanningConfig(explicit_include_node_counts=(1, 2)),
+        ExhaustivePlanningConfig(
+            explicit_include_node_counts=(1, 2),
+            approve_explicit_include_over_budget=(
+                approve_explicit_include_over_budget
+            ),
+        ),
+        action_registry=action_registry,
     )
-    manifest = provider.manifest()
-    registry.register_plan(
-        plan,
-        provider_fingerprint=provider.fingerprint(),
-        context_fingerprint=manifest["context_fingerprint"],
-    )
-    pending = registry.pending_candidates()
-    total = len(pending)
-    started = perf_counter()
-    progress(f"[exhaustive] pending={total}, completed_before={642 - total}")
-    for index, candidate in enumerate(pending, start=1):
-        expression = Expression.from_prefix(candidate.prefix_token_ids)
-        assignment = provider.evaluate(expression)
-        if assignment.valid:
-            reward_details = dict(assignment.metadata)
-            reward_details.setdefault(
-                "reward_result",
-                {
-                    "raw_reward": assignment.reward,
-                    "reward": assignment.reward,
-                    "log_reward": assignment.log_reward,
-                },
+    registry = ExhaustiveRegistry(path, action_registry=action_registry)
+    try:
+        manifest = provider.manifest()
+        registry.register_plan(
+            plan,
+            provider_fingerprint=provider.fingerprint(),
+            context_fingerprint=manifest["context_fingerprint"],
+        )
+        pending = registry.pending_candidates()
+        total = len(pending)
+        completed_before = sum(
+            registry.coverage(node_count)["evaluated_count"]
+            for node_count in (1, 2)
+        )
+        started = perf_counter()
+        progress(
+            f"[exhaustive] pending={total}, completed_before={completed_before}"
+        )
+        for index, candidate in enumerate(pending, start=1):
+            expression = Expression.from_prefix(
+                candidate.prefix_token_ids,
+                action_registry=action_registry,
             )
-            registry.record_evaluation(
-                candidate.structural_hash,
-                valid=True,
-                reward_details=reward_details,
-                target_mass=assignment.reward,
-            )
-        else:
-            registry.record_evaluation(
-                candidate.structural_hash,
-                valid=False,
-                reward_details=dict(assignment.metadata),
-                rejection_reason=assignment.rejection_reason,
-                target_mass=0.0,
-            )
-        if index % progress_every == 0 or index == total:
-            elapsed = perf_counter() - started
-            rate = index / elapsed if elapsed else 0.0
-            eta = (total - index) / rate if rate else None
-            progress(
-                f"[exhaustive] {index}/{total}, elapsed={elapsed:.1f}s, "
-                f"eta={eta:.1f}s" if eta is not None else f"[exhaustive] {index}/{total}"
-            )
-    for node_count in (1, 2):
-        registry.compute_exact_masses(node_count, reward_floor=reward_floor)
-        coverage = registry.coverage(node_count)
-        progress(f"[exhaustive] N={node_count} coverage={coverage}")
-    return registry
+            assignment = provider.evaluate(expression)
+            if assignment.valid:
+                reward_details = dict(assignment.metadata)
+                reward_details.setdefault(
+                    "reward_result",
+                    {
+                        "raw_reward": assignment.reward,
+                        "reward": assignment.reward,
+                        "log_reward": assignment.log_reward,
+                    },
+                )
+                registry.record_evaluation(
+                    candidate.structural_hash,
+                    valid=True,
+                    reward_details=reward_details,
+                    target_mass=assignment.reward,
+                )
+            else:
+                registry.record_evaluation(
+                    candidate.structural_hash,
+                    valid=False,
+                    reward_details=dict(assignment.metadata),
+                    rejection_reason=assignment.rejection_reason,
+                    target_mass=0.0,
+                )
+            if index % progress_every == 0 or index == total:
+                elapsed = perf_counter() - started
+                rate = index / elapsed if elapsed else 0.0
+                eta = (total - index) / rate if rate else None
+                progress(
+                    f"[exhaustive] {index}/{total}, elapsed={elapsed:.1f}s, "
+                    f"eta={eta:.1f}s"
+                    if eta is not None
+                    else f"[exhaustive] {index}/{total}"
+                )
+        for node_count in (1, 2):
+            registry.compute_exact_masses(node_count, reward_floor=reward_floor)
+            coverage = registry.coverage(node_count)
+            progress(f"[exhaustive] N={node_count} coverage={coverage}")
+        return registry
+    except BaseException:
+        registry.close()
+        raise
 
 
 def configure_registry_once(trainer: GFNTrainer, registry: ExhaustiveRegistry) -> None:

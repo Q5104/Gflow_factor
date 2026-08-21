@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from types import MappingProxyType
 
+from factor_gfn.feature_spaces import RAW_DAILY_FEATURE_NAMES
 
 class OperatorCategory(StrEnum):
     """研报日频文法中的叶子和五类算子。"""
@@ -65,12 +66,16 @@ def _specs(
     )
 
 
-LEAVES = _specs(
-    ("open", "high", "low", "close", "vwap", "volume"),
-    OperatorCategory.LEAF,
-    arity=0,
-    requires_window=False,
-)
+def build_leaf_operators(names: tuple[str, ...]) -> tuple[OperatorSpec, ...]:
+    return _specs(
+        tuple(names),
+        OperatorCategory.LEAF,
+        arity=0,
+        requires_window=False,
+    )
+
+
+LEAVES = build_leaf_operators(RAW_DAILY_FEATURE_NAMES)
 
 UNARY_OPERATORS = _specs(
     (
@@ -206,5 +211,6 @@ __all__ = [
     "TS_BINARY_OPERATORS",
     "TS_UNARY_OPERATORS",
     "UNARY_OPERATORS",
+    "build_leaf_operators",
     "get_operator",
 ]

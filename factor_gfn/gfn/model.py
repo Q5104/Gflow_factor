@@ -8,19 +8,15 @@ import torch
 from torch import Tensor, nn
 
 from factor_gfn.grammar import (
-    CATEGORY_TO_INDEX,
-    OPERATOR_TO_INDEX,
+    RAW_ACTION_REGISTRY,
+    ActionRegistry,
     OperatorCategory,
     SearchSpaceConfig,
-    TOTAL_ACTIONS,
     WINDOWS,
-    WINDOW_TO_INDEX,
-    get_action,
-    get_token_indices,
 )
 
 from .config import ModelConfig
-from .state_adapter import MODEL_TOKEN_COUNT, ROLE_COUNT, StateBatch
+from .state_adapter import ROLE_COUNT, StateBatch
 
 
 TOKEN_GROUP_NAMES = ("leaf", "unary", "binary")
@@ -73,21 +69,28 @@ class ForwardPolicyNetwork(nn.Module):
         self,
         model_config: ModelConfig = ModelConfig(),
         search_space: SearchSpaceConfig = SearchSpaceConfig(),
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
     ) -> None:
         super().__init__()
+        if not isinstance(action_registry, ActionRegistry):
+            raise TypeError("action_registry 必须是 ActionRegistry")
         self.model_config = model_config
         self.search_space = search_space
+        self.action_registry = action_registry
+        self.action_count = action_registry.action_count
+        self.model_token_count = self.action_count + 2
+        self.operator_count = len(action_registry.operator_to_index)
         d_model = model_config.d_model
         max_sequence_nodes = 2 * search_space.max_nodes + 1
 
-        category_special = len(CATEGORY_TO_INDEX)
-        operator_special = len(OPERATOR_TO_INDEX)
-        window_special = len(WINDOW_TO_INDEX)
+        category_special = len(action_registry.category_to_index)
+        operator_special = self.operator_count
+        window_special = len(action_registry.window_to_index)
         category_lookup: list[int] = []
         operator_lookup: list[int] = []
         window_lookup: list[int] = []
-        for token_id in range(TOTAL_ACTIONS):
-            category, operator, window = get_token_indices(token_id)
+        for token_id in range(self.action_count):
+            category, operator, window = action_registry.get_token_indices(token_id)
             category_lookup.append(category)
             operator_lookup.append(operator)
             window_lookup.append(window)
@@ -141,20 +144,29 @@ class ForwardPolicyNetwork(nn.Module):
             self.token_head = nn.Sequential(
                 nn.Linear(d_model, d_model),
                 nn.GELU(),
-                nn.Linear(d_model, TOTAL_ACTIONS),
+                nn.Linear(d_model, self.action_count),
             )
-        token_groups = [get_action(token_id).arity for token_id in range(TOTAL_ACTIONS)]
+        token_groups = [
+            action_registry.get_action(token_id).arity
+            for token_id in range(self.action_count)
+        ]
         token_categories = [
-            CATEGORY_TO_INDEX[get_action(token_id).category]
-            for token_id in range(TOTAL_ACTIONS)
+            action_registry.category_to_index[
+                action_registry.get_action(token_id).category
+            ]
+            for token_id in range(self.action_count)
         ]
         token_operators = [
-            OPERATOR_TO_INDEX[get_action(token_id).name]
-            for token_id in range(TOTAL_ACTIONS)
+            action_registry.operator_to_index[action_registry.get_action(token_id).name]
+            for token_id in range(self.action_count)
         ]
         token_windows = [
-            (WINDOWS.index(get_action(token_id).window) if get_action(token_id).window else -1)
-            for token_id in range(TOTAL_ACTIONS)
+            (
+                WINDOWS.index(action_registry.get_action(token_id).window)
+                if action_registry.get_action(token_id).window
+                else -1
+            )
+            for token_id in range(self.action_count)
         ]
         self.register_buffer(
             "token_group_lookup",
@@ -182,11 +194,14 @@ class ForwardPolicyNetwork(nn.Module):
             )
             for category in OperatorCategory
         ]
-        operator_categories = [0] * len(OPERATOR_TO_INDEX)
-        operator_requires_window = [False] * len(OPERATOR_TO_INDEX)
-        for action in (get_action(token_id) for token_id in range(TOTAL_ACTIONS)):
-            operator_categories[OPERATOR_TO_INDEX[action.name]] = CATEGORY_TO_INDEX[action.category]
-            operator_requires_window[OPERATOR_TO_INDEX[action.name]] = bool(action.window)
+        operator_categories = [0] * self.operator_count
+        operator_requires_window = [False] * self.operator_count
+        for action in action_registry.actions:
+            operator_id = action_registry.operator_to_index[action.name]
+            operator_categories[operator_id] = action_registry.category_to_index[
+                action.category
+            ]
+            operator_requires_window[operator_id] = bool(action.window)
         self.register_buffer(
             "category_group_lookup",
             torch.tensor(category_groups, dtype=torch.long),
@@ -213,10 +228,10 @@ class ForwardPolicyNetwork(nn.Module):
                 d_model, GRAMMAR_CATEGORY_COUNT
             )
             self.operator_head: nn.Linear | None = nn.Linear(
-                d_model, len(OPERATOR_TO_INDEX)
+                d_model, self.operator_count
             )
             self.window_head: nn.Linear | None = nn.Linear(
-                d_model, len(OPERATOR_TO_INDEX) * WINDOW_COUNT
+                d_model, self.operator_count * WINDOW_COUNT
             )
             for head in (
                 self.grammar_category_head,
@@ -313,7 +328,7 @@ class ForwardPolicyNetwork(nn.Module):
             self.action_category_lookup, num_classes=GRAMMAR_CATEGORY_COUNT
         ).to(dtype=torch.bool)
         action_operators = torch.nn.functional.one_hot(
-            self.action_operator_lookup, num_classes=len(OPERATOR_TO_INDEX)
+            self.action_operator_lookup, num_classes=self.operator_count
         ).to(dtype=torch.bool)
         legal_by_category = legal_token_mask.unsqueeze(-1) & action_categories
         legal_category_mask = legal_by_category.any(dim=2)
@@ -365,7 +380,7 @@ class ForwardPolicyNetwork(nn.Module):
         )
 
         window_logits = self.window_head(slot_hidden).view(
-            *slot_hidden.shape[:2], len(OPERATOR_TO_INDEX), WINDOW_COUNT
+            *slot_hidden.shape[:2], self.operator_count, WINDOW_COUNT
         ) / temperature
         # 当前固定文法中，同一个时序 Operator 的五个窗口具有相同结构合法性；
         # 用 Operator 合法掩码一次性展开，避免每次 forward 发起 142 次 GPU 小操作。
@@ -418,7 +433,7 @@ class ForwardPolicyNetwork(nn.Module):
     def _token_embeddings(self, token_ids: Tensor) -> Tensor:
         """按研报口径叠加类别、算子/特征和窗口三组 embedding。"""
 
-        if token_ids.min().item() < 0 or token_ids.max().item() >= MODEL_TOKEN_COUNT:
+        if token_ids.min().item() < 0 or token_ids.max().item() >= self.model_token_count:
             raise ValueError("模型 Token ID 超出动作/Hole/PAD 词表")
         return (
             self.category_embedding(self.token_category_lookup[token_ids])
@@ -463,6 +478,8 @@ class ForwardPolicyNetwork(nn.Module):
             for state in batch.states
         ):
             raise ValueError("StateBatch 与模型的 SearchSpaceConfig 必须等价")
+        if batch.action_space_fingerprint != self.action_registry.fingerprint():
+            raise ValueError("StateBatch 与模型不得跨 ActionRegistry 混用")
         if batch.depths.max().item() > self.search_space.max_depth:
             raise ValueError("输入状态深度超过模型配置")
 
@@ -513,7 +530,7 @@ class ForwardPolicyNetwork(nn.Module):
 
         slot_logits = self.slot_head(slot_hidden).squeeze(-1) / temperature
         token_logits = (
-            slot_hidden.new_zeros((*slot_hidden.shape[:2], TOTAL_ACTIONS))
+            slot_hidden.new_zeros((*slot_hidden.shape[:2], self.action_count))
             if self.token_head is None
             else self.token_head(slot_hidden) / temperature
         )

@@ -1,5 +1,6 @@
-import json
 import gc
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ import pandas as pd
 from factor_gfn.barra import STYLE_NAMES, BarraConfig
 from factor_gfn.evaluator import EvaluationConfig
 from factor_gfn.gfn.real_data import (
+    ExpressionFeatureSpec,
     RealRewardDataConfig,
     RealRewardDataPaths,
     build_global_rebalance_indices,
@@ -88,7 +90,15 @@ class RealRewardDataContextTests(unittest.TestCase):
         np.save(processed / "date_list.npy", dates, allow_pickle=False)
         np.save(processed / "stock_list.npy", stocks, allow_pickle=False)
         (processed / "metadata.json").write_text(
-            json.dumps({"schema": "test.processed.v1"}), encoding="utf-8"
+            json.dumps(
+                {
+                    "schema": "test.processed.v1",
+                    "feature_order": [
+                        "open", "high", "low", "close", "vwap", "volume"
+                    ],
+                }
+            ),
+            encoding="utf-8",
         )
 
         for style_index, name in enumerate(STYLE_NAMES):
@@ -149,6 +159,45 @@ class RealRewardDataContextTests(unittest.TestCase):
         )
         return paths, config
 
+    @staticmethod
+    def _sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        digest.update(path.read_bytes())
+        return digest.hexdigest()
+
+    def _with_derived_tensor(
+        self,
+        paths: RealRewardDataPaths,
+        tensor: np.ndarray,
+        *,
+        directory_name: str = "daily_derived_v1",
+    ) -> RealRewardDataPaths:
+        derived = paths.processed_dir / directory_name
+        derived.mkdir()
+        np.save(derived / "data_tensor.npy", tensor.astype(np.float32), allow_pickle=False)
+        spec = ExpressionFeatureSpec.daily_derived(derived)
+        metadata = {
+            "status": "completed",
+            "feature_space_id": spec.feature_space_id,
+            "feature_order": list(spec.ordered_feature_names),
+            "feature_count": len(spec.ordered_feature_names),
+            "shape": list(tensor.shape),
+            "builder_schema_fingerprint": spec.expected_schema_fingerprint,
+            "axes": {
+                "date": {"sha256": self._sha256(paths.date_list_path)},
+                "stock": {"sha256": self._sha256(paths.stock_list_path)},
+            },
+        }
+        (derived / "metadata.json").write_text(
+            json.dumps(metadata), encoding="utf-8"
+        )
+        return RealRewardDataPaths(
+            processed_dir=paths.processed_dir,
+            industry_path=paths.industry_path,
+            industry_metadata_path=paths.industry_metadata_path,
+            expression_features=spec,
+        )
+
     def test_context_is_aligned_global_and_excludes_validation_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths, config = self._prepare_files(Path(temporary))
@@ -183,6 +232,89 @@ class RealRewardDataContextTests(unittest.TestCase):
             self.assertEqual(first.fingerprint, second.fingerprint)
             del first, second
             gc.collect()
+
+    def test_derived_expression_tensor_keeps_raw_labels_identical(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, config = self._prepare_files(Path(temporary))
+            dates = np.load(paths.date_list_path, allow_pickle=False)
+            stocks = np.load(paths.stock_list_path, allow_pickle=False)
+            first_tensor = np.arange(
+                dates.size * 16 * stocks.size, dtype=np.float32
+            ).reshape(dates.size, 16, stocks.size)
+            first_tensor[5, 1, 2] = np.nan
+            second_tensor = np.full_like(first_tensor, -123.0)
+            first_paths = self._with_derived_tensor(paths, first_tensor)
+            second_paths = self._with_derived_tensor(
+                paths, second_tensor, directory_name="daily_derived_v1_second"
+            )
+
+            raw = build_real_reward_data_context(config, paths)
+            first = build_real_reward_data_context(config, first_paths)
+            second = build_real_reward_data_context(config, second_paths)
+
+            np.testing.assert_array_equal(first.forward_returns, raw.forward_returns)
+            np.testing.assert_array_equal(second.forward_returns, raw.forward_returns)
+            self.assertEqual(first.factor_tensor.shape, (40, 16, 4))
+            np.testing.assert_equal(first.factor_tensor[5, 1, 2], np.nan)
+            self.assertEqual(
+                first.ordered_feature_names[1],
+                "ret_cc1",
+            )
+            self.assertEqual(first.expression_feature_space_id, "daily_derived_v1")
+            self.assertNotEqual(first.fingerprint, raw.fingerprint)
+            del raw, first, second
+            gc.collect()
+
+    def test_derived_schema_and_axes_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths, config = self._prepare_files(Path(temporary))
+            dates = np.load(paths.date_list_path, allow_pickle=False)
+            stocks = np.load(paths.stock_list_path, allow_pickle=False)
+            tensor = np.ones((dates.size, 16, stocks.size), dtype=np.float32)
+            derived_paths = self._with_derived_tensor(paths, tensor)
+            metadata_path = derived_paths.expression_metadata_path
+            original = json.loads(metadata_path.read_text(encoding="utf-8"))
+
+            wrong_order = dict(original)
+            wrong_order["feature_order"] = list(reversed(original["feature_order"]))
+            metadata_path.write_text(json.dumps(wrong_order), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "feature order"):
+                build_real_reward_data_context(config, derived_paths)
+
+            wrong_axis = dict(original)
+            wrong_axis["axes"] = {
+                **original["axes"],
+                "date": {"sha256": "0" * 64},
+            }
+            metadata_path.write_text(json.dumps(wrong_axis), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "date axis fingerprint"):
+                build_real_reward_data_context(config, derived_paths)
+
+            wrong_fingerprint = dict(original)
+            wrong_fingerprint["builder_schema_fingerprint"] = "0" * 64
+            metadata_path.write_text(json.dumps(wrong_fingerprint), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "schema fingerprint"):
+                build_real_reward_data_context(config, derived_paths)
+
+            metadata_path.write_text(json.dumps(original), encoding="utf-8")
+            wrong_count = np.ones((dates.size, 15, stocks.size), dtype=np.float32)
+            np.save(derived_paths.expression_tensor_path, wrong_count, allow_pickle=False)
+            with self.assertRaisesRegex(ValueError, "feature count"):
+                build_real_reward_data_context(config, derived_paths)
+
+            wrong_date_axis = np.ones(
+                (dates.size - 1, 16, stocks.size), dtype=np.float32
+            )
+            date_metadata = dict(original)
+            date_metadata["shape"] = list(wrong_date_axis.shape)
+            metadata_path.write_text(json.dumps(date_metadata), encoding="utf-8")
+            np.save(
+                derived_paths.expression_tensor_path,
+                wrong_date_axis,
+                allow_pickle=False,
+            )
+            with self.assertRaisesRegex(ValueError, "Raw date/stock"):
+                build_real_reward_data_context(config, derived_paths)
 
 
 if __name__ == "__main__":

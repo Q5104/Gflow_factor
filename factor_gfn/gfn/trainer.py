@@ -21,10 +21,10 @@ import numpy as np
 import torch
 
 from factor_gfn.grammar import (
+    RAW_ACTION_REGISTRY,
     WINDOWS,
     Expression,
     action_space_fingerprint,
-    get_action,
     resolve_exact_node_strata,
     state_space_fingerprint,
     transition_space_fingerprint,
@@ -171,7 +171,10 @@ class SyntheticRewardProvider:
     def evaluate(self, expression: Expression) -> RewardAssignment:
         if not isinstance(expression, Expression):
             raise TypeError("expression 必须是 Expression")
-        names = {get_action(token_id).name for token_id in expression.to_prefix()}
+        names = {
+            expression.action_registry.get_action(token_id).name
+            for token_id in expression.to_prefix()
+        }
         log_reward = (
             self.config.close_bonus * float("close" in names)
             + self.config.ts_mean_bonus * float("ts_mean" in names)
@@ -318,6 +321,7 @@ class GFNTrainer:
                 "GFNConfig.reward 与 RewardProvider 声明的 reward_config 不一致"
             )
         self.config = config
+        self.action_registry = RAW_ACTION_REGISTRY
         self.reward_provider = reward_provider
         self.device = torch.device(device)
         self.cublas_workspace_config = configure_cuda_determinism(
@@ -347,8 +351,15 @@ class GFNTrainer:
                 if config.complexity_scheduler.enabled else None
             )
             conditioned_enabled = config.complexity_scheduler.enabled
-        self.adapter = StateAdapter(config.search_space)
-        self.model = ForwardPolicyNetwork(config.model, config.search_space).to(self.device)
+        self.adapter = StateAdapter(
+            config.search_space,
+            action_registry=self.action_registry,
+        )
+        self.model = ForwardPolicyNetwork(
+            config.model,
+            config.search_space,
+            action_registry=self.action_registry,
+        ).to(self.device)
         training = config.training
         if resolved_complexity is None:
             self.tb_loss = TrajectoryBalanceLoss(
@@ -893,10 +904,14 @@ class GFNTrainer:
             grammar_semantics_fingerprint=fingerprint(
                 {
                     "state_space": state_space_fingerprint(),
-                    "transition_space": transition_space_fingerprint(),
+                    "transition_space": transition_space_fingerprint(
+                        self.action_registry
+                    ),
                 }
             ),
-            operator_semantics_fingerprint=action_space_fingerprint(),
+            operator_semantics_fingerprint=action_space_fingerprint(
+                self.action_registry
+            ),
             interpreter_semantics_fingerprint=fingerprint(interpreter_payload),
             provider_fingerprint=self.reward_provider.fingerprint(),
             data_context_fingerprint=str(provider_manifest["context_fingerprint"]),
@@ -1134,7 +1149,8 @@ class GFNTrainer:
             raise ValueError("condition_N must be a feasible integer node count")
         condition_N = int(condition_N)
         feasible = resolve_exact_node_strata(
-            self.config.search_space
+            self.config.search_space,
+            self.action_registry,
         ).resolved_feasible_node_counts
         if condition_N not in feasible:
             raise ValueError("condition_N must be feasible under the search space")
@@ -1432,7 +1448,14 @@ class GFNTrainer:
                 dtype=np.float64,
             )
             selected_windows = np.asarray(
-                [WINDOWS.index(get_action(step.selected_token_id).window) for step in window_steps],
+                [
+                    WINDOWS.index(
+                        self.action_registry.get_action(
+                            step.selected_token_id
+                        ).window
+                    )
+                    for step in window_steps
+                ],
                 dtype=np.int64,
             )
             diagnostics = (

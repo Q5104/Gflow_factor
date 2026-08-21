@@ -144,12 +144,16 @@ from .reward import (
     combine_reward_components,
 )
 from .real_data import (
+    DAILY_DERIVED_FEATURE_SPACE_ID,
     REAL_REWARD_CONTEXT_SCHEMA,
+    RAW_DAILY_FEATURE_SPACE_ID,
+    ExpressionFeatureSpec,
     RealRewardDataConfig,
     RealRewardDataContext,
     RealRewardDataPaths,
     build_global_rebalance_indices,
     build_real_reward_data_context,
+    validate_expression_feature_artifact,
 )
 from .state_adapter import (
     HOLE_TOKEN_ID,
@@ -353,7 +357,10 @@ __all__ = [
     "RewardAssignment",
     "RewardProvider",
     "SingleConditionBatchCollection",
+    "DAILY_DERIVED_FEATURE_SPACE_ID",
     "REAL_REWARD_CONTEXT_SCHEMA",
+    "RAW_DAILY_FEATURE_SPACE_ID",
+    "ExpressionFeatureSpec",
     "RealRewardDataConfig",
     "RealRewardDataContext",
     "RealRewardDataPaths",
@@ -443,6 +450,7 @@ __all__ = [
     "build_global_rebalance_indices",
     "build_log_z_initialization_health",
     "build_real_reward_data_context",
+    "validate_expression_feature_artifact",
     "state_hash",
     "target_condition_fingerprint",
     "state_adapter_manifest",

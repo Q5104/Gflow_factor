@@ -13,12 +13,12 @@ import torch
 from torch import Tensor
 
 from factor_gfn.grammar import (
-    CATEGORY_TO_INDEX,
+    RAW_ACTION_REGISTRY,
+    ActionRegistry,
     DAGAction,
     Expression,
     ExactNodeGrammarState,
     GrammarState,
-    get_action,
     state_space_fingerprint,
 )
 
@@ -69,6 +69,10 @@ def state_hash(state: ReplayState) -> str:
         "state_space_fingerprint": state_space_fingerprint(),
         "search_space_fingerprint": structural_state.search_space.fingerprint(),
     }
+    if structural_state.action_registry != RAW_ACTION_REGISTRY:
+        manifest["action_space_fingerprint"] = (
+            structural_state.action_registry.fingerprint()
+        )
     if isinstance(state, ExactNodeGrammarState):
         manifest["condition_fingerprint"] = target_condition_fingerprint(
             state.target_node_count,
@@ -112,7 +116,12 @@ class TrajectoryStep:
     window_entropy: float | None = None
     normalized_window_entropy: float | None = None
 
-    def validate(self, *, check_tensor_values: bool = True) -> None:
+    def validate(
+        self,
+        *,
+        check_tensor_values: bool = True,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+    ) -> None:
         _validate_hash(self.state_hash, "state_hash")
         _validate_hash(self.child_state_hash, "child_state_hash")
         if (
@@ -132,7 +141,7 @@ class TrajectoryStep:
             raise ValueError("selected_slot_orbit_key 不能为空")
         if not isinstance(self.selected_token_id, Integral) or isinstance(self.selected_token_id, bool):
             raise ValueError("selected_token_id 必须是合法整数 Token ID")
-        get_action(int(self.selected_token_id))
+        action_registry.get_action(int(self.selected_token_id))
         if (
             not isinstance(self.n_parents, Integral)
             or isinstance(self.n_parents, bool)
@@ -201,7 +210,10 @@ class TrajectoryStep:
                 )
             ):
                 raise ValueError("group_probabilities 必须是和为1的三元概率")
-            if self.selected_token_group != get_action(int(self.selected_token_id)).arity:
+            if (
+                self.selected_token_group
+                != action_registry.get_action(int(self.selected_token_id)).arity
+            ):
                 raise ValueError("selected_token_group 与 Token 元数不一致")
             if (
                 not isinstance(self.group_entropy, Real)
@@ -228,8 +240,11 @@ class TrajectoryStep:
         if any(value is not None for value in grammar_fields):
             if any(value is None for value in grammar_fields):
                 raise ValueError("完整文法策略轨迹字段必须同时存在或同时为空")
-            action = get_action(int(self.selected_token_id))
-            if self.selected_grammar_category != CATEGORY_TO_INDEX[action.category]:
+            action = action_registry.get_action(int(self.selected_token_id))
+            if (
+                self.selected_grammar_category
+                != action_registry.category_to_index[action.category]
+            ):
                 raise ValueError("selected_grammar_category 与 Token 类别不一致")
             if (
                 not isinstance(self.grammar_category_probabilities, tuple)
@@ -392,8 +407,12 @@ class Trajectory:
             raise ValueError("轨迹至少需要一个步骤")
         if self.sampling_mode not in ("stochastic", "greedy"):
             raise ValueError("sampling_mode 必须是 stochastic 或 greedy")
+        action_registry = self.terminal_expression.action_registry
         for step in self.steps:
-            step.validate(check_tensor_values=check_tensor_values)
+            step.validate(
+                check_tensor_values=check_tensor_values,
+                action_registry=action_registry,
+            )
         for current, following in zip(self.steps, self.steps[1:]):
             if current.child_state_hash != following.state_hash:
                 raise ValueError("相邻轨迹步骤的状态哈希不连续")
@@ -442,6 +461,14 @@ class Trajectory:
         """按记录的规范槽位和 Token 重放轨迹并核对每个状态。"""
 
         self.validate()
+        action_registry = self.terminal_expression.action_registry
+        structural_initial = (
+            initial_state.state
+            if isinstance(initial_state, ExactNodeGrammarState)
+            else initial_state
+        )
+        if structural_initial.action_registry != action_registry:
+            raise ValueError("重放初始状态与轨迹不得跨 ActionRegistry 混用")
         if self.target_node_count is None:
             if isinstance(initial_state, ExactNodeGrammarState):
                 raise ValueError("无条件轨迹不能用 conditioned 初始状态重放")
@@ -471,7 +498,13 @@ class Trajectory:
             slot = slots[step.selected_slot_index]
             if slot.path != step.selected_slot_path or slot.orbit_key != step.selected_slot_orbit_key:
                 raise ValueError("重放时规范槽位身份与轨迹记录不一致")
-            state = state.step(DAGAction(slot.path, step.selected_token_id))
+            state = state.step(
+                DAGAction(
+                    slot.path,
+                    step.selected_token_id,
+                    action_registry,
+                )
+            )
             if state_hash(state) != step.child_state_hash:
                 raise ValueError("重放后的子状态哈希与轨迹记录不一致")
             actual_n_parents = state.count_parents()

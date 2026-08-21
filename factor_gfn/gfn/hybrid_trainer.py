@@ -149,7 +149,21 @@ class HybridVarianceTrainer(GFNTrainer):
             )
 
         self.config = config
+        self.action_registry = config.action_registry
         self.reward_provider = reward_provider
+        provider_context = getattr(reward_provider, "context", None)
+        provider_feature_space_id = getattr(
+            provider_context,
+            "expression_feature_space_id",
+            None,
+        )
+        if (
+            provider_feature_space_id is not None
+            and provider_feature_space_id != config.feature_space.feature_space_id
+        ):
+            raise ValueError(
+                "Hybrid config Feature Space 与 RewardProvider context 不一致"
+            )
         self.device = torch.device(device)
         self.no_anchor_mode = False
         self.hybrid_mode = True
@@ -161,10 +175,15 @@ class HybridVarianceTrainer(GFNTrainer):
             config.training.seed,
             deterministic_algorithms=config.training.deterministic_algorithms,
         )
-        self.adapter = StateAdapter(config.search_space)
-        self.model = ForwardPolicyNetwork(config.model, config.search_space).to(
-            self.device
+        self.adapter = StateAdapter(
+            config.search_space,
+            action_registry=self.action_registry,
         )
+        self.model = ForwardPolicyNetwork(
+            config.model,
+            config.search_space,
+            action_registry=self.action_registry,
+        ).to(self.device)
         self.exact_tb_loss = FixedExactTrajectoryBalanceLoss(
             max_nodes=config.search_space.max_nodes,
             exact_node_counts=config.objective.exact_tb_node_counts,
@@ -247,10 +266,14 @@ class HybridVarianceTrainer(GFNTrainer):
             grammar_semantics_fingerprint=fingerprint(
                 {
                     "state_space": state_space_fingerprint(),
-                    "transition_space": transition_space_fingerprint(),
+                    "transition_space": transition_space_fingerprint(
+                        self.action_registry
+                    ),
                 }
             ),
-            operator_semantics_fingerprint=action_space_fingerprint(),
+            operator_semantics_fingerprint=action_space_fingerprint(
+                self.action_registry
+            ),
             interpreter_semantics_fingerprint=fingerprint(interpreter_payload),
             provider_fingerprint=self.reward_provider.fingerprint(),
             data_context_fingerprint=str(provider_manifest["context_fingerprint"]),
@@ -287,6 +310,10 @@ class HybridVarianceTrainer(GFNTrainer):
         *,
         source_semantics_by_N: Mapping[int, ExhaustiveReuseSemantics],
     ) -> dict[int, ExhaustiveStratumReuseProof]:
+        if not isinstance(registry, ExhaustiveRegistry):
+            raise TypeError("registry 必须是 ExhaustiveRegistry")
+        if registry.action_registry.fingerprint() != self.action_registry.fingerprint():
+            raise ValueError("Hybrid Trainer 与 exhaustive registry ActionRegistry 不一致")
         if self.exhaustive_reward_lookups_by_N:
             raise RuntimeError("hybrid exhaustive registry equivalence is already verified")
         expected = set(self.config.objective.exact_tb_node_counts)
@@ -301,6 +328,7 @@ class HybridVarianceTrainer(GFNTrainer):
                 search_space=self.config.search_space,
                 target_node_count=node_count,
                 canonical_count_cap=None,
+                action_registry=self.action_registry,
             ).expressions
             proof = prove_exhaustive_stratum_reuse(
                 registry,

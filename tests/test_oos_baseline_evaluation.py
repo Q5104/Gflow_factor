@@ -481,7 +481,7 @@ class EvaluationArtifactAndReportingTests(unittest.TestCase):
                 expected_test_score_artifact_fingerprint=self.evaluation.test_score_artifact_fingerprint,
             )
 
-    def test_fixed_ten_figures_six_tables_and_notebook_contract(self):
+    def test_eighteen_figures_eight_tables_and_notebook_contract(self):
         _, loaded = self._freeze_and_load()
         report = build_oos_report_data(loaded)
         split_payload = loaded.payloads["lightgbm_split_effectiveness"]
@@ -493,10 +493,10 @@ class EvaluationArtifactAndReportingTests(unittest.TestCase):
         renderer = OOSReportRenderer(report, self.root / "outputs")
         manifest_path = renderer.render_all()
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self.assertEqual(len(manifest["figures"]), 10)
-        self.assertEqual(len(manifest["tables"]), 6)
-        self.assertEqual(len(list((manifest_path.parent / "figures").glob("*.png"))), 10)
-        self.assertEqual(len(list((manifest_path.parent / "tables").glob("*.csv"))), 6)
+        self.assertEqual(len(manifest["figures"]), 20)
+        self.assertEqual(len(manifest["tables"]), 8)
+        self.assertEqual(len(list((manifest_path.parent / "figures").glob("*.png"))), 20)
+        self.assertEqual(len(list((manifest_path.parent / "tables").glob("*.csv"))), 8)
         notebook_path = Path(__file__).parents[1] / "notebooks" / "oos_baseline_evaluation.ipynb"
         notebook = nbformat.read(notebook_path, as_version=4)
         headings = ["".join(cell.source) for cell in notebook.cells if cell.cell_type == "markdown"]
@@ -508,9 +508,10 @@ class EvaluationArtifactAndReportingTests(unittest.TestCase):
             "04｜G10 多头组合与基准",
             "05｜超额收益与多空收益",
             "06｜换手率",
-            "07｜LightGBM 跨阶段诊断",
-            "08｜策略冻结与可复现信息",
-            "09｜导出正式报告",
+            "07｜滚动 ICIR 权重诊断",
+            "08｜LightGBM 跨阶段诊断",
+            "09｜策略冻结与可复现信息",
+            "10｜导出正式报告",
         ]
         positions = [
             next(index for index, text in enumerate(headings) if heading in text)

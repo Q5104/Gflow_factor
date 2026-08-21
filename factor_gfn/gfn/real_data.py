@@ -25,16 +25,79 @@ from factor_gfn.barra import (
     build_barra_long_short_returns,
     summarize_long_short,
 )
+from factor_gfn.data.daily_derived import DAILY_DERIVED_FEATURE_NAMES
+from factor_gfn.data.daily_derived_artifact import daily_derived_schema_fingerprint
 from factor_gfn.data.industry import (
     INDUSTRY_SW_DAILY_METADATA_PATH,
     INDUSTRY_SW_DAILY_PATH,
     load_sw_industry_panel,
 )
 from factor_gfn.data.preprocess import PROCESSED_DATA_DIR
-from factor_gfn.evaluator import EvaluationConfig, build_forward_returns
+from factor_gfn.evaluator import FEATURE_NAMES, EvaluationConfig, build_forward_returns
 
 
 REAL_REWARD_CONTEXT_SCHEMA = "factor_gfn.real_reward_context.v1"
+RAW_DAILY_FEATURE_SPACE_ID = "raw_daily"
+DAILY_DERIVED_FEATURE_SPACE_ID = "daily_derived_v1"
+
+
+@dataclass(frozen=True, slots=True)
+class ExpressionFeatureSpec:
+    """One explicit expression-tensor artifact and its ordered leaf schema."""
+
+    feature_space_id: str
+    artifact_dir: Path
+    ordered_feature_names: tuple[str, ...]
+    expected_schema_fingerprint: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "artifact_dir", Path(self.artifact_dir).resolve())
+        names = tuple(self.ordered_feature_names)
+        if not names or any(not isinstance(name, str) or not name for name in names):
+            raise ValueError("ordered_feature_names 必须是非空有序特征名")
+        if len(set(names)) != len(names):
+            raise ValueError("ordered_feature_names 不允许重复")
+        object.__setattr__(self, "ordered_feature_names", names)
+        if self.feature_space_id == RAW_DAILY_FEATURE_SPACE_ID:
+            if names != FEATURE_NAMES or self.expected_schema_fingerprint is not None:
+                raise ValueError("Raw Daily 必须使用冻结的 6-feature schema")
+        elif self.feature_space_id == DAILY_DERIVED_FEATURE_SPACE_ID:
+            if names != DAILY_DERIVED_FEATURE_NAMES:
+                raise ValueError("Daily-Derived 必须使用冻结的 16-feature order")
+            if self.expected_schema_fingerprint != daily_derived_schema_fingerprint():
+                raise ValueError("Daily-Derived expected schema fingerprint 不匹配")
+        else:
+            raise ValueError(f"未知 expression feature space：{self.feature_space_id!r}")
+
+    @property
+    def tensor_path(self) -> Path:
+        return self.artifact_dir / "data_tensor.npy"
+
+    @property
+    def metadata_path(self) -> Path:
+        return self.artifact_dir / "metadata.json"
+
+    @classmethod
+    def raw_daily(
+        cls, processed_dir: Path = PROCESSED_DATA_DIR
+    ) -> ExpressionFeatureSpec:
+        return cls(
+            feature_space_id=RAW_DAILY_FEATURE_SPACE_ID,
+            artifact_dir=processed_dir,
+            ordered_feature_names=FEATURE_NAMES,
+        )
+
+    @classmethod
+    def daily_derived(
+        cls,
+        artifact_dir: Path = PROCESSED_DATA_DIR / DAILY_DERIVED_FEATURE_SPACE_ID,
+    ) -> ExpressionFeatureSpec:
+        return cls(
+            feature_space_id=DAILY_DERIVED_FEATURE_SPACE_ID,
+            artifact_dir=artifact_dir,
+            ordered_feature_names=DAILY_DERIVED_FEATURE_NAMES,
+            expected_schema_fingerprint=daily_derived_schema_fingerprint(),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,14 +107,34 @@ class RealRewardDataPaths:
     processed_dir: Path = PROCESSED_DATA_DIR
     industry_path: Path = INDUSTRY_SW_DAILY_PATH
     industry_metadata_path: Path = INDUSTRY_SW_DAILY_METADATA_PATH
+    expression_features: ExpressionFeatureSpec | None = None
 
     def __post_init__(self) -> None:
         for name in ("processed_dir", "industry_path", "industry_metadata_path"):
             object.__setattr__(self, name, Path(getattr(self, name)).resolve())
+        if self.expression_features is None:
+            object.__setattr__(
+                self,
+                "expression_features",
+                ExpressionFeatureSpec.raw_daily(self.processed_dir),
+            )
+        elif not isinstance(self.expression_features, ExpressionFeatureSpec):
+            raise TypeError("expression_features 必须是 ExpressionFeatureSpec")
 
     @property
     def tensor_path(self) -> Path:
+        """Frozen Raw Daily tensor used for raw evaluation inputs."""
         return self.processed_dir / "data_tensor.npy"
+
+    @property
+    def expression_tensor_path(self) -> Path:
+        assert self.expression_features is not None
+        return self.expression_features.tensor_path
+
+    @property
+    def expression_metadata_path(self) -> Path:
+        assert self.expression_features is not None
+        return self.expression_features.metadata_path
 
     @property
     def universe_mask_path(self) -> Path:
@@ -103,7 +186,8 @@ class RealRewardDataConfig:
 class RealRewardDataContext:
     """Aligned arrays and diagnostics for a real Reward run.
 
-    ``factor_tensor`` contains all available history through the training end.
+    ``expression_feature_tensor`` contains the selected Feature Space history
+    through the training end. ``factor_tensor`` remains its compatibility alias.
     ``evaluation_factor_rows`` selects the rows that enter Reward evaluation.
     No validation-period feature or return is exposed through this context.
     """
@@ -121,6 +205,12 @@ class RealRewardDataContext:
     barra_long_short: Mapping[str, LongShortSeries]
     fingerprint: str
     manifest: Mapping[str, Any]
+    ordered_feature_names: tuple[str, ...] = FEATURE_NAMES
+    expression_feature_space_id: str = RAW_DAILY_FEATURE_SPACE_ID
+
+    @property
+    def expression_feature_tensor(self) -> npt.NDArray[np.floating]:
+        return self.factor_tensor
 
 
 def _require_files(paths: list[Path]) -> None:
@@ -140,6 +230,38 @@ def _sha256_file(path: Path) -> str:
 def _freeze(values: npt.NDArray[Any]) -> npt.NDArray[Any]:
     values.setflags(write=False)
     return values
+
+
+def validate_expression_feature_artifact(
+    paths: RealRewardDataPaths,
+    tensor: npt.NDArray[Any],
+) -> Mapping[str, Any]:
+    spec = paths.expression_features
+    assert spec is not None
+    metadata = json.loads(paths.expression_metadata_path.read_text(encoding="utf-8"))
+    if tuple(metadata.get("feature_order", ())) != spec.ordered_feature_names:
+        raise ValueError("expression metadata feature order 与显式 schema 不一致")
+    if tensor.ndim != 3:
+        raise ValueError("expression tensor 必须使用 (date, feature, stock) 三维布局")
+    if tensor.shape[1] != len(spec.ordered_feature_names):
+        raise ValueError("expression tensor feature count 与显式 schema 不一致")
+    if spec.feature_space_id == DAILY_DERIVED_FEATURE_SPACE_ID:
+        if metadata.get("status") != "completed":
+            raise ValueError("Daily-Derived metadata 未标记 completed")
+        if metadata.get("feature_space_id") != DAILY_DERIVED_FEATURE_SPACE_ID:
+            raise ValueError("Daily-Derived metadata feature_space_id 不匹配")
+        if metadata.get("feature_count") != len(spec.ordered_feature_names):
+            raise ValueError("Daily-Derived metadata feature_count 不匹配")
+        if tuple(metadata.get("shape", ())) != tensor.shape:
+            raise ValueError("Daily-Derived metadata shape 与 tensor 不一致")
+        if metadata.get("builder_schema_fingerprint") != spec.expected_schema_fingerprint:
+            raise ValueError("Daily-Derived metadata schema fingerprint 不匹配")
+        axes = metadata.get("axes", {})
+        if axes.get("date", {}).get("sha256") != _sha256_file(paths.date_list_path):
+            raise ValueError("Daily-Derived date axis fingerprint 不匹配")
+        if axes.get("stock", {}).get("sha256") != _sha256_file(paths.stock_list_path):
+            raise ValueError("Daily-Derived stock axis fingerprint 不匹配")
+    return metadata
 
 
 def build_global_rebalance_indices(
@@ -227,6 +349,8 @@ def build_real_reward_data_context(
     barra_paths = paths.barra_paths
     required = [
         paths.tensor_path,
+        paths.expression_tensor_path,
+        paths.expression_metadata_path,
         paths.universe_mask_path,
         paths.date_list_path,
         paths.stock_list_path,
@@ -239,13 +363,26 @@ def build_real_reward_data_context(
     ]
     _require_files(required)
 
-    tensor = np.load(paths.tensor_path, mmap_mode="r", allow_pickle=False)
+    raw_tensor = np.load(paths.tensor_path, mmap_mode="r", allow_pickle=False)
+    expression_tensor = (
+        raw_tensor
+        if paths.expression_tensor_path == paths.tensor_path
+        else np.load(paths.expression_tensor_path, mmap_mode="r", allow_pickle=False)
+    )
     universe_all = np.load(paths.universe_mask_path, mmap_mode="r", allow_pickle=False)
     dates = np.load(paths.date_list_path, allow_pickle=False).astype("datetime64[D]")
     stocks = np.load(paths.stock_list_path, allow_pickle=False).astype(str)
     expected = (dates.size, stocks.size)
-    if tensor.ndim != 3 or tensor.shape != (dates.size, 6, stocks.size):
+    if raw_tensor.ndim != 3 or raw_tensor.shape != (dates.size, 6, stocks.size):
         raise ValueError("data_tensor 必须与 date/stock 轴形成 (date, 6, stock)")
+    validate_expression_feature_artifact(paths, expression_tensor)
+    spec = paths.expression_features
+    assert spec is not None
+    if (
+        expression_tensor.shape[0] != dates.size
+        or expression_tensor.shape[2] != stocks.size
+    ):
+        raise ValueError("expression tensor 与 Raw date/stock 轴不一致")
     if universe_all.shape != expected:
         raise ValueError("universe_mask 与 date/stock 轴不一致")
     if np.unique(dates).size != dates.size or not np.all(dates[:-1] < dates[1:]):
@@ -264,14 +401,14 @@ def build_real_reward_data_context(
     end_row = int(evaluation_rows_full[-1])
 
     history_dates = _freeze(dates[: end_row + 1].copy())
-    factor_tensor = tensor[: end_row + 1]
+    factor_tensor = expression_tensor[: end_row + 1]
     evaluation_factor_rows = _freeze(
         np.arange(start_row, end_row + 1, dtype=np.int64)
     )
     evaluation_dates = _freeze(dates[start_row : end_row + 1].copy())
     universe = universe_all[start_row : end_row + 1]
     forward_returns = build_forward_returns(
-        tensor[start_row : end_row + 1, 0, :], config.evaluation
+        raw_tensor[start_row : end_row + 1, 0, :], config.evaluation
     )
     _freeze(forward_returns)
     industry = _freeze(
@@ -372,6 +509,22 @@ def build_real_reward_data_context(
         "barra_long_short": diagnostics,
         "sources": sources,
     }
+    if spec.feature_space_id != RAW_DAILY_FEATURE_SPACE_ID:
+        sources.update(
+            {
+                "expression_metadata_sha256": _sha256_file(
+                    paths.expression_metadata_path
+                ),
+                "expression_data_tensor_bytes": (
+                    paths.expression_tensor_path.stat().st_size
+                ),
+            }
+        )
+        manifest["expression_features"] = {
+            "feature_space_id": spec.feature_space_id,
+            "ordered_feature_names": list(spec.ordered_feature_names),
+            "schema_fingerprint": spec.expected_schema_fingerprint,
+        }
     payload = json.dumps(
         manifest, ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
@@ -390,14 +543,20 @@ def build_real_reward_data_context(
         barra_long_short=barra_long_short,
         fingerprint=fingerprint,
         manifest=manifest,
+        ordered_feature_names=spec.ordered_feature_names,
+        expression_feature_space_id=spec.feature_space_id,
     )
 
 
 __all__ = [
+    "DAILY_DERIVED_FEATURE_SPACE_ID",
     "REAL_REWARD_CONTEXT_SCHEMA",
+    "RAW_DAILY_FEATURE_SPACE_ID",
+    "ExpressionFeatureSpec",
     "RealRewardDataConfig",
     "RealRewardDataContext",
     "RealRewardDataPaths",
     "build_global_rebalance_indices",
     "build_real_reward_data_context",
+    "validate_expression_feature_artifact",
 ]

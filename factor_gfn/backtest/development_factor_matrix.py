@@ -32,13 +32,14 @@ from factor_gfn.evaluator.cross_section import (
     clean_candidate_factor_cross_sections,
     encode_industry_panel,
 )
-from factor_gfn.grammar import Expression
+from factor_gfn.grammar import ActionRegistry, Expression
 
 from .baseline_factor_pool import (
     OOS_UNTOUCHED,
     VerifiedFrozenBaselineFactorPool,
     load_verified_baseline_factor_pool,
 )
+from .expression_compatibility import action_registry_for_vocabulary
 from .strategy_input import (
     STRATEGY_INPUT_TOP_K,
     VerifiedStrategyInput,
@@ -278,9 +279,13 @@ def _label_fingerprint(
 
 def _verify_expression_identity(
     feature: FrozenFactorFeature,
+    action_registry: ActionRegistry,
 ) -> Expression:
     try:
-        expression = Expression.from_prefix(feature.prefix_token_ids)
+        expression = Expression.from_prefix(
+            feature.prefix_token_ids,
+            action_registry=action_registry,
+        )
     except (IndexError, TypeError, ValueError) as error:
         raise DevelopmentFactorMatrixIntegrityError(
             f"invalid frozen expression prefix for {feature.alias}"
@@ -460,8 +465,25 @@ def build_development_factor_matrices(
     )
     if tuple(item.structural_hash for item in mapping) != expected_hashes:
         raise DevelopmentFactorMatrixIntegrityError("frozen factor order changed")
-    expressions = tuple(_verify_expression_identity(item) for item in mapping)
-    interpreter = FactorInterpreter(context.factor_tensor)
+    try:
+        action_registry = action_registry_for_vocabulary(
+            frozen_pool.manifest.get("vocabulary")
+        )
+    except ValueError as error:
+        raise DevelopmentFactorMatrixIntegrityError(
+            "frozen factor pool vocabulary is invalid"
+        ) from error
+    if action_registry.leaf_names != context.ordered_feature_names:
+        raise DevelopmentFactorMatrixIntegrityError(
+            "frozen factor pool vocabulary does not match expression feature schema"
+        )
+    expressions = tuple(
+        _verify_expression_identity(item, action_registry) for item in mapping
+    )
+    interpreter = FactorInterpreter(
+        context.expression_feature_tensor,
+        ordered_feature_names=context.ordered_feature_names,
+    )
     aliases = tuple(item.alias for item in mapping)
     hashes = tuple(item.structural_hash for item in mapping)
     calendar_fingerprint = str(context.manifest.get("calendar", {}).get("fingerprint"))
@@ -789,9 +811,6 @@ def _verify_directory(
         or len({item.structural_hash for item in mapping}) != len(mapping)
     ):
         raise DevelopmentFactorMatrixIntegrityError("factor mapping order is invalid")
-    for item in mapping:
-        _verify_expression_identity(item)
-
     pool_path_value = manifest.get("upstream_manifest_paths", {}).get(
         "factor_pool_manifest"
     )
@@ -809,8 +828,19 @@ def _verify_directory(
                 "Strategy Input manifest path missing"
             )
         strategy_input_path = Path(strategy_input_path_value).resolve()
-    if verify_factor_pool:
-        pool = load_verified_baseline_factor_pool(pool_path)
+    pool = load_verified_baseline_factor_pool(pool_path) if verify_factor_pool else None
+    try:
+        action_registry = action_registry_for_vocabulary(
+            pool.manifest.get("vocabulary") if pool is not None else None
+        )
+    except ValueError as error:
+        raise DevelopmentFactorMatrixIntegrityError(
+            "frozen factor pool vocabulary is invalid"
+        ) from error
+    for item in mapping:
+        _verify_expression_identity(item, action_registry)
+
+    if pool is not None:
         expected_hashes = pool.ordered_structural_hashes
         expected_directions = pool.frozen_train_directions
         if strategy_input_path is not None:

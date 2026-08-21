@@ -7,8 +7,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from .operators import get_operator
-from .tokens import ActionSpec, get_action
+from .tokens import ActionRegistry, ActionSpec, RAW_ACTION_REGISTRY
 
 
 HASH_SCHEMA = "factor_gfn.expression.v1"
@@ -18,7 +17,11 @@ class ExpressionParseError(ValueError):
     """表达式 Token 序列无法构成唯一完整语法树。"""
 
 
-def _normalize_token_ids(token_ids: Iterable[int], label: str) -> tuple[int, ...]:
+def _normalize_token_ids(
+    token_ids: Iterable[int],
+    label: str,
+    action_registry: ActionRegistry,
+) -> tuple[int, ...]:
     try:
         raw_tokens = tuple(token_ids)
     except TypeError as exc:
@@ -29,7 +32,7 @@ def _normalize_token_ids(token_ids: Iterable[int], label: str) -> tuple[int, ...
     normalized: list[int] = []
     for position, token_id in enumerate(raw_tokens):
         try:
-            action = get_action(token_id)
+            action = action_registry.get_action(token_id)
         except (TypeError, IndexError) as exc:
             raise ExpressionParseError(
                 f"{label}第 {position} 个动作 ID 非法：{token_id!r}"
@@ -47,15 +50,18 @@ class ExpressionNode:
 
     action_id: int
     children: tuple[ExpressionNode, ...] = ()
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY
 
     def __post_init__(self) -> None:
         try:
-            action = get_action(self.action_id)
+            action = self.action_registry.get_action(self.action_id)
         except (TypeError, IndexError) as exc:
             raise ValueError(f"表达式节点包含非法动作 ID：{self.action_id!r}") from exc
         children = tuple(self.children)
         if any(not isinstance(child, ExpressionNode) for child in children):
             raise TypeError("表达式节点的 children 必须全部是 ExpressionNode")
+        if any(child.action_registry != self.action_registry for child in children):
+            raise ValueError("ExpressionNode children 不得跨 ActionRegistry 混用")
         if len(children) != action.arity:
             raise ValueError(
                 f"{action.name} 需要 {action.arity} 个子节点，实际为 {len(children)}"
@@ -65,7 +71,7 @@ class ExpressionNode:
 
     @property
     def action(self) -> ActionSpec:
-        return get_action(self.action_id)
+        return self.action_registry.get_action(self.action_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,11 +101,20 @@ class Expression:
         if not isinstance(self.root, ExpressionNode):
             raise TypeError("root 必须是 ExpressionNode")
 
+    @property
+    def action_registry(self) -> ActionRegistry:
+        return self.root.action_registry
+
     @classmethod
-    def from_prefix(cls, token_ids: Iterable[int]) -> Expression:
+    def from_prefix(
+        cls,
+        token_ids: Iterable[int],
+        *,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+    ) -> Expression:
         """严格解析前序动作序列，拒绝缺失子节点和多余根节点。"""
 
-        tokens = _normalize_token_ids(token_ids, "前序序列")
+        tokens = _normalize_token_ids(token_ids, "前序序列", action_registry)
         pending: list[_PendingPrefixNode] = []
         root: ExpressionNode | None = None
 
@@ -109,12 +124,12 @@ class Expression:
                     f"前序序列在位置 {position} 存在多余动作，完整表达式已提前结束"
                 )
 
-            action = get_action(action_id)
+            action = action_registry.get_action(action_id)
             if action.arity > 0:
                 pending.append(_PendingPrefixNode(action_id=action_id, children=[]))
                 continue
 
-            completed = ExpressionNode(action_id)
+            completed = ExpressionNode(action_id, action_registry=action_registry)
             while True:
                 if not pending:
                     root = completed
@@ -122,16 +137,20 @@ class Expression:
 
                 parent = pending[-1]
                 parent.children.append(completed)
-                parent_arity = get_action(parent.action_id).arity
+                parent_arity = action_registry.get_action(parent.action_id).arity
                 if len(parent.children) < parent_arity:
                     break
 
                 pending.pop()
-                completed = ExpressionNode(parent.action_id, tuple(parent.children))
+                completed = ExpressionNode(
+                    parent.action_id,
+                    tuple(parent.children),
+                    action_registry,
+                )
 
         if pending:
             parent = pending[-1]
-            action = get_action(parent.action_id)
+            action = action_registry.get_action(parent.action_id)
             missing = action.arity - len(parent.children)
             raise ExpressionParseError(
                 f"前序序列不完整：{action.name} 仍缺少 {missing} 个子节点"
@@ -141,13 +160,18 @@ class Expression:
         return cls(root)
 
     @classmethod
-    def from_postfix(cls, token_ids: Iterable[int]) -> Expression:
+    def from_postfix(
+        cls,
+        token_ids: Iterable[int],
+        *,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+    ) -> Expression:
         """严格解析后序动作序列，并保持二元子节点的左右顺序。"""
 
-        tokens = _normalize_token_ids(token_ids, "后序序列")
+        tokens = _normalize_token_ids(token_ids, "后序序列", action_registry)
         stack: list[ExpressionNode] = []
         for position, action_id in enumerate(tokens):
-            action = get_action(action_id)
+            action = action_registry.get_action(action_id)
             if len(stack) < action.arity:
                 raise ExpressionParseError(
                     f"后序序列在位置 {position} 的 {action.name} 缺少操作数："
@@ -158,7 +182,7 @@ class Expression:
             else:
                 children = tuple(stack[-action.arity :])
                 del stack[-action.arity :]
-            stack.append(ExpressionNode(action_id, children))
+            stack.append(ExpressionNode(action_id, children, action_registry))
 
         if len(stack) != 1:
             raise ExpressionParseError(
@@ -237,10 +261,10 @@ class Expression:
 
         def normalize(node: ExpressionNode) -> ExpressionNode:
             children = tuple(normalize(child) for child in node.children)
-            operator = get_operator(node.action.name)
+            operator = self.action_registry.get_operator(node.action.name)
             if operator.commutative:
                 children = tuple(sorted(children, key=_node_canonical_json))
-            return ExpressionNode(node.action_id, children)
+            return ExpressionNode(node.action_id, children, self.action_registry)
 
         return Expression(normalize(self.root))
 
@@ -273,10 +297,14 @@ def _node_canonical_json(node: ExpressionNode) -> str:
     )
 
 
-def validate_postfix(token_ids: Iterable[int]) -> None:
+def validate_postfix(
+    token_ids: Iterable[int],
+    *,
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+) -> None:
     """验证后序序列能否恰好构造一个完整结果；成功时不返回内容。"""
 
-    Expression.from_postfix(token_ids)
+    Expression.from_postfix(token_ids, action_registry=action_registry)
 
 
 __all__ = [

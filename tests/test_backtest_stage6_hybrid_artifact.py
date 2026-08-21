@@ -23,7 +23,12 @@ from factor_gfn.backtest.stage6_train_reuse import (
     HYBRID_TRAIN_REUSE_OVERLAY_SCHEMA,
     run_stage6_hybrid_train_reuse_overlay,
 )
-from factor_gfn.grammar import Expression, get_action_id
+from factor_gfn.grammar import (
+    DAILY_DERIVED_ACTION_REGISTRY,
+    RAW_ACTION_REGISTRY,
+    ActionRegistry,
+    Expression,
+)
 
 
 def _stable_hash(value) -> str:
@@ -115,18 +120,23 @@ class HybridStage6SourceAdapterTests(unittest.TestCase):
         *,
         complete: bool = True,
         exact_n: bool = False,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
     ) -> tuple[Path, Expression]:
         run = root / "hybrid_test_run"
         run.mkdir()
         expression = (
-            Expression.from_prefix((get_action_id("open"),))
+            Expression.from_prefix(
+                (action_registry.get_action_id(action_registry.leaf_names[0]),),
+                action_registry=action_registry,
+            )
             if exact_n
             else Expression.from_prefix(
                 (
-                    get_action_id("add"),
-                    get_action_id("open"),
-                    get_action_id("close"),
-                )
+                    action_registry.get_action_id("add"),
+                    action_registry.get_action_id(action_registry.leaf_names[0]),
+                    action_registry.get_action_id(action_registry.leaf_names[1]),
+                ),
+                action_registry=action_registry,
             ).canonicalize()
         )
         long_excess_dates = [] if exact_n else ["2020-01-01", "2020-01-06"]
@@ -201,6 +211,16 @@ class HybridStage6SourceAdapterTests(unittest.TestCase):
                 }
             ],
         }
+        if action_registry != RAW_ACTION_REGISTRY:
+            vocabulary = {
+                "feature_space_id": action_registry.feature_space.feature_space_id,
+                "feature_space_fingerprint": (
+                    action_registry.feature_space_fingerprint
+                ),
+                "action_space_fingerprint": action_registry.fingerprint(),
+            }
+            artifact["vocabulary"] = vocabulary
+            artifact["records"][0]["vocabulary"] = vocabulary
         _write_json(run / "train_candidate_artifact.json", artifact)
         checkpoint = {
             "schema": "factor_gfn.checkpoint.hybrid_variance.v1",
@@ -315,6 +335,7 @@ class HybridStage6SourceAdapterTests(unittest.TestCase):
                 origin["old_metric_audit"]["valid_semantics"],
                 "candidate_import_schema_compatibility_only",
             )
+            self.assertNotIn("vocabulary", origin)
 
             compatibility = audit_expression_compatibility(
                 import_manifest, source_set, root / "compatibility"
@@ -329,7 +350,76 @@ class HybridStage6SourceAdapterTests(unittest.TestCase):
             )
             self.assertNotIn("valid", accepted)
             self.assertNotIn("reward", accepted)
+            self.assertNotIn("vocabulary", accepted)
             self.assertTrue(accepted["stage6_metric_recompute_required"])
+
+    def test_derived_vocabulary_survives_snapshot_import_and_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run, expression = self._make_run(
+                root,
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+            )
+            source_set = materialize_source_set(
+                [self._spec(run)], root / "snapshots"
+            )
+            source_set_payload = json.loads(source_set.read_text(encoding="utf-8"))
+            source_manifest_path = Path(
+                source_set_payload["source_manifests"][0]["snapshot_manifest"]
+            )
+            source_manifest = json.loads(
+                source_manifest_path.read_text(encoding="utf-8")
+            )
+            vocabulary = source_manifest["source_semantics"]["vocabulary"]
+            self.assertEqual(vocabulary["feature_space_id"], "daily_derived_v1")
+
+            candidate_import = import_candidate_source_set(
+                source_set, root / "registries"
+            )
+            origin = json.loads(
+                (candidate_import.parent / "normalized_candidate_origins.jsonl")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            group = json.loads(
+                (candidate_import.parent / "candidate_registry.jsonl")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            self.assertEqual(origin["vocabulary"], vocabulary)
+            self.assertEqual(group["representations"][0]["vocabulary"], vocabulary)
+
+            compatibility = audit_expression_compatibility(
+                candidate_import, source_set, root / "compatibility"
+            )
+            accepted = json.loads(
+                (compatibility.parent / "auto_accepted_candidate_registry.jsonl")
+                .read_text(encoding="utf-8")
+                .strip()
+            )
+            self.assertEqual(accepted["vocabulary"], vocabulary)
+            rebuilt = Expression.from_prefix(
+                accepted["prefix_token_ids"],
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+            )
+            self.assertEqual(rebuilt.structural_hash(), expression.structural_hash())
+
+    def test_hybrid_vocabulary_mismatch_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run, _ = self._make_run(
+                root,
+                action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+            )
+            artifact_path = run / "train_candidate_artifact.json"
+            artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+            artifact["records"][0]["vocabulary"] = {
+                **artifact["vocabulary"],
+                "action_space_fingerprint": "0" * 64,
+            }
+            _write_json(artifact_path, artifact)
+            with self.assertRaisesRegex(ValueError, "vocabulary 不一致"):
+                materialize_candidate_source(self._spec(run), root / "snapshots")
 
     def test_exact_contract_artifact_builds_deterministic_v2_overlay(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -10,6 +10,8 @@ from factor_gfn.evaluator import (
 )
 from factor_gfn.grammar import (
     DAGAction,
+    DAILY_DERIVED_ACTION_REGISTRY,
+    DAILY_DERIVED_FEATURE_NAMES,
     NON_LEAF_OPERATORS,
     Expression,
     GrammarState,
@@ -85,6 +87,50 @@ class InterpreterInputContractTests(unittest.TestCase):
             Expression.from_prefix((get_action_id("close"),))
         )
         self.assertTrue(np.isnan(result[0, 0]))
+
+    def test_explicit_schema_rejects_count_and_invalid_names(self):
+        data = np.ones((10, 2, 3))
+        with self.assertRaisesRegex(ValueError, "feature 轴"):
+            FactorInterpreter(data, ordered_feature_names=("only_one",))
+        with self.assertRaisesRegex(ValueError, "重复"):
+            FactorInterpreter(data, ordered_feature_names=("same", "same"))
+
+
+class DerivedInterpreterPlumbingTests(unittest.TestCase):
+    def test_ret_cc1_reads_exact_derived_index_and_preserves_nan(self):
+        names = DAILY_DERIVED_FEATURE_NAMES
+        tensor = np.zeros((7, len(names), 2), dtype=np.float64)
+        tensor[:, 1, :] = np.arange(14, dtype=np.float64).reshape(7, 2)
+        tensor[3, 1, 0] = np.nan
+        interpreter = FactorInterpreter(tensor, ordered_feature_names=names)
+        expression = Expression.from_prefix(
+            (DAILY_DERIVED_ACTION_REGISTRY.get_action_id("ret_cc1"),),
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        )
+
+        result = interpreter.evaluate(expression)
+
+        np.testing.assert_allclose(result, tensor[:, 1, :], equal_nan=True)
+        self.assertTrue(np.isnan(result[3, 0]))
+        self.assertEqual(interpreter.ordered_feature_names, names)
+
+    def test_ts_mean_ret_cc1_uses_same_numeric_operator_path(self):
+        names = DAILY_DERIVED_FEATURE_NAMES
+        tensor = np.zeros((8, len(names), 1), dtype=np.float64)
+        tensor[:, 1, 0] = np.arange(1.0, 9.0)
+        interpreter = FactorInterpreter(tensor, ordered_feature_names=names)
+        expression = Expression.from_prefix(
+            (
+                DAILY_DERIVED_ACTION_REGISTRY.get_action_id("ts_mean", 5),
+                DAILY_DERIVED_ACTION_REGISTRY.get_action_id("ret_cc1"),
+            ),
+            action_registry=DAILY_DERIVED_ACTION_REGISTRY,
+        )
+
+        result = interpreter.evaluate(expression)
+
+        expected = np.array([np.nan] * 4 + [3.0, 4.0, 5.0, 6.0])[:, None]
+        np.testing.assert_allclose(result, expected, equal_nan=True)
 
 
 class InterpreterEvaluationTests(unittest.TestCase):

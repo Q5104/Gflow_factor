@@ -287,6 +287,14 @@ from .oos_evaluation import (
     max_drawdown_from_returns,
     spearman_average_ties,
 )
+from .rolling_icir import (
+    RollingICIRConfig,
+    RollingICIRResult,
+    cross_sectional_spearman,
+    estimate_rolling_weights,
+    generate_causal_rolling_scores,
+    periodic_ic_matrix,
+)
 
 __all__ = [
     "DEVELOPMENT_FACTOR_MATRIX_MANIFEST_FILENAME",
@@ -313,6 +321,8 @@ __all__ = [
     "StrategyDependencyError",
     "StrategyScores",
     "VerifiedFrozenStrategyBundle",
+    "RollingICIRConfig",
+    "RollingICIRResult",
     "CANDIDATE_SOURCE_SCHEMA",
     "ACCEPTED_REGISTRY_SCHEMA",
     "AUTO_ACCEPT",
@@ -525,15 +535,19 @@ __all__ = [
     "compound_nav",
     "deterministic_deciles",
     "drift_adjusted_one_way_turnover",
+    "cross_sectional_spearman",
+    "estimate_rolling_weights",
     "evaluate_oos_baselines",
     "freeze_oos_baseline_evaluation",
     "freeze_test_score_artifact",
     "generate_test_strategy_scores",
+    "generate_causal_rolling_scores",
     "geometric_annualized_return",
     "load_verified_oos_baseline_evaluation",
     "load_verified_test_labels",
     "load_verified_test_score_artifact",
     "max_drawdown_from_returns",
+    "periodic_ic_matrix",
     "spearman_average_ties",
     "unlock_verified_test_features",
 ]

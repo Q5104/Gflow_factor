@@ -14,7 +14,6 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 
 from factor_gfn.evaluator.interpreter import (
-    FEATURE_NAMES,
     INTERPRETER_OPERATOR_FUNCTIONS,
     FactorInterpreter,
 )
@@ -28,17 +27,18 @@ from factor_gfn.grammar.grammar_state import (
 )
 from factor_gfn.grammar.operators import ALL_SYMBOLS, get_operator
 from factor_gfn.grammar.partial_ast import (
-    HOLE,
     PartialNode,
     get_node,
     remove_frontier,
     removable_frontier_paths,
 )
 from factor_gfn.grammar.tokens import (
+    DAILY_DERIVED_ACTION_REGISTRY,
+    RAW_ACTION_REGISTRY,
     WINDOWS,
+    ActionRegistry,
     action_space_fingerprint,
     action_space_manifest,
-    get_action,
 )
 
 from .candidate_import import (
@@ -69,6 +69,42 @@ SYNTHETIC_FIXTURE_SPEC = {
     "construction": "deterministic_bounded_trigonometric_with_fixed_nan_positions",
     "finite_requirement": "record_only_all_nan_allowed",
 }
+
+
+def _vocabulary_identity(action_registry: ActionRegistry) -> dict[str, str] | None:
+    if action_registry == RAW_ACTION_REGISTRY:
+        return None
+    return {
+        "feature_space_id": action_registry.feature_space.feature_space_id,
+        "feature_space_fingerprint": action_registry.feature_space_fingerprint,
+        "action_space_fingerprint": action_registry.fingerprint(),
+    }
+
+
+def action_registry_for_vocabulary(
+    vocabulary: Mapping[str, Any] | None,
+) -> ActionRegistry:
+    """Resolve the legacy Raw default or the one approved Derived vocabulary."""
+
+    if vocabulary is None:
+        return RAW_ACTION_REGISTRY
+    if not isinstance(vocabulary, Mapping):
+        raise ValueError("candidate vocabulary 必须是对象")
+    expected = _vocabulary_identity(DAILY_DERIVED_ACTION_REGISTRY)
+    if dict(vocabulary) != expected:
+        raise ValueError("candidate vocabulary 未知或与 Derived ActionRegistry 不匹配")
+    return DAILY_DERIVED_ACTION_REGISTRY
+
+
+def _registry_for_groups(groups: Iterable[Mapping[str, Any]]) -> ActionRegistry:
+    registries = [
+        action_registry_for_vocabulary(representation.get("vocabulary"))
+        for group in groups
+        for representation in group.get("representations", [])
+    ]
+    if any(registry != registries[0] for registry in registries[1:]):
+        raise ValueError("candidate registry 不得混用 Raw/Derived vocabulary")
+    return registries[0] if registries else RAW_ACTION_REGISTRY
 
 
 def _write_json(path: Path, value: Mapping[str, Any]) -> None:
@@ -188,9 +224,10 @@ def _source_action_fingerprint(snapshot_path: Path, source_type: str) -> str | N
 
 def _source_semantics(
     verified_sources: Iterable[Mapping[str, Any]],
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
 ) -> dict[str, dict[str, Any]]:
     output: dict[str, dict[str, Any]] = {}
-    current_action = action_space_fingerprint()
+    current_action = action_space_fingerprint(action_registry)
     for item in verified_sources:
         source = item["source"]
         snapshot = item["manifest"]
@@ -199,6 +236,9 @@ def _source_semantics(
             item["path"], str(source["source_type"])
         )
         semantics = snapshot.get("source_semantics", {})
+        vocabulary = semantics.get("vocabulary")
+        if isinstance(vocabulary, Mapping):
+            action_fingerprint = vocabulary.get("action_space_fingerprint")
         output[source_id] = {
             "source_id": source_id,
             "source_type": source["source_type"],
@@ -237,33 +277,48 @@ def _operator_manifest() -> list[dict[str, Any]]:
     ]
 
 
-def _target_semantics_manifest() -> dict[str, Any]:
+def _target_semantics_manifest(
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+) -> dict[str, Any]:
     dispatch = sorted(INTERPRETER_OPERATOR_FUNCTIONS)
+    fixture_spec = (
+        SYNTHETIC_FIXTURE_SPEC
+        if action_registry == RAW_ACTION_REGISTRY
+        else {
+            **SYNTHETIC_FIXTURE_SPEC,
+            "shape": [72, len(action_registry.leaf_names), 8],
+        }
+    )
     return {
         "expression_hash_schema": HASH_SCHEMA,
-        "action_space_fingerprint": action_space_fingerprint(),
-        "action_space_manifest_digest": _stable_hash(action_space_manifest()),
+        "action_space_fingerprint": action_space_fingerprint(action_registry),
+        "action_space_manifest_digest": _stable_hash(
+            action_space_manifest(action_registry)
+        ),
         "state_space_fingerprint": state_space_fingerprint(),
-        "transition_space_fingerprint": transition_space_fingerprint(),
+        "transition_space_fingerprint": transition_space_fingerprint(action_registry),
         "search_space": STAGE6_SEARCH_SPACE.manifest(),
         "search_space_fingerprint": STAGE6_SEARCH_SPACE.fingerprint(),
         "operator_registry_digest": _stable_hash(_operator_manifest()),
         "interpreter_dispatch_digest": _stable_hash(dispatch),
         "interpreter_dispatch_count": len(dispatch),
-        "feature_names": list(FEATURE_NAMES),
-        "synthetic_fixture_spec": SYNTHETIC_FIXTURE_SPEC,
-        "synthetic_fixture_fingerprint": _stable_hash(SYNTHETIC_FIXTURE_SPEC),
+        "feature_names": list(action_registry.leaf_names),
+        "synthetic_fixture_spec": fixture_spec,
+        "synthetic_fixture_fingerprint": _stable_hash(fixture_spec),
         "auditor_version": AUDITOR_VERSION,
     }
 
 
-def _synthetic_fixture() -> np.ndarray:
+def _synthetic_fixture(
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+) -> np.ndarray:
+    feature_count = len(action_registry.leaf_names)
     date = np.arange(72, dtype=np.float64)[:, None, None]
-    feature = np.arange(6, dtype=np.float64)[None, :, None]
+    feature = np.arange(feature_count, dtype=np.float64)[None, :, None]
     stock = np.arange(8, dtype=np.float64)[None, None, :]
     data = 0.55 + 0.04 * np.sin((date + 1.0) * (feature + 1.0) / 17.0)
     data = data + 0.03 * np.cos((date + stock + 1.0) / 11.0)
-    data = np.broadcast_to(data, (72, 6, 8)).copy()
+    data = np.broadcast_to(data, (72, feature_count, 8)).copy()
     data[3, 0, 0] = np.nan
     data[17, 4, 3] = np.nan
     data[41, 5, 7] = np.nan
@@ -275,6 +330,7 @@ def _to_partial(node: ExpressionNode) -> PartialNode:
     return PartialNode(
         node.action_id,
         tuple(_to_partial(child) for child in node.children),
+        node.action_registry,
     )
 
 
@@ -284,6 +340,7 @@ def _find_grammar_path(expression: Expression) -> tuple[DAGAction, ...] | None:
     try:
         terminal = GrammarState(
             search_space=STAGE6_SEARCH_SPACE,
+            action_registry=expression.action_registry,
             _root=_to_partial(expression.canonicalize().root),
         )
     except (TypeError, ValueError, RuntimeError):
@@ -291,7 +348,7 @@ def _find_grammar_path(expression: Expression) -> tuple[DAGAction, ...] | None:
     failed: set[str] = set()
 
     def find_to_root(state: GrammarState) -> tuple[DAGAction, ...] | None:
-        if state.root == HOLE:
+        if state.root.is_hole:
             return ()
         if state.state_key in failed:
             return None
@@ -302,12 +359,17 @@ def _find_grammar_path(expression: Expression) -> tuple[DAGAction, ...] | None:
             try:
                 parent = GrammarState(
                     search_space=STAGE6_SEARCH_SPACE,
+                    action_registry=expression.action_registry,
                     _root=remove_frontier(state.root, path),
                 )
             except (TypeError, ValueError, RuntimeError):
                 continue
             for slot in parent.open_slots():
-                action = DAGAction(slot.path, removed.action_id)
+                action = DAGAction(
+                    slot.path,
+                    removed.action_id,
+                    expression.action_registry,
+                )
                 try:
                     successor = parent.step(action)
                 except (IndexError, TypeError, ValueError, RuntimeError):
@@ -323,7 +385,10 @@ def _find_grammar_path(expression: Expression) -> tuple[DAGAction, ...] | None:
     path = find_to_root(terminal)
     if path is None:
         return None
-    replay = GrammarState(search_space=STAGE6_SEARCH_SPACE)
+    replay = GrammarState(
+        search_space=STAGE6_SEARCH_SPACE,
+        action_registry=expression.action_registry,
+    )
     try:
         for action in path:
             replay = replay.step(action)
@@ -341,19 +406,21 @@ def _operator_compatibility(expression: Expression) -> tuple[list[str], str | No
     stack = [expression.root]
     while stack:
         node = stack.pop()
-        action = get_action(node.action_id)
-        operator = get_operator(action.name)
+        action = expression.action_registry.get_action(node.action_id)
         names.add(action.name)
+        if action.arity == 0:
+            if action.name not in expression.action_registry.leaf_names:
+                return sorted(names), "leaf_feature_unsupported"
+            stack.extend(node.children)
+            continue
+        operator = get_operator(action.name)
         if action.arity != operator.arity:
             return sorted(names), "operator_arity_mismatch"
         if operator.requires_window != (action.window != 0):
             return sorted(names), "operator_window_contract_mismatch"
         if action.window != 0 and action.window not in WINDOWS:
             return sorted(names), "operator_window_unsupported"
-        if action.arity == 0:
-            if action.name not in FEATURE_NAMES:
-                return sorted(names), "leaf_feature_unsupported"
-        elif action.name not in INTERPRETER_OPERATOR_FUNCTIONS:
+        if action.name not in INTERPRETER_OPERATOR_FUNCTIONS:
             return sorted(names), "interpreter_dispatch_missing"
         stack.extend(node.children)
     return sorted(names), None
@@ -365,8 +432,13 @@ def _smoke_expression(
     cache: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
     current_hash = expression.structural_hash()
-    if current_hash in cache:
-        return cache[current_hash]
+    cache_key = (
+        current_hash
+        if expression.action_registry == RAW_ACTION_REGISTRY
+        else f"{expression.action_registry.fingerprint()}:{current_hash}"
+    )
+    if cache_key in cache:
+        return cache[cache_key]
     try:
         result = interpreter.evaluate(expression)
         outcome = {
@@ -384,7 +456,7 @@ def _smoke_expression(
             "error_detail": str(error),
             "all_nan_allowed": True,
         }
-    cache[current_hash] = outcome
+    cache[cache_key] = outcome
     return outcome
 
 
@@ -402,7 +474,25 @@ def _audit_representation(
     source_formula = representation.get("formula")
     prefix = representation.get("prefix_token_ids")
     try:
-        expression = Expression.from_prefix(prefix)
+        action_registry = action_registry_for_vocabulary(
+            representation.get("vocabulary")
+        )
+    except (TypeError, ValueError) as error:
+        return (
+            {
+                "representation_digest": representation.get("representation_digest"),
+                "status": AUTO_REJECT,
+                "reason_codes": ["vocabulary_invalid"],
+                "error_type": type(error).__name__,
+                "error_detail": str(error),
+            },
+            None,
+        )
+    try:
+        expression = Expression.from_prefix(
+            prefix,
+            action_registry=action_registry,
+        )
     except (IndexError, TypeError, ValueError) as error:
         return (
             {
@@ -449,6 +539,11 @@ def _audit_representation(
     operators, operator_error = _operator_compatibility(expression)
     if operator_error is not None:
         reject_reasons.append(operator_error)
+    if interpreter.ordered_feature_names != action_registry.leaf_names:
+        interpreter = FactorInterpreter(
+            _synthetic_fixture(action_registry),
+            ordered_feature_names=action_registry.leaf_names,
+        )
     smoke = _smoke_expression(expression, interpreter, smoke_cache)
     if not smoke["passed"]:
         reject_reasons.append(str(smoke["reason_code"]))
@@ -488,6 +583,9 @@ def _audit_representation(
         "interpreter_smoke": smoke,
         "source_action_space_relations": action_relations,
     }
+    vocabulary = _vocabulary_identity(action_registry)
+    if vocabulary is not None:
+        result["vocabulary"] = vocabulary
     return result, expression
 
 
@@ -530,9 +628,13 @@ def audit_expression_compatibility(
         "source_set_fingerprint"
     ):
         raise RuntimeError("candidate registry 与 source set fingerprint 不一致")
-    semantics = _source_semantics(verified_sources)
-    target_semantics = _target_semantics_manifest()
-    interpreter = FactorInterpreter(_synthetic_fixture())
+    action_registry = _registry_for_groups(groups)
+    semantics = _source_semantics(verified_sources, action_registry)
+    target_semantics = _target_semantics_manifest(action_registry)
+    interpreter = FactorInterpreter(
+        _synthetic_fixture(action_registry),
+        ordered_feature_names=action_registry.leaf_names,
+    )
     smoke_cache: dict[str, dict[str, Any]] = {}
 
     audits: list[dict[str, Any]] = []
@@ -608,22 +710,24 @@ def audit_expression_compatibility(
             continue
         claimed_hash = audit["source_claimed_structural_hash"]
         expression = expressions_by_group[claimed_hash]
-        accepted.append(
-            {
-                "schema": ACCEPTED_REGISTRY_SCHEMA,
-                "current_structural_hash": expression.structural_hash(),
-                "source_claimed_structural_hash": claimed_hash,
-                "formula": expression.to_formula(),
-                "prefix_token_ids": list(expression.to_prefix()),
-                "node_count": expression.stats.node_count,
-                "depth": expression.stats.depth,
-                "origin_ids": audit["origin_ids"],
-                "source_ids": audit["source_ids"],
-                "compatibility_record_fingerprint": _stable_hash(audit),
-                "historical_metric_reuse": "forbidden",
-                "stage6_metric_recompute_required": True,
-            }
-        )
+        accepted_record = {
+            "schema": ACCEPTED_REGISTRY_SCHEMA,
+            "current_structural_hash": expression.structural_hash(),
+            "source_claimed_structural_hash": claimed_hash,
+            "formula": expression.to_formula(),
+            "prefix_token_ids": list(expression.to_prefix()),
+            "node_count": expression.stats.node_count,
+            "depth": expression.stats.depth,
+            "origin_ids": audit["origin_ids"],
+            "source_ids": audit["source_ids"],
+            "compatibility_record_fingerprint": _stable_hash(audit),
+            "historical_metric_reuse": "forbidden",
+            "stage6_metric_recompute_required": True,
+        }
+        vocabulary = _vocabulary_identity(expression.action_registry)
+        if vocabulary is not None:
+            accepted_record["vocabulary"] = vocabulary
+        accepted.append(accepted_record)
     accepted.sort(key=lambda row: row["current_structural_hash"])
 
     status_counts = Counter(row["status"] for row in audits)

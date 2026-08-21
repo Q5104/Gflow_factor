@@ -11,8 +11,7 @@ from dataclasses import dataclass
 from numbers import Integral
 
 from .expression import Expression, ExpressionNode
-from .operators import get_operator
-from .tokens import get_action
+from .tokens import ActionRegistry, RAW_ACTION_REGISTRY
 
 
 PARTIAL_AST_SCHEMA = "factor_gfn.partial_ast.v1"
@@ -25,11 +24,16 @@ class PartialNode:
 
     action_id: int | None = None
     children: tuple["PartialNode", ...] = ()
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY
 
     def __post_init__(self) -> None:
         children = tuple(self.children)
+        if not isinstance(self.action_registry, ActionRegistry):
+            raise TypeError("action_registry 必须是 ActionRegistry")
         if any(not isinstance(child, PartialNode) for child in children):
             raise TypeError("部分 AST 的 children 必须全部是 PartialNode")
+        if any(child.action_registry != self.action_registry for child in children):
+            raise ValueError("PartialNode children 不得跨 ActionRegistry 混用")
         if self.action_id is None:
             if children:
                 raise ValueError("Hole 节点不能包含子节点")
@@ -38,7 +42,7 @@ class PartialNode:
         if not isinstance(self.action_id, Integral) or isinstance(self.action_id, bool):
             raise TypeError("部分 AST 的 action_id 必须是整数或 None")
         action_id = int(self.action_id)
-        action = get_action(action_id)
+        action = self.action_registry.get_action(action_id)
         if len(children) != action.arity:
             raise ValueError(
                 f"{action.name} 需要 {action.arity} 个子节点，实际为 {len(children)}"
@@ -67,12 +71,12 @@ def _payload(node: PartialNode, target_path: SlotPath | None = None, path: SlotP
         return ["target" if target_path == path else "hole"]
 
     assert node.action_id is not None
-    action = get_action(node.action_id)
+    action = node.action_registry.get_action(node.action_id)
     children = [
         _payload(child, target_path, path + (index,))
         for index, child in enumerate(node.children)
     ]
-    if get_operator(action.name).commutative:
+    if node.action_registry.get_operator(action.name).commutative:
         children.sort(key=_json)
     return ["node", action.name, action.window, children]
 
@@ -98,13 +102,13 @@ def targeted_slot_key(node: PartialNode, path: SlotPath) -> str:
 
 def canonicalize_partial(node: PartialNode) -> PartialNode:
     if node.is_hole:
-        return HOLE
+        return PartialNode(action_registry=node.action_registry)
     assert node.action_id is not None
     children = tuple(canonicalize_partial(child) for child in node.children)
-    action = get_action(node.action_id)
-    if get_operator(action.name).commutative:
+    action = node.action_registry.get_action(node.action_id)
+    if node.action_registry.get_operator(action.name).commutative:
         children = tuple(sorted(children, key=canonical_json))
-    return PartialNode(node.action_id, children)
+    return PartialNode(node.action_id, children, node.action_registry)
 
 
 def get_node(root: PartialNode, path: SlotPath) -> PartialNode:
@@ -122,6 +126,8 @@ def get_node(root: PartialNode, path: SlotPath) -> PartialNode:
 
 
 def replace_node(root: PartialNode, path: SlotPath, replacement: PartialNode) -> PartialNode:
+    if root.action_registry != replacement.action_registry:
+        raise ValueError("replacement 与 root 不得跨 ActionRegistry 混用")
     if not path:
         return replacement
     if root.is_hole:
@@ -134,14 +140,18 @@ def replace_node(root: PartialNode, path: SlotPath, replacement: PartialNode) ->
         raise ValueError(f"槽位路径越界：{path}")
     children = list(root.children)
     children[index] = replace_node(children[index], path[1:], replacement)
-    return PartialNode(root.action_id, tuple(children))
+    return PartialNode(root.action_id, tuple(children), root.action_registry)
 
 
 def fill_hole(root: PartialNode, path: SlotPath, action_id: int) -> PartialNode:
     if not get_node(root, path).is_hole:
         raise ValueError(f"目标路径不是开放槽位：{path}")
-    action = get_action(action_id)
-    replacement = PartialNode(action_id, tuple(HOLE for _ in range(action.arity)))
+    action = root.action_registry.get_action(action_id)
+    replacement = PartialNode(
+        action_id,
+        tuple(PartialNode(action_registry=root.action_registry) for _ in range(action.arity)),
+        root.action_registry,
+    )
     return canonicalize_partial(replace_node(root, path, replacement))
 
 
@@ -151,7 +161,9 @@ def remove_frontier(root: PartialNode, path: SlotPath) -> PartialNode:
         raise ValueError("不能撤销 Hole")
     if node.children and any(not child.is_hole for child in node.children):
         raise ValueError(f"节点不是可撤销前沿节点：{path}")
-    return canonicalize_partial(replace_node(root, path, HOLE))
+    return canonicalize_partial(
+        replace_node(root, path, PartialNode(action_registry=root.action_registry))
+    )
 
 
 def open_hole_paths(root: PartialNode) -> tuple[SlotPath, ...]:
@@ -195,7 +207,7 @@ def partial_stats(root: PartialNode) -> PartialStats:
         node_count += 1
         max_depth_seen = max(max_depth_seen, depth)
         assert node.action_id is not None
-        operator_count += int(get_action(node.action_id).arity > 0)
+        operator_count += int(node.action_registry.get_action(node.action_id).arity > 0)
         stack.extend((child, depth + 1) for child in node.children)
     return PartialStats(node_count, operator_count, hole_count, max_depth_seen)
 
@@ -208,7 +220,11 @@ def to_expression(root: PartialNode) -> Expression:
         if node.is_hole:
             raise RuntimeError("完整性检查后仍发现 Hole")
         assert node.action_id is not None
-        return ExpressionNode(node.action_id, tuple(convert(child) for child in node.children))
+        return ExpressionNode(
+            node.action_id,
+            tuple(convert(child) for child in node.children),
+            node.action_registry,
+        )
 
     return Expression(convert(root))
 

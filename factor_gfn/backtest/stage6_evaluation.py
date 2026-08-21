@@ -30,6 +30,7 @@ from factor_gfn.barra import (
 from factor_gfn.data.industry import load_sw_industry_panel
 from factor_gfn.evaluator import (
     EvaluationConfig,
+    FEATURE_NAMES,
     FactorInterpreter,
     NeutralizationDiagnostics,
     build_forward_returns,
@@ -43,9 +44,16 @@ from factor_gfn.evaluator import (
     summarize_ic,
 )
 from factor_gfn.grammar import Expression
-from factor_gfn.gfn.real_data import RealRewardDataPaths
+from factor_gfn.gfn.real_data import (
+    RAW_DAILY_FEATURE_SPACE_ID,
+    RealRewardDataPaths,
+    validate_expression_feature_artifact,
+)
 
-from .expression_compatibility import ACCEPTED_REGISTRY_SCHEMA
+from .expression_compatibility import (
+    ACCEPTED_REGISTRY_SCHEMA,
+    action_registry_for_vocabulary,
+)
 
 
 STAGE6_EVALUATION_CONTEXT_SCHEMA = "factor_gfn.stage6_evaluation_context.v1"
@@ -224,6 +232,11 @@ class Stage6EvaluationContext:
     _universe_mask: npt.NDArray[np.bool_] = field(repr=False)
     _industry_labels: npt.NDArray[np.int32] = field(repr=False)
     _barra_long_short: Mapping[str, LongShortSeries] = field(repr=False)
+    ordered_feature_names: tuple[str, ...] = FEATURE_NAMES
+
+    @property
+    def expression_feature_tensor(self) -> npt.NDArray[np.floating]:
+        return self.factor_tensor
 
     def get_split_data(self, split: str) -> Stage6SplitData:
         if split == "oos":
@@ -279,6 +292,8 @@ def build_stage6_evaluation_context_from_arrays(
     dates: npt.ArrayLike,
     stocks: npt.ArrayLike,
     factor_tensor: npt.ArrayLike,
+    raw_open: npt.ArrayLike | None = None,
+    ordered_feature_names: tuple[str, ...] = FEATURE_NAMES,
     universe_mask: npt.ArrayLike,
     industry_labels: npt.ArrayLike,
     barra_exposures: Mapping[str, npt.ArrayLike],
@@ -290,6 +305,7 @@ def build_stage6_evaluation_context_from_arrays(
     all_dates = np.asarray(dates).astype("datetime64[D]")
     stock_values = np.asarray(stocks).astype(str)
     tensor_all = np.asarray(factor_tensor)
+    feature_names = tuple(ordered_feature_names)
     universe_all = np.asarray(universe_mask, dtype=bool)
     industry_all = np.asarray(industry_labels, dtype=np.int32)
     if all_dates.ndim != 1 or stock_values.ndim != 1 or not all_dates.size or not stock_values.size:
@@ -301,10 +317,28 @@ def build_stage6_evaluation_context_from_arrays(
     if np.unique(stock_values).size != stock_values.size:
         raise ValueError("stocks must be unique")
     expected = (all_dates.size, stock_values.size)
-    if tensor_all.ndim != 3 or tensor_all.shape[0] != expected[0] or tensor_all.shape[2] != expected[1]:
+    if (
+        tensor_all.ndim != 3
+        or tensor_all.shape[0] != expected[0]
+        or tensor_all.shape[2] != expected[1]
+    ):
         raise ValueError("factor_tensor must use (date, feature, stock) axes")
-    if tensor_all.shape[1] < 1:
-        raise ValueError("factor_tensor must contain the open feature")
+    if (
+        not feature_names
+        or len(set(feature_names)) != len(feature_names)
+        or any(not isinstance(name, str) or not name for name in feature_names)
+    ):
+        raise ValueError("ordered_feature_names must be unique non-empty strings")
+    if tensor_all.shape[1] != len(feature_names):
+        raise ValueError("factor_tensor feature count must match ordered_feature_names")
+    if raw_open is None:
+        if feature_names != FEATURE_NAMES:
+            raise ValueError("non-Raw expression tensors require explicit raw_open labels")
+        raw_open_all = tensor_all[:, 0, :]
+    else:
+        raw_open_all = np.asarray(raw_open)
+        if raw_open_all.shape != expected:
+            raise ValueError("raw_open must align to the Raw date/stock axes")
     if universe_all.shape != expected or industry_all.shape != expected:
         raise ValueError("universe and industry arrays must align to date/stock")
     if set(barra_exposures) != set(STYLE_NAMES):
@@ -327,7 +361,7 @@ def build_stage6_evaluation_context_from_arrays(
     }
     rows_by_split = _split_rows(date_values, config)
 
-    forward_returns = build_forward_returns(tensor[:, 0, :], config.evaluation)
+    forward_returns = build_forward_returns(raw_open_all[:cutoff], config.evaluation)
     exit_offset = config.evaluation.entry_lag + config.evaluation.horizon
     label_within = np.zeros(date_values.size, dtype=bool)
     split_by_row: dict[int, Stage6SplitName] = {}
@@ -451,6 +485,11 @@ def build_stage6_evaluation_context_from_arrays(
         },
         "sources": dict(source_manifest or {}),
     }
+    if feature_names != FEATURE_NAMES:
+        manifest["expression_features"] = {
+            "ordered_feature_names": list(feature_names),
+            "raw_label_source": "explicit_raw_open",
+        }
     fingerprint = _stable_hash(manifest)
     return Stage6EvaluationContext(
         config=config,
@@ -465,6 +504,7 @@ def build_stage6_evaluation_context_from_arrays(
         _universe_mask=universe,
         _industry_labels=industry,
         _barra_long_short=MappingProxyType(barra_long_short),
+        ordered_feature_names=feature_names,
     )
 
 
@@ -477,6 +517,8 @@ def build_stage6_evaluation_context(
     barra_paths = paths.barra_paths
     required = [
         paths.tensor_path,
+        paths.expression_tensor_path,
+        paths.expression_metadata_path,
         paths.universe_mask_path,
         paths.date_list_path,
         paths.stock_list_path,
@@ -497,7 +539,22 @@ def build_stage6_evaluation_context(
     cutoff = int(prefix_rows[-1]) + 1
     dates = all_dates[:cutoff]
     stocks = np.load(paths.stock_list_path, allow_pickle=False).astype(str)
-    tensor = _load_npy_row_prefix(paths.tensor_path, cutoff)
+    raw_tensor = _load_npy_row_prefix(paths.tensor_path, cutoff)
+    expression_header = np.load(
+        paths.expression_tensor_path, mmap_mode="r", allow_pickle=False
+    )
+    validate_expression_feature_artifact(paths, expression_header)
+    if (
+        expression_header.shape[0] != all_dates.size
+        or expression_header.shape[2] != stocks.size
+    ):
+        raise ValueError("expression tensor does not align to Raw date/stock axes")
+    del expression_header
+    tensor = (
+        raw_tensor
+        if paths.expression_tensor_path == paths.tensor_path
+        else _load_npy_row_prefix(paths.expression_tensor_path, cutoff)
+    )
     universe = _load_npy_row_prefix(paths.universe_mask_path, cutoff)
     industry = load_sw_industry_panel(dates, stocks, level=1, path=paths.industry_path)
     exposures = {
@@ -513,10 +570,24 @@ def build_stage6_evaluation_context(
         "matrix_load_policy": "read_only_limited_npy_memmap_prefix_through_validation",
         "requested_prefix_rows": cutoff,
     }
+    spec = paths.expression_features
+    assert spec is not None
+    if spec.feature_space_id != RAW_DAILY_FEATURE_SPACE_ID:
+        sources.update(
+            {
+                "expression_metadata_sha256": _sha256_file(
+                    paths.expression_metadata_path
+                ),
+                "expression_feature_space_id": spec.feature_space_id,
+                "expression_schema_fingerprint": spec.expected_schema_fingerprint,
+            }
+        )
     return build_stage6_evaluation_context_from_arrays(
         dates=dates,
         stocks=stocks,
         factor_tensor=tensor,
+        raw_open=raw_tensor[:, 0, :],
+        ordered_feature_names=spec.ordered_feature_names,
         universe_mask=universe,
         industry_labels=industry,
         barra_exposures=exposures,
@@ -676,7 +747,10 @@ class Stage6CandidateEvaluator:
         self.evaluation_contract_fingerprint = _stable_hash(
             dict(self.evaluation_contract)
         )
-        self._interpreter = FactorInterpreter(context.factor_tensor)
+        self._interpreter = FactorInterpreter(
+            context.expression_feature_tensor,
+            ordered_feature_names=context.ordered_feature_names,
+        )
 
     def _expression(self, candidate: Mapping[str, Any]) -> tuple[Expression, dict[str, Any]]:
         forbidden = sorted(self._FORBIDDEN_HISTORICAL_FIELDS.intersection(candidate))
@@ -689,7 +763,20 @@ class Stage6CandidateEvaluator:
         if candidate.get("stage6_metric_recompute_required") is not True:
             raise ValueError("candidate does not require Stage 6 metric recomputation")
         try:
-            expression = Expression.from_prefix(candidate["prefix_token_ids"])
+            action_registry = action_registry_for_vocabulary(
+                candidate.get("vocabulary")
+            )
+        except (TypeError, ValueError) as error:
+            raise ValueError("accepted candidate vocabulary is invalid") from error
+        if action_registry.leaf_names != self.context.ordered_feature_names:
+            raise ValueError(
+                "candidate vocabulary does not match Stage 6 expression feature schema"
+            )
+        try:
+            expression = Expression.from_prefix(
+                candidate["prefix_token_ids"],
+                action_registry=action_registry,
+            )
         except (KeyError, IndexError, TypeError, ValueError) as error:
             raise ValueError("accepted candidate prefix is invalid") from error
         stats = expression.stats

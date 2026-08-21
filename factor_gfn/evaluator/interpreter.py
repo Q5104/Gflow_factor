@@ -11,7 +11,6 @@ import numpy.typing as npt
 
 from factor_gfn.grammar.expression import Expression, ExpressionNode
 from factor_gfn.grammar.operators import NON_LEAF_OPERATORS, get_operator
-from factor_gfn.grammar.tokens import get_action
 
 from .ops_impl import ALL_OPERATOR_FUNCTIONS
 
@@ -35,21 +34,22 @@ class InterpreterError(RuntimeError):
 
 def _prepare_data_tensor(
     data_tensor: npt.ArrayLike,
+    ordered_feature_names: tuple[str, ...],
 ) -> tuple[npt.NDArray[np.float64], bool]:
     try:
         candidate = np.asarray(data_tensor, dtype=np.float64)
     except (TypeError, ValueError) as exc:
-        raise ValueError("六特征张量必须能够转换为 float64 数组") from exc
+        raise ValueError("expression feature tensor 必须能够转换为 float64 数组") from exc
 
     if candidate.ndim != 3:
         raise ValueError(
-            "六特征张量形状必须为 (date, feature, stock)，"
+            "expression feature tensor 形状必须为 (date, feature, stock)，"
             f"实际 ndim={candidate.ndim}"
         )
-    if candidate.shape[1] != len(FEATURE_NAMES):
+    if candidate.shape[1] != len(ordered_feature_names):
         raise ValueError(
-            f"feature 轴必须恰好包含 {len(FEATURE_NAMES)} 个特征 "
-            f"{FEATURE_NAMES}，实际为 {candidate.shape[1]}"
+            f"feature 轴必须恰好包含 {len(ordered_feature_names)} 个特征 "
+            f"{ordered_feature_names}，实际为 {candidate.shape[1]}"
         )
     if candidate.shape[0] == 0 or candidate.shape[2] == 0:
         raise ValueError("date 轴和 stock 轴均不能为空")
@@ -60,6 +60,22 @@ def _prepare_data_tensor(
         data[~np.isfinite(data)] = np.nan
     data.setflags(write=False)
     return data, borrowed
+
+
+def _normalize_feature_names(
+    ordered_feature_names: tuple[str, ...],
+) -> tuple[str, ...]:
+    try:
+        names = tuple(ordered_feature_names)
+    except TypeError as exc:
+        raise TypeError("ordered_feature_names 必须是有序特征名序列") from exc
+    if not names:
+        raise ValueError("ordered_feature_names 不能为空")
+    if any(not isinstance(name, str) or not name for name in names):
+        raise ValueError("ordered_feature_names 必须全部为非空字符串")
+    if len(set(names)) != len(names):
+        raise ValueError("ordered_feature_names 不允许重复特征名")
+    return names
 
 
 def _validate_dispatch_registry() -> None:
@@ -82,6 +98,7 @@ class FactorInterpreter:
         self,
         data_tensor: npt.ArrayLike,
         *,
+        ordered_feature_names: tuple[str, ...] = FEATURE_NAMES,
         subexpression_cache_max_bytes: int = 0,
     ) -> None:
         if (
@@ -90,7 +107,14 @@ class FactorInterpreter:
             or subexpression_cache_max_bytes < 0
         ):
             raise ValueError("subexpression_cache_max_bytes 必须是非负整数")
-        self._data, self._borrows_input_data = _prepare_data_tensor(data_tensor)
+        self._ordered_feature_names = _normalize_feature_names(ordered_feature_names)
+        self._feature_to_index = MappingProxyType(
+            {name: index for index, name in enumerate(self._ordered_feature_names)}
+        )
+        self._data, self._borrows_input_data = _prepare_data_tensor(
+            data_tensor,
+            self._ordered_feature_names,
+        )
         self._subexpression_cache_max_bytes = subexpression_cache_max_bytes
         self._subexpression_cache_bytes = 0
         self._subexpression_cache: OrderedDict[str, FloatMatrix] = OrderedDict()
@@ -107,6 +131,10 @@ class FactorInterpreter:
         """是否直接借用调用方提供的只读 ``float64`` 存储。"""
 
         return self._borrows_input_data
+
+    @property
+    def ordered_feature_names(self) -> tuple[str, ...]:
+        return self._ordered_feature_names
 
     def subexpression_cache_info(self) -> dict[str, int | str]:
         return {
@@ -158,11 +186,26 @@ class FactorInterpreter:
 
         if not isinstance(expression, Expression):
             raise TypeError("expression 必须是 Expression 实例")
+        if expression.action_registry.leaf_names != self._ordered_feature_names:
+            raise ValueError("Expression ActionRegistry 与 Interpreter feature schema 不一致")
 
         expected_shape = (self._data.shape[0], self._data.shape[2])
 
         def evaluate_node(node: ExpressionNode, *, is_root: bool) -> FloatMatrix:
-            action = get_action(node.action_id)
+            action = expression.action_registry.get_action(node.action_id)
+            if action.arity == 0:
+                if action.window != 0:
+                    raise InterpreterError(
+                        f"叶子特征 {action.name!r} 不允许携带窗口 {action.window}"
+                    )
+                try:
+                    feature_index = self._feature_to_index[action.name]
+                except KeyError as exc:
+                    raise InterpreterError(
+                        f"包含 schema 未登记的叶子特征：{action.name!r}"
+                    ) from exc
+                return self._data[:, feature_index, :]
+
             operator = get_operator(action.name)
             if action.arity != operator.arity:
                 raise InterpreterError(
@@ -173,15 +216,6 @@ class FactorInterpreter:
                 raise InterpreterError(
                     f"动作 {action.name} 窗口配置与算子签名不一致"
                 )
-
-            if action.arity == 0:
-                try:
-                    feature_index = FEATURE_TO_INDEX[action.name]
-                except KeyError as exc:
-                    raise InterpreterError(
-                        f"包含未知叶子特征：{action.name!r}"
-                    ) from exc
-                return self._data[:, feature_index, :]
 
             cache_key: str | None = None
             if not is_root and self._subexpression_cache_max_bytes > 0:
@@ -222,11 +256,17 @@ class FactorInterpreter:
 
 
 def evaluate_expression(
-    data_tensor: npt.ArrayLike, expression: Expression
+    data_tensor: npt.ArrayLike,
+    expression: Expression,
+    *,
+    ordered_feature_names: tuple[str, ...] = FEATURE_NAMES,
 ) -> FloatMatrix:
     """一次性构造解释器并计算表达式的便捷入口。"""
 
-    return FactorInterpreter(data_tensor).evaluate(expression)
+    return FactorInterpreter(
+        data_tensor,
+        ordered_feature_names=ordered_feature_names,
+    ).evaluate(expression)
 
 
 __all__ = [

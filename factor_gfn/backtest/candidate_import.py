@@ -318,6 +318,8 @@ def _normalize_origin(
         "node_count": common["node_count"],
         "depth": common["depth"],
     }
+    if "vocabulary" in common:
+        representation["vocabulary"] = dict(common["vocabulary"])
     identity = {
         "source_id": source["source_id"],
         "snapshot_fingerprint": source["snapshot_fingerprint"],
@@ -542,6 +544,10 @@ def _adapt_hybrid_train_artifact(
     records = artifact.get("records")
     if not isinstance(records, list):
         raise RuntimeError("冻结 Hybrid Train artifact 缺少 records 列表")
+    artifact_has_vocabulary = "vocabulary" in artifact
+    vocabulary = artifact.get("vocabulary")
+    if artifact_has_vocabulary and not isinstance(vocabulary, Mapping):
+        raise RuntimeError("冻结 Hybrid Train artifact vocabulary 必须是对象")
     origins: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for index, record in enumerate(records):
@@ -565,6 +571,14 @@ def _adapt_hybrid_train_artifact(
                 "rejection_reason": None,
             }
             common = _require_record_fields(import_record)
+            if artifact_has_vocabulary:
+                if record.get("vocabulary") != vocabulary:
+                    raise ValueError("Hybrid artifact/record vocabulary 不一致")
+                common["vocabulary"] = dict(vocabulary)
+            elif "vocabulary" in record:
+                raise ValueError(
+                    "Raw legacy Hybrid artifact 不得仅在 record 声明 vocabulary"
+                )
             origin = _normalize_origin(
                 common,
                 source=source,
@@ -638,6 +652,11 @@ def _build_groups(
                     "node_count": first["node_count"],
                     "depth": first["depth"],
                     "origin_ids": sorted(item["origin_id"] for item in variant_members),
+                    **(
+                        {"vocabulary": dict(first["vocabulary"])}
+                        if "vocabulary" in first
+                        else {}
+                    ),
                 }
             )
         conflict = len(variant_summaries) > 1

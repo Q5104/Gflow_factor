@@ -9,13 +9,11 @@ from dataclasses import replace
 import torch
 
 from factor_gfn.grammar import (
-    CATEGORY_TO_INDEX,
-    OPERATOR_TO_INDEX,
     WINDOWS,
+    ActionRegistry,
     DAGAction,
     ExactNodeGrammarState,
     GrammarState,
-    get_action,
 )
 
 from .config import SamplingConfig
@@ -46,6 +44,7 @@ def _compact_policy_diagnostics(
     token_id: int,
     slot_mask: torch.Tensor,
     legal_token_mask: torch.Tensor,
+    action_registry: ActionRegistry,
 ) -> torch.Tensor:
     """Keep hot-path diagnostics on device until the sampled batch is complete."""
 
@@ -104,8 +103,8 @@ def _compact_policy_diagnostics(
         window_entropy = nan
         normalized_window_entropy = nan
     else:
-        action = get_action(token_id)
-        category_id = CATEGORY_TO_INDEX[action.category]
+        action = action_registry.get_action(token_id)
+        category_id = action_registry.category_to_index[action.category]
         category_logs = output.grammar_category_log_probs[row, slot_index]
         category_legal = output.legal_grammar_category_mask[row, slot_index]
         grammar_probabilities = (
@@ -120,7 +119,7 @@ def _compact_policy_diagnostics(
             torch.zeros((), dtype=dtype, device=device),
         )
 
-        operator_id = OPERATOR_TO_INDEX[action.name]
+        operator_id = action_registry.operator_to_index[action.name]
         operator_logs = output.operator_log_probs[row, slot_index]
         operator_legal = output.legal_operator_mask[row, slot_index]
         category_operator_mask = output.operator_category_lookup == category_id
@@ -177,7 +176,9 @@ def _compact_policy_diagnostics(
 
 
 def _decode_compact_policy_diagnostics(
-    values: Sequence[float], token_id: int
+    values: Sequence[float],
+    token_id: int,
+    action_registry: ActionRegistry,
 ) -> dict[str, object]:
     if len(values) != _COMPACT_DIAGNOSTIC_SIZE:
         raise ValueError("紧凑策略诊断向量长度错误")
@@ -202,7 +203,7 @@ def _decode_compact_policy_diagnostics(
     group_probabilities = numbers[2:5]
     if all(math.isfinite(value) for value in group_probabilities):
         result.update(
-            selected_token_group=get_action(token_id).arity,
+            selected_token_group=action_registry.get_action(token_id).arity,
             group_probabilities=group_probabilities,
             group_entropy=max(0.0, numbers[5]),
             normalized_group_entropy=min(1.0, max(0.0, numbers[6])),
@@ -210,9 +211,11 @@ def _decode_compact_policy_diagnostics(
 
     grammar_probabilities = numbers[7:13]
     if all(math.isfinite(value) for value in grammar_probabilities):
-        action = get_action(token_id)
+        action = action_registry.get_action(token_id)
         result.update(
-            selected_grammar_category=CATEGORY_TO_INDEX[action.category],
+            selected_grammar_category=action_registry.category_to_index[
+                action.category
+            ],
             grammar_category_probabilities=grammar_probabilities,
             grammar_category_entropy=max(0.0, numbers[13]),
             normalized_grammar_category_entropy=min(
@@ -352,11 +355,12 @@ def _grammar_diagnostics(
     row: int,
     slot_index: int,
     token_id: int,
+    action_registry: ActionRegistry,
 ) -> dict[str, object] | None:
     if output.grammar_category_log_probs is None:
         return None
-    action = get_action(token_id)
-    category_id = CATEGORY_TO_INDEX[action.category]
+    action = action_registry.get_action(token_id)
+    category_id = action_registry.category_to_index[action.category]
     category_logs = output.grammar_category_log_probs[row, slot_index]
     category_legal = output.legal_grammar_category_mask[row, slot_index]
     category_probabilities = category_logs.exp().masked_fill(~category_legal, 0.0)
@@ -369,7 +373,7 @@ def _grammar_diagnostics(
         raise FloatingPointError("文法类别联合概率没有归一化")
     category_entropy = _entropy_diagnostics(category_logs, category_legal)
 
-    operator_id = OPERATOR_TO_INDEX[action.name]
+    operator_id = action_registry.operator_to_index[action.name]
     operator_logs = output.operator_log_probs[row, slot_index]
     operator_legal = output.legal_operator_mask[row, slot_index]
     selected_operator_log = operator_logs[operator_id]
@@ -441,9 +445,16 @@ def sample_trajectories(
         raise ValueError("num_trajectories 必须是正整数")
     if target_node_counts is not None and len(target_node_counts) != num_trajectories:
         raise ValueError("target_node_counts 数量必须等于 num_trajectories")
+    action_registry = adapter.action_registry
+    model_registry = getattr(model, "action_registry", action_registry)
+    if model_registry != action_registry:
+        raise ValueError("model 与 StateAdapter 不得跨 ActionRegistry 混用")
     if initial_states is None:
         structural_sources = [
-            GrammarState(search_space=adapter.search_space)
+            GrammarState(
+                search_space=adapter.search_space,
+                action_registry=action_registry,
+            )
             for _ in range(num_trajectories)
         ]
         if target_node_counts is None:
@@ -520,6 +531,7 @@ def sample_trajectories(
                             token_id,
                             batch.slot_mask[row],
                             batch.legal_token_mask[row],
+                            action_registry,
                         )
                     )
                     policy_entropy = None
@@ -540,9 +552,15 @@ def sample_trajectories(
                     )
                     group_diagnostics = _group_diagnostics(output, row, slot_index)
                     grammar_diagnostics = _grammar_diagnostics(
-                        output, row, slot_index, token_id
+                        output,
+                        row,
+                        slot_index,
+                        token_id,
+                        action_registry,
                     )
-                child = state.step(DAGAction(slot.path, token_id))
+                child = state.step(
+                    DAGAction(slot.path, token_id, action_registry)
+                )
                 n_parents = child.count_parents()
                 log_pb = -math.log(n_parents)
                 step_lists[trajectory_index].append(
@@ -561,7 +579,7 @@ def sample_trajectories(
                         policy_entropy=policy_entropy,
                         normalized_policy_entropy=normalized_policy_entropy,
                         selected_token_group=(
-                            get_action(token_id).arity
+                            action_registry.get_action(token_id).arity
                             if group_diagnostics is not None else None
                         ),
                         group_probabilities=(
@@ -626,7 +644,9 @@ def sample_trajectories(
             step_lists[trajectory_index][step_index] = replace(
                 step,
                 **_decode_compact_policy_diagnostics(
-                    values[3:], step.selected_token_id
+                    values[3:],
+                    step.selected_token_id,
+                    action_registry,
                 ),
             )
 

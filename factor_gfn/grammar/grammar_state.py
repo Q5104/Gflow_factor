@@ -11,7 +11,7 @@ from numbers import Integral
 import numpy as np
 from numpy.typing import NDArray
 
-from .operators import ALL_SYMBOLS
+from .operators import NON_LEAF_OPERATORS
 from .config import (
     DEFAULT_MAX_DEPTH,
     DEFAULT_MAX_NODES,
@@ -19,7 +19,6 @@ from .config import (
     SearchSpaceConfig,
 )
 from .partial_ast import (
-    HOLE,
     PARTIAL_AST_SCHEMA,
     PartialNode,
     SlotPath,
@@ -33,7 +32,7 @@ from .partial_ast import (
     targeted_slot_key,
     to_expression,
 )
-from .tokens import TOTAL_ACTIONS, action_space_fingerprint, get_action
+from .tokens import ActionRegistry, RAW_ACTION_REGISTRY, action_space_fingerprint
 
 
 STATE_SPACE_SCHEMA = "factor_gfn.dag_state.v1"
@@ -55,6 +54,7 @@ class DAGAction:
 
     slot_path: SlotPath
     token_id: int
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY
 
     def __post_init__(self) -> None:
         path = tuple(self.slot_path)
@@ -63,7 +63,9 @@ class DAGAction:
         if not isinstance(self.token_id, Integral) or isinstance(self.token_id, bool):
             raise TypeError("token_id 必须是整数")
         token_id = int(self.token_id)
-        get_action(token_id)
+        if not isinstance(self.action_registry, ActionRegistry):
+            raise TypeError("action_registry 必须是 ActionRegistry")
+        self.action_registry.get_action(token_id)
         object.__setattr__(self, "slot_path", tuple(int(index) for index in path))
         object.__setattr__(self, "token_id", token_id)
 
@@ -98,7 +100,13 @@ class GrammarState:
     使用相同的 ``state_key``。完整动作由 ``(slot_path, token_id)`` 共同定义。
     """
 
-    __slots__ = ("_root", "search_space", "_stats", "_state_key")
+    __slots__ = (
+        "_root",
+        "search_space",
+        "action_registry",
+        "_stats",
+        "_state_key",
+    )
 
     def __init__(
         self,
@@ -106,8 +114,12 @@ class GrammarState:
         search_space: SearchSpaceConfig | None = None,
         max_depth: int | None = None,
         max_nodes: int | None = None,
-        _root: PartialNode = HOLE,
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+        _root: PartialNode | None = None,
     ) -> None:
+        if not isinstance(action_registry, ActionRegistry):
+            raise TypeError("action_registry 必须是 ActionRegistry")
+        self.action_registry = action_registry
         if search_space is not None:
             if not isinstance(search_space, SearchSpaceConfig):
                 raise TypeError("search_space 必须是 SearchSpaceConfig")
@@ -119,8 +131,12 @@ class GrammarState:
                 max_depth=DEFAULT_MAX_DEPTH if max_depth is None else max_depth,
                 max_nodes=DEFAULT_MAX_NODES if max_nodes is None else max_nodes,
             )
+        if _root is None:
+            _root = PartialNode(action_registry=action_registry)
         if not isinstance(_root, PartialNode):
             raise TypeError("_root 必须是 PartialNode")
+        if _root.action_registry != action_registry:
+            raise ValueError("_root 与 GrammarState 不得跨 ActionRegistry 混用")
         self._root = canonicalize_partial(_root)
         self._stats = partial_stats(self._root)
         if self._stats.node_count > self.max_nodes:
@@ -170,11 +186,12 @@ class GrammarState:
             return NotImplemented
         return (
             self.search_space == other.search_space
+            and self.action_registry == other.action_registry
             and self.state_key == other.state_key
         )
 
     def __hash__(self) -> int:
-        return hash((self.search_space, self.state_key))
+        return hash((self.search_space, self.action_registry, self.state_key))
 
     def snapshot(self) -> GrammarSnapshot:
         return GrammarSnapshot(
@@ -211,14 +228,14 @@ class GrammarState:
         raise ValueError(f"路径不是当前状态的规范开放槽位代表：{normalized}")
 
     def get_legal_token_mask(self, slot: OpenSlot | SlotPath) -> NDArray[np.bool_]:
-        """返回给定开放槽位上的142维 Token 合法掩码。"""
+        """返回给定开放槽位上与所属 registry 等宽的 Token 合法掩码。"""
 
-        mask = np.zeros(TOTAL_ACTIONS, dtype=np.bool_)
+        mask = np.zeros(self.action_registry.action_count, dtype=np.bool_)
         if self.done:
             return mask
         resolved = self._resolve_slot(slot.path if isinstance(slot, OpenSlot) else slot)
-        for token_id in range(TOTAL_ACTIONS):
-            action = get_action(token_id)
+        for token_id in range(self.action_registry.action_count):
+            action = self.action_registry.get_action(token_id)
             if action.arity > 0 and resolved.depth >= self.max_depth:
                 continue
             remaining_holes = self.pending_slots - 1 + action.arity
@@ -240,7 +257,7 @@ class GrammarState:
         successor_keys: set[str] = set()
         for slot in self.open_slots():
             for token_id in self.legal_token_ids(slot):
-                action = DAGAction(slot.path, int(token_id))
+                action = DAGAction(slot.path, int(token_id), self.action_registry)
                 successor = self._step_unchecked(action)
                 if successor.state_key in successor_keys:
                     continue
@@ -251,8 +268,14 @@ class GrammarState:
         return tuple(transitions)
 
     def _step_unchecked(self, action: DAGAction) -> "GrammarState":
+        if action.action_registry != self.action_registry:
+            raise ValueError("DAGAction 与 GrammarState 不得跨 ActionRegistry 混用")
         root = fill_hole(self._root, action.slot_path, action.token_id)
-        return GrammarState(search_space=self.search_space, _root=root)
+        return GrammarState(
+            search_space=self.search_space,
+            action_registry=self.action_registry,
+            _root=root,
+        )
 
     def step(self, action: DAGAction) -> "GrammarState":
         """执行一个联合动作并返回新的不可变状态。"""
@@ -261,9 +284,11 @@ class GrammarState:
             raise RuntimeError("终止状态不能继续执行动作")
         if not isinstance(action, DAGAction):
             raise TypeError("step 需要 DAGAction(slot_path, token_id)")
+        if action.action_registry != self.action_registry:
+            raise ValueError("DAGAction 与 GrammarState 不得跨 ActionRegistry 混用")
         slot = self._resolve_slot(action.slot_path)
         if not bool(self.get_legal_token_mask(slot)[action.token_id]):
-            token = get_action(action.token_id)
+            token = self.action_registry.get_action(action.token_id)
             raise ValueError(
                 f"Token 在槽位上不合法：path={slot.path}, name={token.name}, "
                 f"window={token.window}, nodes={self.node_count}, holes={self.pending_slots}"
@@ -281,6 +306,7 @@ class GrammarState:
             parent_root = remove_frontier(self._root, path)
             parent = GrammarState(
                 search_space=self.search_space,
+                action_registry=self.action_registry,
                 _root=parent_root,
             )
             if parent.state_key in parents:
@@ -329,7 +355,9 @@ def _schema_digest(schema: str, manifest: object) -> str:
 
 
 def state_space_manifest() -> dict[str, object]:
-    commutative = sorted(symbol.name for symbol in ALL_SYMBOLS if symbol.commutative)
+    commutative = sorted(
+        symbol.name for symbol in NON_LEAF_OPERATORS if symbol.commutative
+    )
     return {
         "partial_ast_schema": PARTIAL_AST_SCHEMA,
         "hole_semantics": "one Expr slot",
@@ -344,9 +372,11 @@ def state_space_fingerprint() -> str:
     return _schema_digest(STATE_SPACE_SCHEMA, state_space_manifest())
 
 
-def transition_space_manifest() -> dict[str, object]:
+def transition_space_manifest(
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+) -> dict[str, object]:
     return {
-        "token_space_fingerprint": action_space_fingerprint(),
+        "token_space_fingerprint": action_space_fingerprint(action_registry),
         "forward_action": ["open_slot_orbit", "token_id"],
         "slot_symmetry": "targeted partial AST canonical orbit",
         "backward_policy": "uniform over distinct parent states",
@@ -354,8 +384,13 @@ def transition_space_manifest() -> dict[str, object]:
     }
 
 
-def transition_space_fingerprint() -> str:
-    return _schema_digest(TRANSITION_SPACE_SCHEMA, transition_space_manifest())
+def transition_space_fingerprint(
+    action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+) -> str:
+    return _schema_digest(
+        TRANSITION_SPACE_SCHEMA,
+        transition_space_manifest(action_registry),
+    )
 
 
 __all__ = [

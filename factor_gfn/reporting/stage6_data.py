@@ -41,7 +41,7 @@ from factor_gfn.backtest.stage6_two_phase_pipeline import (
 from factor_gfn.grammar import LEAVES, WINDOWS, get_action
 
 
-STAGE6_REPORT_DATA_SCHEMA = "factor_gfn.reporting.stage6_data.v1"
+STAGE6_REPORT_DATA_SCHEMA = "factor_gfn.reporting.stage6_data.v2"
 PAIR_AUDIT_VERSION = "stage6-reporting-pair-audit-v1"
 UNIVERSES = (
     "stage5_source",
@@ -50,6 +50,7 @@ UNIVERSES = (
     "hard_filter_pass",
     "decorrelation_input",
     "provisional_pool",
+    "frozen_order_top100",
 )
 _VALIDATION_CODES = {
     "validation_abs_ic_gt_0_01",
@@ -74,10 +75,14 @@ class Stage6ReportDataBundle:
     decorrelation_outcomes: pd.DataFrame
     effective_train_long_excess: pd.DataFrame
     before_top30_correlation: pd.DataFrame
-    after_top30_correlation: pd.DataFrame
+    after_top20_correlation: pd.DataFrame
     decorrelation_pair_summary: pd.DataFrame
     greedy_pair_audit: pd.DataFrame
     provisional_factor_pool: pd.DataFrame
+    top100_candidate_metrics: pd.DataFrame
+    top100_quality_summary: pd.DataFrame
+    complexity_summary: pd.DataFrame
+    top_candidate_examples: pd.DataFrame
     structure_shift_summary: pd.DataFrame
     operator_prevalence_shift: pd.DataFrame
     field_prevalence_shift: pd.DataFrame
@@ -293,6 +298,24 @@ def _summary(values: pd.Series) -> dict[str, float]:
     return {"mean": float(data.mean()), "median": float(data.median()), "q25": float(data.quantile(.25)), "q75": float(data.quantile(.75))}
 
 
+def _extended_summary(values: pd.Series) -> dict[str, float | int]:
+    data = pd.to_numeric(values, errors="coerce").dropna()
+    if data.empty:
+        return {
+            "n": 0,
+            **{key: math.nan for key in ("min", "mean", "median", "q25", "q75", "max")},
+        }
+    return {
+        "n": int(len(data)),
+        "min": float(data.min()),
+        "mean": float(data.mean()),
+        "median": float(data.median()),
+        "q25": float(data.quantile(.25)),
+        "q75": float(data.quantile(.75)),
+        "max": float(data.max()),
+    }
+
+
 def _token_prevalence(frame: pd.DataFrame, universe: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     total = len(frame)
     op_occ: Counter[str] = Counter(); op_seen: Counter[str] = Counter()
@@ -346,7 +369,10 @@ def build_stage6_report_data(
     source_frame = pd.DataFrame(source_candidates)
     train_frame = pd.DataFrame(train_rows)
 
-    counts = [len(source_hashes), len(train_pass), len(validation_hashes), len(hard_pass), len(greedy_hashes), len(pool_hashes)]
+    counts = [
+        len(source_hashes), len(train_pass), len(validation_hashes), len(hard_pass),
+        len(greedy_hashes), len(pool_hashes), min(100, len(pool_hashes)),
+    ]
     funnel_rows = []
     for index, (stage, count) in enumerate(zip(UNIVERSES, counts, strict=True)):
         previous = counts[index - 1] if index else count
@@ -427,7 +453,7 @@ def build_stage6_report_data(
     ranked = _rank_hashes(hard_pass, hard_by_hash)
     pool_ranked = _rank_hashes(pool_hashes, hard_by_hash)
     before_matrix = _correlation_matrix(ranked[:30], effective)
-    after_matrix = _correlation_matrix(pool_ranked[:30], effective)
+    after_matrix = _correlation_matrix(pool_ranked[:20], effective)
     audit = _greedy_audit(greedy_rows, effective)
     pair_summary = pd.DataFrame([_pair_summary("decorrelation_input", ranked, effective), _pair_summary("provisional_pool", pool_ranked, effective)])
     deco_summary = {"input_count": len(greedy_rows), "retained_count": len(pool_hashes), "correlation_rejected_count": sum(row.get("decorrelation_status") == "rejected_by_correlation" for row in greedy_rows), "invalid_count": sum(row.get("decorrelation_status") == "decorrelation_invalid" for row in greedy_rows), "retention_rate": len(pool_hashes) / len(greedy_rows) if greedy_rows else math.nan}
@@ -439,6 +465,52 @@ def build_stage6_report_data(
         structural_hash = str(row["structural_hash"]); metric = metrics_by_hash.loc[structural_hash]
         pool_output.append({"provisional_rank": provisional_rank, "sorted_rank": row.get("sorted_rank"), "structural_hash": structural_hash, "formula": row.get("expression", {}).get("formula", metric["formula"]), "prefix_token_ids": row.get("expression", {}).get("prefix_token_ids", metric["prefix_token_ids"]), "node_count": row.get("expression", {}).get("node_count", metric["node_count"]), "depth": row.get("expression", {}).get("depth", metric["depth"]), "train_ic": metric["train_ic"], "validation_ic": metric["validation_ic"], "train_direction": metric["train_direction"], "train_long_ir": metric["train_long_ir"], "validation_long_ir": metric["validation_long_ir"], "train_barra_ts_corr": metric["train_barra_ts_corr"], "decorrelation_status": "retained", "source_provenance": row.get("source_identity", {}), "validation_result_fingerprint": row.get("result_fingerprint"), "source_snapshot_fingerprint": snapshot_manifest.get("source_snapshot_fingerprint"), "source_set_fingerprint": snapshot_manifest.get("source_set_fingerprint"), "accepted_registry_fingerprint": snapshot_manifest.get("accepted_registry_fingerprint"), "train_entry_fingerprint": snapshot_manifest.get("train_entry_fingerprint"), "train_pass_fingerprint": snapshot_manifest.get("train_pass_fingerprint"), "validation_context_fingerprint": snapshot_manifest.get("validation_context_fingerprint"), "validation_evaluation_fingerprint": snapshot_manifest.get("validation_evaluation_fingerprint"), "selection_fingerprint": snapshot_manifest.get("selection_fingerprint"), "selection_contract_fingerprint": snapshot_manifest.get("selection_contract_fingerprint"), "enrichment_fingerprint": snapshot_manifest.get("enrichment_fingerprint")})
     pool = pd.DataFrame(pool_output)
+
+    ranked_pool = pool.sort_values("provisional_rank", kind="stable").reset_index(drop=True)
+    top100 = ranked_pool.head(100).copy()
+    top100["abs_train_ic"] = pd.to_numeric(top100["train_ic"], errors="coerce").abs()
+    top100["abs_validation_ic"] = pd.to_numeric(top100["validation_ic"], errors="coerce").abs()
+    top100["operator_count"] = top100["prefix_token_ids"].map(
+        lambda tokens: sum(1 for token in tokens if get_action(int(token)).arity)
+    )
+    top100["leaf_count"] = top100["prefix_token_ids"].map(
+        lambda tokens: sum(1 for token in tokens if not get_action(int(token)).arity)
+    )
+    top100_columns = [
+        "provisional_rank", "sorted_rank", "structural_hash", "formula",
+        "prefix_token_ids", "node_count", "depth", "operator_count", "leaf_count",
+        "train_direction", "train_ic", "validation_ic",
+        "abs_train_ic", "abs_validation_ic", "train_long_ir",
+        "validation_long_ir", "train_barra_ts_corr",
+    ]
+    top100_metrics = top100.reindex(columns=top100_columns)
+    top100_quality = pd.DataFrame(
+        [
+            {"metric": metric, **_extended_summary(top100_metrics[metric])}
+            for metric in (
+                "abs_train_ic", "abs_validation_ic", "train_long_ir",
+                "validation_long_ir", "train_barra_ts_corr",
+            )
+        ]
+    )
+    top_examples = top100_metrics.head(10).copy()
+
+    complexity_rows = []
+    for metric in ("node_count", "depth", "operator_count", "leaf_count"):
+        values = pd.to_numeric(top100_metrics[metric], errors="coerce").dropna()
+        complexity_rows.append(
+            {
+                "universe": "frozen_order_top100",
+                "candidate_count": int(len(top100_metrics)),
+                "metric": metric,
+                "min": float(values.min()),
+                "median": float(values.median()),
+                "mean": float(values.mean()),
+                "p95": float(values.quantile(.95)),
+                "max": float(values.max()),
+            }
+        )
+    complexity_summary = pd.DataFrame(complexity_rows)
 
     before_structure = metrics[["structural_hash", "prefix_token_ids", "node_count", "depth"]].copy()
     after_structure = pool[["structural_hash", "prefix_token_ids", "node_count", "depth"]].copy()
@@ -465,9 +537,11 @@ def build_stage6_report_data(
         stability_summary=stability, before_after_quality_summary=quality,
         decorrelation_input=hard_frame[hard_frame["hard_filter_pass"] == True].copy(),
         decorrelation_outcomes=greedy_frame, effective_train_long_excess=pd.DataFrame(series_rows, columns=["structural_hash", "date", "value", "origin"]),
-        before_top30_correlation=before_matrix, after_top30_correlation=after_matrix,
+        before_top30_correlation=before_matrix, after_top20_correlation=after_matrix,
         decorrelation_pair_summary=pair_summary, greedy_pair_audit=audit,
-        provisional_factor_pool=pool, structure_shift_summary=structure,
+        provisional_factor_pool=pool, top100_candidate_metrics=top100_metrics,
+        top100_quality_summary=top100_quality, complexity_summary=complexity_summary,
+        top_candidate_examples=top_examples, structure_shift_summary=structure,
         operator_prevalence_shift=operator_shift, field_prevalence_shift=field_shift,
         window_prevalence_shift=window_shift,
         availability_and_warnings=pd.DataFrame(warnings, columns=["category", "structural_hash", "message"]),
@@ -633,7 +707,10 @@ def load_stage6_report_data(
         "validation_evaluation_fingerprint": validation_entry["evaluation_contract_fingerprint"], "validation_ordered_result_set_fingerprint": ordered,
         "selection_fingerprint": selection["enriched_selection_fingerprint"], "selection_contract_fingerprint": selection["selection_contract_fingerprint"],
         "enrichment_fingerprint": selection["enrichment_contract_fingerprint"], "selection_scope": "provisional_selection", "engineering_smoke": False,
-        "oos": "not_loaded_not_evaluated", "top_k_correlation": 30, "minimum_common_periods": 60, "pair_audit_version": PAIR_AUDIT_VERSION,
+        "oos": "not_loaded_not_evaluated", "before_correlation_top_k": 30,
+        "after_correlation_top_k": 20, "top100_count": 100,
+        "top100_policy": "authoritative_provisional_pool_order_prefix",
+        "minimum_common_periods": 60, "pair_audit_version": PAIR_AUDIT_VERSION,
     }
     return build_stage6_report_data(snapshot_manifest=report_snapshot, source_candidates=source_candidates, train_prefilter_results=prefilter, validation_records=validation_records, hard_filter_results=hard, greedy_results=greedy, alpha_pool=pool, enrichment_results=enrichment)
 

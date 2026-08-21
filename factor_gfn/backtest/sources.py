@@ -673,6 +673,10 @@ def _hybrid_snapshot_builder(
         raise ValueError("Hybrid artifact records 必须是列表")
     if artifact.get("candidate_count") != len(records):
         raise ValueError("Hybrid artifact candidate_count 不一致")
+    artifact_has_vocabulary = "vocabulary" in artifact
+    vocabulary = artifact.get("vocabulary")
+    if artifact_has_vocabulary and not isinstance(vocabulary, Mapping):
+        raise ValueError("Hybrid artifact vocabulary 必须是对象")
     hashes: list[str] = []
     for record in records:
         if not isinstance(record, Mapping):
@@ -684,6 +688,11 @@ def _hybrid_snapshot_builder(
         structural_hash = record.get("structural_hash")
         if not isinstance(structural_hash, str):
             raise ValueError("Hybrid artifact record 缺少 structural_hash")
+        if artifact_has_vocabulary:
+            if record.get("vocabulary") != vocabulary:
+                raise ValueError("Hybrid artifact/record vocabulary 不一致")
+        elif "vocabulary" in record:
+            raise ValueError("Raw legacy Hybrid artifact 不得仅在 record 声明 vocabulary")
         hashes.append(structural_hash)
     if hashes != sorted(hashes) or len(hashes) != len(set(hashes)):
         raise ValueError("Hybrid artifact structural_hash 必须唯一且有序")
@@ -751,6 +760,24 @@ def _hybrid_snapshot_builder(
         if isinstance(train_scope, Mapping)
         else None
     )
+    source_semantics = {
+        "source_artifact_schema": artifact_schema,
+        "run_id": directory.name,
+        "seed": None,
+        "seed_method": "not_exposed_by_hybrid_run_manifest",
+        "generation_config_fingerprint": run_config.get(
+            "config_fingerprint"
+        ),
+        "provider_fingerprint": run_config.get(
+            "reward_provider_fingerprint"
+        ),
+        "context_fingerprint": context_fingerprint,
+        "reward_fingerprint": None,
+        "reward_fingerprint_method": "not_applicable_train_artifact",
+        "train_evaluation_contract_fingerprint": contract_fingerprint,
+    }
+    if artifact_has_vocabulary:
+        source_semantics["vocabulary"] = dict(vocabulary)
     return {
         "schema": SOURCE_SNAPSHOT_SCHEMA,
         "source_id": spec.source_id,
@@ -764,22 +791,7 @@ def _hybrid_snapshot_builder(
             "included_record_sources": [],
             "excluded_record_sources": [],
         },
-        "source_semantics": {
-            "source_artifact_schema": artifact_schema,
-            "run_id": directory.name,
-            "seed": None,
-            "seed_method": "not_exposed_by_hybrid_run_manifest",
-            "generation_config_fingerprint": run_config.get(
-                "config_fingerprint"
-            ),
-            "provider_fingerprint": run_config.get(
-                "reward_provider_fingerprint"
-            ),
-            "context_fingerprint": context_fingerprint,
-            "reward_fingerprint": None,
-            "reward_fingerprint_method": "not_applicable_train_artifact",
-            "train_evaluation_contract_fingerprint": contract_fingerprint,
-        },
+        "source_semantics": source_semantics,
         "snapshot_kind": "completed_hybrid_train_artifact",
         "cutoff": {
             "committed_optimizer_step": runner_step,

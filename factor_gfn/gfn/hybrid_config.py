@@ -10,11 +10,16 @@ from numbers import Real
 from typing import Any, Literal
 
 from factor_gfn.grammar import (
+    DAILY_DERIVED_V1_FEATURE_SPACE,
+    RAW_DAILY_FEATURE_SPACE,
+    ActionRegistry,
+    FeatureSpaceSpec,
     SearchSpaceConfig,
     action_space_fingerprint,
     resolve_exact_node_strata,
     state_space_fingerprint,
     transition_space_fingerprint,
+    build_action_registry,
 )
 
 from .config import ModelConfig, RewardConfig, SamplingConfig, state_adapter_manifest
@@ -157,6 +162,7 @@ class HybridVarianceGFNConfig:
     """Isolated Stage 5 5/15 config with no learned-logZ training fields."""
 
     training: HybridTrainingConfig
+    feature_space: FeatureSpaceSpec = RAW_DAILY_FEATURE_SPACE
     search_space: SearchSpaceConfig = STAGE5_HYBRID_SEARCH_SPACE
     model: ModelConfig = STAGE5_HYBRID_MODEL
     sampling: SamplingConfig = STAGE5_HYBRID_SAMPLING
@@ -171,6 +177,11 @@ class HybridVarianceGFNConfig:
     )
 
     def __post_init__(self) -> None:
+        if self.feature_space not in (
+            RAW_DAILY_FEATURE_SPACE,
+            DAILY_DERIVED_V1_FEATURE_SPACE,
+        ):
+            raise ValueError("hybrid config 仅支持 Raw Daily 或 Daily-Derived v1")
         if self.search_space != STAGE5_HYBRID_SEARCH_SPACE:
             raise ValueError("hybrid search space must remain max_depth=5, max_nodes=15")
         if self.model != STAGE5_HYBRID_MODEL:
@@ -188,15 +199,23 @@ class HybridVarianceGFNConfig:
             raise ValueError("hybrid grammar and objective conditions must both be 1..15")
 
     @property
+    def action_registry(self) -> ActionRegistry:
+        return build_action_registry(self.feature_space)
+
+    @property
     def resolved_condition_node_counts(self) -> tuple[int, ...]:
         return resolve_exact_node_strata(
-            self.search_space
+            self.search_space,
+            self.action_registry,
         ).resolved_feasible_node_counts
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        config_payload = asdict(self)
+        config_payload.pop("feature_space")
+        registry = self.action_registry
+        manifest = {
             "schema": HYBRID_VARIANCE_CONFIG_SCHEMA,
-            "config": asdict(self),
+            "config": config_payload,
             "resolved_condition_node_counts": self.resolved_condition_node_counts,
             "training_units": {
                 "conditions_per_cycle": self.training.conditions_per_cycle,
@@ -207,11 +226,15 @@ class HybridVarianceGFNConfig:
                     self.training.total_training_trajectories
                 ),
             },
-            "state_adapter": state_adapter_manifest(),
-            "token_space_fingerprint": action_space_fingerprint(),
+            "state_adapter": state_adapter_manifest(registry),
+            "token_space_fingerprint": action_space_fingerprint(registry),
             "state_space_fingerprint": state_space_fingerprint(),
-            "transition_space_fingerprint": transition_space_fingerprint(),
+            "transition_space_fingerprint": transition_space_fingerprint(registry),
         }
+        if self.feature_space != RAW_DAILY_FEATURE_SPACE:
+            manifest["feature_space"] = self.feature_space.manifest()
+            manifest["feature_space_fingerprint"] = self.feature_space.fingerprint()
+        return manifest
 
     def fingerprint(self) -> str:
         payload = json.dumps(
@@ -228,10 +251,12 @@ def build_stage5_hybrid_variance_5_15_config(
     max_cycles: int,
     trajectories_per_batch: int = STAGE5_HYBRID_DEFAULT_TRAJECTORIES_PER_BATCH,
     seed: int = STAGE5_HYBRID_SEED,
+    feature_space: FeatureSpaceSpec = RAW_DAILY_FEATURE_SPACE,
 ) -> HybridVarianceGFNConfig:
     """Build the frozen 5/15 hybrid contract for one explicit cycle budget."""
 
     return HybridVarianceGFNConfig(
+        feature_space=feature_space,
         training=HybridTrainingConfig(
             max_cycles=max_cycles,
             trajectories_per_batch=trajectories_per_batch,

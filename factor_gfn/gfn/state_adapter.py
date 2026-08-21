@@ -8,14 +8,14 @@ import torch
 from torch import Tensor
 
 from factor_gfn.grammar import (
+    RAW_ACTION_REGISTRY,
     TOTAL_ACTIONS,
+    ActionRegistry,
     ExactNodeGrammarState,
     GrammarState,
     OpenSlot,
     PartialNode,
     SearchSpaceConfig,
-    get_action,
-    get_operator,
 )
 
 PolicyGrammarState = GrammarState | ExactNodeGrammarState
@@ -63,6 +63,7 @@ class StateBatch:
     legal_token_mask: Tensor
     auxiliary_features: Tensor
     condition_features: Tensor
+    action_space_fingerprint: str
 
     def to(self, device: torch.device | str) -> "StateBatch":
         updates = {
@@ -89,14 +90,23 @@ class StateBatch:
         return replace(self, **updates)
 
 
-def _child_role(parent_token_id: int, child_index: int) -> int:
-    action = get_action(parent_token_id)
-    if get_operator(action.name).commutative:
+def _child_role(
+    parent_token_id: int,
+    child_index: int,
+    action_registry: ActionRegistry,
+) -> int:
+    action = action_registry.get_action(parent_token_id)
+    if action_registry.get_operator(action.name).commutative:
         return ROLE_COMMUTATIVE_CHILD
     return ROLE_ARG0 if child_index == 0 else ROLE_ARG1
 
 
-def _node_records(root: PartialNode) -> tuple[_NodeRecord, ...]:
+def _node_records(
+    root: PartialNode,
+    action_registry: ActionRegistry,
+    hole_token_id: int,
+    pad_token_id: int,
+) -> tuple[_NodeRecord, ...]:
     records: list[_NodeRecord] = []
 
     def visit(
@@ -107,7 +117,7 @@ def _node_records(root: PartialNode) -> tuple[_NodeRecord, ...]:
         path_parent_tokens: tuple[int, ...],
         path_roles: tuple[int, ...],
     ) -> None:
-        token_id = HOLE_TOKEN_ID if node.is_hole else int(node.action_id)
+        token_id = hole_token_id if node.is_hole else int(node.action_id)
         records.append(
             _NodeRecord(
                 path=path,
@@ -123,7 +133,7 @@ def _node_records(root: PartialNode) -> tuple[_NodeRecord, ...]:
             return
         assert node.action_id is not None
         for index, child in enumerate(node.children):
-            child_role = _child_role(node.action_id, index)
+            child_role = _child_role(node.action_id, index, action_registry)
             visit(
                 child,
                 path + (index,),
@@ -133,21 +143,47 @@ def _node_records(root: PartialNode) -> tuple[_NodeRecord, ...]:
                 path_roles + (child_role,),
             )
 
-    visit(root, (), ROLE_ROOT, PAD_TOKEN_ID, (), ())
+    visit(root, (), ROLE_ROOT, pad_token_id, (), ())
     return tuple(records)
 
 
 class StateAdapter:
     """以阶段二规范状态为唯一真值来源构造模型输入。"""
 
-    def __init__(self, search_space: SearchSpaceConfig = SearchSpaceConfig()) -> None:
+    def __init__(
+        self,
+        search_space: SearchSpaceConfig = SearchSpaceConfig(),
+        action_registry: ActionRegistry = RAW_ACTION_REGISTRY,
+    ) -> None:
         self.search_space = search_space
+        if not isinstance(action_registry, ActionRegistry):
+            raise TypeError("action_registry 必须是 ActionRegistry")
+        self.action_registry = action_registry
+
+    @property
+    def action_count(self) -> int:
+        return self.action_registry.action_count
+
+    @property
+    def hole_token_id(self) -> int:
+        return self.action_count
+
+    @property
+    def pad_token_id(self) -> int:
+        return self.action_count + 1
+
+    @property
+    def model_token_count(self) -> int:
+        return self.action_count + 2
 
     def _validate_state(self, state: PolicyGrammarState) -> None:
         if state.done:
             raise ValueError("终止状态没有前向动作，不能送入策略网络")
         if state.search_space != self.search_space:
             raise ValueError("GrammarState 与 StateAdapter 的 SearchSpaceConfig 必须等价")
+        structural = state.state if isinstance(state, ExactNodeGrammarState) else state
+        if structural.action_registry != self.action_registry:
+            raise ValueError("GrammarState 与 StateAdapter 不得跨 ActionRegistry 混用")
 
     def batch(
         self,
@@ -163,19 +199,31 @@ class StateAdapter:
             state.state if isinstance(state, ExactNodeGrammarState) else state
             for state in states
         )
-        all_records = tuple(_node_records(state.root) for state in structural_states)
+        all_records = tuple(
+            _node_records(
+                state.root,
+                self.action_registry,
+                self.hole_token_id,
+                self.pad_token_id,
+            )
+            for state in structural_states
+        )
         all_slots = tuple(state.open_slots() for state in states)
         batch_size = len(states)
         max_nodes_in_batch = max(len(records) for records in all_records)
         max_slots = max(len(slots) for slots in all_slots)
         max_depth = self.search_space.max_depth
 
-        token_ids = torch.full((batch_size, max_nodes_in_batch), PAD_TOKEN_ID, dtype=torch.long)
+        token_ids = torch.full(
+            (batch_size, max_nodes_in_batch), self.pad_token_id, dtype=torch.long
+        )
         depths = torch.zeros((batch_size, max_nodes_in_batch), dtype=torch.long)
         role_ids = torch.full((batch_size, max_nodes_in_batch), ROLE_PAD, dtype=torch.long)
         node_mask = torch.zeros((batch_size, max_nodes_in_batch), dtype=torch.bool)
         path_parent_token_ids = torch.full(
-            (batch_size, max_nodes_in_batch, max_depth), PAD_TOKEN_ID, dtype=torch.long
+            (batch_size, max_nodes_in_batch, max_depth),
+            self.pad_token_id,
+            dtype=torch.long,
         )
         path_role_ids = torch.full(
             (batch_size, max_nodes_in_batch, max_depth), ROLE_PAD, dtype=torch.long
@@ -186,12 +234,12 @@ class StateAdapter:
         slot_depths = torch.zeros((batch_size, max_slots), dtype=torch.long)
         slot_role_ids = torch.full((batch_size, max_slots), ROLE_PAD, dtype=torch.long)
         slot_parent_token_ids = torch.full(
-            (batch_size, max_slots), PAD_TOKEN_ID, dtype=torch.long
+            (batch_size, max_slots), self.pad_token_id, dtype=torch.long
         )
         slot_budget_features = torch.zeros((batch_size, max_slots, 3), dtype=torch.float32)
         slot_mask = torch.zeros((batch_size, max_slots), dtype=torch.bool)
         legal_token_mask = torch.zeros(
-            (batch_size, max_slots, TOTAL_ACTIONS), dtype=torch.bool
+            (batch_size, max_slots, self.action_count), dtype=torch.bool
         )
         auxiliary_features = torch.zeros((batch_size, 3), dtype=torch.float32)
         condition_features = torch.zeros((batch_size, 2), dtype=torch.float32)
@@ -225,7 +273,7 @@ class StateAdapter:
                 token_mask = torch.tensor(
                     [
                         (slot.path, token_id) in canonical_edges
-                        for token_id in range(TOTAL_ACTIONS)
+                        for token_id in range(self.action_count)
                     ],
                     dtype=torch.bool,
                 )
@@ -284,6 +332,7 @@ class StateAdapter:
             legal_token_mask=legal_token_mask,
             auxiliary_features=auxiliary_features,
             condition_features=condition_features,
+            action_space_fingerprint=self.action_registry.fingerprint(),
         )
 
 

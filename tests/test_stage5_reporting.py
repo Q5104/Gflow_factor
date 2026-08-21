@@ -255,7 +255,7 @@ class Stage5ReportingTests(unittest.TestCase):
     def test_correlation_subset_order_alignment_and_invalid_pairs(self):
         bundle = load_stage5_report_data(self._write_fixture(), expected_config=self.config)
         selected = bundle.selected_long_excess_series.drop_duplicates("structural_hash")
-        self.assertEqual(len(selected), 30)
+        self.assertEqual(len(selected), 20)
         self.assertEqual(list(selected["structural_hash"].head(2)), ["h000", "h001"])
         self.assertNotIn("h031", set(selected["structural_hash"]))
         matrix = bundle.long_excess_correlation_matrix
@@ -269,14 +269,20 @@ class Stage5ReportingTests(unittest.TestCase):
         bundle = load_stage5_report_data(self._write_fixture(), expected_config=self.config)
         output_dir = self.root / "report"
         rendered = Stage5ReportRenderer(bundle, output_dir).render_all()
-        self.assertEqual(len(rendered["figures"]), 15)
+        self.assertEqual(len(rendered["figures"]), 18)
         self.assertTrue(all(path.is_file() and path.stat().st_size > 0 for path in rendered["figures"]))
         self.assertTrue(all(path.is_file() and path.stat().st_size > 0 for path in rendered["tables"]))
         manifest = json.loads(Path(rendered["manifest"]).read_text(encoding="utf-8"))
+        self.assertEqual(manifest["report_schema"], "factor_gfn.reporting.stage5_report.v2")
+        self.assertEqual(manifest["report_version"], 2)
         self.assertEqual(manifest["source_run_identity"], bundle.snapshot_manifest["source_run_id"])
         self.assertEqual(manifest["snapshot_steps"]["runner"], 15)
         self.assertFalse(manifest["incomplete_preview"])
-        self.assertEqual(len(manifest["output_inventory"]["figures"]), 15)
+        self.assertEqual(len(manifest["output_inventory"]["figures"]), 18)
+        self.assertIn("04_candidate_quality_summary.png", manifest["output_inventory"]["figures"])
+        self.assertIn("05_train_long_excess_corr_top20.png", manifest["output_inventory"]["figures"])
+        self.assertIn("06_complexity_summary.png", manifest["output_inventory"]["figures"])
+        self.assertIn("07_top_candidate_examples.png", manifest["output_inventory"]["figures"])
 
     def test_reporting_notebook_contract_and_empty_outputs(self):
         notebook_path = Path(__file__).resolve().parents[1] / "notebooks" / "stage5_reporting.ipynb"
@@ -306,6 +312,11 @@ class Stage5ReportingTests(unittest.TestCase):
         self.assertTrue(all(cell.outputs == [] for cell in code_cells))
         source = "\n".join("".join(cell.source) for cell in code_cells)
         self.assertIn("ALLOW_INCOMPLETE = False", source)
+        self.assertIn("stage5_reporting_v2", source)
+        self.assertIn("correlation_top_k=20", source)
+        self.assertIn("figure_candidate_quality_table", source)
+        self.assertIn("figure_complexity_table", source)
+        self.assertIn("figure_top_candidate_examples_table", source)
         self.assertIn("REPLACE_WITH_COMPLETED_STAGE5_RUN_DIRECTORY", source)
         self.assertNotIn("runs/stage5_hybrid_variance_real", source.replace("\\", "/"))
 
