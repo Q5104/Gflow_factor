@@ -4,6 +4,7 @@
 > 建立日期：2026-08-04  
 > 最近同步：2026-08-18
 > 当前阶段：Raw Daily Conditional Hybrid Baseline 已完整完成。正式 Stage 5 为 `N=1..15` Hybrid Exact-TB/LPV 100-cycle run；Stage 6 已完成 Train/Validation 筛选并冻结完整 1610-factor Baseline Pool；三种 Top100 静态策略、Test scores、OOS evaluation 与 reporting 均已冻结。后续新增日频衍生特征或策略优化必须作为独立实验，不覆盖本 Baseline。
+> Daily-Derived v1 已进入独立实验开发；权威 Feature Contract 见 `docs/daily_derived/DAILY_DERIVED_FEATURE_DESIGN.md`。Raw Daily Baseline v1 保持冻结。
 > 重要说明：本文用于记录开发路线、已确认决策、待确认问题和验收标准，不是不可修改的冻结规格。
 
 ## 1. 项目目标
